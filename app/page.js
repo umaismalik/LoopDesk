@@ -101,7 +101,11 @@ function JitsiMeetingEmbed({ roomUrl, title }) {
 }
 const api = async (p, body, key, projectId) => {
   try {
-    const r = await fetch("/api/" + p + (projectId ? (p.includes("?") ? "&" : "?") + "project=" + encodeURIComponent(projectId) : ""), {
+    const resource = p.split("?")[0];
+    const pageQuery = projectId && resource !== "db" && resource !== "tickets"
+      ? "&ticketOffset=" + encodeURIComponent(localStorage.getItem("rw-ticket-offset") || "0")
+      : "";
+    const r = await fetch("/api/" + p + (projectId ? (p.includes("?") ? "&" : "?") + "project=" + encodeURIComponent(projectId) + pageQuery : ""), {
       method: body ? "POST" : "GET",
       headers: { "x-key": key || "", ...(body && !(body instanceof FormData) ? { "Content-Type": "application/json" } : {}) },
       body: body ? (body instanceof FormData ? body : JSON.stringify(body)) : undefined,
@@ -191,6 +195,10 @@ export default function Page() {
   const [projectOrganizationId, setProjectOrganizationId] = useState("");
   const [projectName, setProjectName] = useState("");
   const [tickets, setTickets] = useState([]);
+  const [ticketOffset, setTicketOffset] = useState(0);
+  const [ticketTotal, setTicketTotal] = useState(0);
+  const [ticketHasMore, setTicketHasMore] = useState(false);
+  const [ticketPageLoading, setTicketPageLoading] = useState(false);
   const [members, setMembers] = useState([]);
   const [invites, setInvites] = useState([]);
   const [audit, setAudit] = useState([]);
@@ -263,6 +271,7 @@ export default function Page() {
 
   const load = useCallback(async (k, requestedProject) => {
     const selectedProject = requestedProject || localStorage.getItem("rw-project") || "";
+    localStorage.setItem("rw-ticket-offset", "0");
     const r = await api("db", null, k, selectedProject);
     if (r.setup) return setScreen("setup");
     if (r.status === 401) return setScreen("login");
@@ -274,7 +283,7 @@ export default function Page() {
     applyDb(r);
     function applyDb(data) {
       setMe(data.me); setCanUseMeetings(data.canUseMeetings === undefined ? data.me.role !== "Client" : data.canUseMeetings); setCanManageMeetings(!!data.canManageMeetings); setMeetingEditAccess(!!data.meetingEditAccess); setMeetingEditAccessExpiresAt(data.meetingEditAccessExpiresAt || null); setMeetingEditRequests(data.meetingEditRequests || []); setGoogleCalendarConfigured(!!data.googleCalendarConfigured); setGoogleCalendarConnected(!!data.googleCalendarConnected); setGoogleCalendarEmail(data.googleCalendarEmail || ""); setProjects(data.projects || []); setOrganizations(data.organizations || []); setProjectId(data.projectId); localStorage.setItem("rw-project", data.projectId);
-      setView((v) => data.me.role === "Client" && v !== "account" ? "portal" : v); setAcct({ name: data.me.name, phone: data.me.phone || "", current: "", password: "", confirm: "" }); setTickets(data.tickets); setMembers(data.members); setInvites(data.invites || []); setAudit(data.audit || []); setFiles(data.files || []); setScreen("app");
+      setView((v) => data.me.role === "Client" && v !== "account" ? "portal" : v); setAcct({ name: data.me.name, phone: data.me.phone || "", current: "", password: "", confirm: "" }); setTickets(data.tickets); setTicketOffset(data.ticketPagination?.offset || 0); setTicketTotal(data.ticketPagination?.total ?? data.tickets.length); setTicketHasMore(!!data.ticketPagination?.hasMore); setMembers(data.members); setInvites(data.invites || []); setAudit(data.audit || []); setFiles(data.files || []); setScreen("app");
     }
   }, []);
   useEffect(() => {
@@ -360,7 +369,27 @@ export default function Page() {
     localStorage.setItem("rw-key", r.key); localStorage.setItem("rw-project", r.projectId);
     setKey(r.key); history.replaceState(null, "", "/"); load(r.key, r.projectId);
   };
-  const commit = async (next) => { setTickets(next); const r = await api("tickets", { tickets: next }, key, projectId); if (!r.ok) { alert(r.error || "Save failed"); load(key); } };
+  const loadTicketPage = async (offset) => {
+    setTicketPageLoading(true);
+    const result = await api(`tickets?offset=${offset}&limit=100`, null, key, projectId);
+    setTicketPageLoading(false);
+    if (!result.ok) { alert(result.error || "Unable to load tickets"); return; }
+    setTickets(result.tickets || []);
+    setTicketOffset(result.pagination?.offset || 0);
+    localStorage.setItem("rw-ticket-offset", String(result.pagination?.offset || 0));
+    setTicketTotal(result.pagination?.total ?? result.tickets.length);
+    setTicketHasMore(!!result.pagination?.hasMore);
+  };
+  const commit = async (next) => {
+    const previousCount = tickets.length;
+    setTickets(next);
+    const result = await api(`tickets?offset=${ticketOffset}&limit=100`, { tickets: next }, key, projectId);
+    if (!result.ok) { alert(result.error || "Save failed"); load(key); return; }
+    const total = Math.max(0, ticketTotal + next.length - previousCount);
+    setTicketTotal(total);
+    setTicketHasMore(ticketOffset + next.length < total);
+    if (!next.length && ticketOffset > 0) loadTicketPage(Math.max(0, ticketOffset - 100));
+  };
 
   const admin = me && me.role === "Admin", canEdit = me && me.role !== "Collaborator" && me.role !== "Client", client = me && me.role === "Client";
   const canEditMeetingContent = !!me && (["Admin", "Collaborator"].includes(me.role) || meetingEditAccess);
@@ -793,7 +822,7 @@ export default function Page() {
   const anames = (ids) => members.filter((m) => (ids || []).includes(m.id)).map((m) => m.name).join(", ") || "Unassigned";
   const aN = aa ? " - " + ((members.find((m) => m.id === aa) || {}).name || "") : "";
   const fh = (a) => a.url || fl(a);
-  const fl = (a) => "/api/file?f=" + a.id + "&n=" + encodeURIComponent(a.name) + "&key=" + key + "&project=" + encodeURIComponent(projectId);
+  const fl = (a) => "/api/file?f=" + a.id + "&n=" + encodeURIComponent(a.name) + "&key=" + key + "&project=" + encodeURIComponent(projectId) + "&ticketOffset=" + encodeURIComponent(localStorage.getItem("rw-ticket-offset") || "0");
   const selectMeetingMember = (memberId) => {
     const member = members.find((item) => item.id === memberId && item.status === "active" && item.role !== "Client");
     if (!member) return;
@@ -1086,7 +1115,8 @@ export default function Page() {
             <td className="ra"><button className="ic" title="View details, solution and attachments" onClick={() => setDetail(t.id)}><Ic d={EYE} /></button>
               {t.status !== "Completed" && <button className="ic" title="Edit" onClick={() => setModal({ ...t })}><Ic d={PEN} /></button>}
               {t.status === "Completed" && <button className="ic" onClick={() => reopen(t)}>Reopen</button>}</td></tr>))}
-          {!tickets.length && <tr><td colSpan="7" className="empty">You have not raised any tickets yet. Use the buttons above to raise one.</td></tr>}</tbody></table></div></section>) : view === "account" ? (<section className="acc">
+          {!tickets.length && <tr><td colSpan="7" className="empty">You have not raised any tickets yet. Use the buttons above to raise one.</td></tr>}</tbody></table></div>
+          <div className="tools"><span className="note">Showing {tickets.length ? ticketOffset + 1 : 0}–{ticketOffset + tickets.length} of {ticketTotal} tickets</span><button className="btn alt" disabled={ticketOffset === 0 || ticketPageLoading} onClick={() => loadTicketPage(Math.max(0, ticketOffset - 100))}>Previous</button><button className="btn alt" disabled={!ticketHasMore || ticketPageLoading} onClick={() => loadTicketPage(ticketOffset + 100)}>{ticketPageLoading ? "Loading…" : "Next"}</button></div></section>) : view === "account" ? (<section className="acc">
           <div className="panel"><h3>Profile</h3>
             <div className="prof"><span className="av">{me.name.split(" ").map((w) => w[0]).slice(0, 2).join("").toUpperCase()}</span><div><b>{me.name}</b><div className="dd">{me.email}</div><span className={"pill r" + me.role}>{me.role}</span></div></div>
             <form onSubmit={(e) => saveAcct(e, false)}><div className="g">
@@ -1153,6 +1183,7 @@ export default function Page() {
               <select value={fp} onChange={(e) => setFp(e.target.value)}><option value="">All priorities</option>{PRIO.map((s) => <option key={s}>{s}</option>)}</select>
               <select value={fa} onChange={(e) => setFa(e.target.value)}><option value="">All assignees</option><option value="none">Unassigned</option>{members.filter((x) => x.role !== "Client").map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}</select>
             </div>
+            <p className="note">Showing {tickets.length ? ticketOffset + 1 : 0}–{ticketOffset + tickets.length} of {ticketTotal} tickets. Search and filters apply to this page.</p>
             <div className="wrap"><table>
               <thead><tr><th>ID</th><th>Ticket</th><th>Raised</th><th>Priority</th><th>Assignee</th><th>Release</th><th>Status</th><th>Completed</th><th>Actions</th></tr></thead>
               <tbody>
@@ -1179,6 +1210,10 @@ export default function Page() {
                 {!rows.length && <tr><td colSpan="9" className="empty">No tickets found.</td></tr>}
               </tbody>
             </table></div>
+            <div className="tools">
+              <button className="btn alt" disabled={ticketOffset === 0 || ticketPageLoading} onClick={() => loadTicketPage(Math.max(0, ticketOffset - 100))}>Previous</button>
+              <button className="btn alt" disabled={!ticketHasMore || ticketPageLoading} onClick={() => loadTicketPage(ticketOffset + 100)}>{ticketPageLoading ? "Loading…" : "Next"}</button>
+            </div>
           </section>
         </>)}
       </main>

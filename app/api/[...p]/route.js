@@ -2,20 +2,21 @@ import path from "path";
 import crypto from "crypto";
 import { SEED } from "../../../lib/seed";
 import { sendEmail, emailStatus } from "../../../lib/email";
-import { loadDb, saveDb, putFile, getFile, delFile, remote } from "../../../lib/store";
+import { getWorkspaceMemberCount, loadDb, loadLoginDb, saveDb, putFile, getFile, delFile, remote } from "../../../lib/store";
 import { check } from "../../../lib/reminders";
 
 export const dynamic = "force-dynamic";
-const load = () => loadDb(() => ({ tickets: SEED, members: [], invites: [], meetings: [] }));
+const load = (scope) => loadDb(() => ({ tickets: SEED, members: [], invites: [], meetings: [] }), scope);
 const save = async (d) => {
   const activeProject = d._activeProject;
   const data = { ...d };
+  delete data._activeProject;
+  delete data._activeProjectId;
   if (activeProject) {
     activeProject.tickets = d.tickets; activeProject.files = d.files; activeProject.audit = d.audit;
-    delete data._activeProject; delete data._activeProjectId;
     delete data.tickets; delete data.files; delete data.audit;
   }
-  await saveDb(data);
+  await saveDb(data, d);
 };
 const uid = () => crypto.randomBytes(16).toString("hex");
 const J = (o, s = 200) => Response.json(o, { status: s });
@@ -35,8 +36,10 @@ const openGoogleToken = (sealed) => {
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
 };
-async function googleAccessToken(d) {
-  if (!googleOAuthConfigured() || !d.googleCalendar?.refreshToken) {
+const googleCalendarForOrganization = (d, organizationId) => d.googleCalendars?.[organizationId];
+async function googleAccessToken(d, organizationId) {
+  const calendar = googleCalendarForOrganization(d, organizationId);
+  if (!googleOAuthConfigured() || !calendar?.refreshToken) {
     throw new Error("Connect a Google Calendar account first. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET on the server.");
   }
   const response = await fetch("https://oauth2.googleapis.com/token", {
@@ -45,7 +48,7 @@ async function googleAccessToken(d) {
     body: new URLSearchParams({
       client_id: process.env.GOOGLE_CLIENT_ID,
       client_secret: process.env.GOOGLE_CLIENT_SECRET,
-      refresh_token: openGoogleToken(d.googleCalendar.refreshToken),
+      refresh_token: openGoogleToken(calendar.refreshToken),
       grant_type: "refresh_token",
     }),
     cache: "no-store",
@@ -56,8 +59,8 @@ async function googleAccessToken(d) {
   }
   return result.access_token;
 }
-async function createGoogleMeetEvent(d, meeting, timeZone) {
-  const accessToken = await googleAccessToken(d);
+async function createGoogleMeetEvent(d, meeting, timeZone, organizationId) {
+  const accessToken = await googleAccessToken(d, organizationId);
   const [year, month, day] = meeting.date.split("-").map(Number);
   const [hour, minute] = meeting.time.split(":").map(Number);
   const endDateTime = new Date(Date.UTC(year, month - 1, day, hour, minute + meeting.duration)).toISOString().slice(0, 19);
@@ -143,7 +146,7 @@ const siteUrl = (origin) => {
 const live = (x) => { const t = +String(x).split(".")[1]; return !t || Date.now() - t < SESSION; };
 const pwOk = (p) => p && p.length >= 8 && /[a-z]/i.test(p) && /\d/.test(p);
 const PWMSG = "Password must be 8+ characters with at least one letter and one number";
-const log = (d, who, act, detail) => { d.audit.unshift({ at: new Date().toISOString(), who, act, detail: detail || "" }); d.audit.length = Math.min(d.audit.length, 1000); };
+const log = (d, who, act, detail) => { d.audit.unshift({ id: uid(), at: new Date().toISOString(), who, act, detail: detail || "" }); d.audit.length = Math.min(d.audit.length, 1000); };
 const TICKET_AUDIT_FIELDS = [
   ["title", "Title"], ["type", "Type"], ["status", "Status"], ["priority", "Priority"],
   ["by", "Raised by"], ["date", "Raised date"], ["closed", "Completed date"],
@@ -214,7 +217,45 @@ async function h(req, p, m) {
     if (!process.env.CRON_SECRET || req.headers.get("authorization") !== "Bearer " + process.env.CRON_SECRET) return J({ error: "denied" }, 401);
     await check(); return J({ ok: true });
   }
-  const d = await load();
+  const key = req.headers.get("x-key") || u.searchParams.get("key");
+  if (remote && r === "login" && m === "POST") {
+    const body = await req.json();
+    const id = String(body.id || "").trim().toLowerCase();
+    const failure = fails.get(id) || { n: 0, t: 0 };
+    if (failure.n >= 5 && Date.now() - failure.t < 300000) return J({ error: "Too many attempts. Try again in 5 minutes." }, 429);
+    const phone = id.includes("@") ? "" : np(id);
+    const d = await loadLoginDb(id.includes("@") ? id : "", phone, () => ({ tickets: SEED, members: [], invites: [], meetings: [] }));
+    const member = d.members.find((item) => item.email === id || (phone && np(item.phone) === phone));
+    if (!member || !verify(String(body.password || ""), member.pw)) {
+      fails.set(id, { n: failure.n + 1, t: Date.now() });
+      return J({ error: "Invalid email/phone or password" }, 401);
+    }
+    if (member.status === "disabled") return J({ error: "This account is disabled. Please contact an admin." }, 403);
+    fails.delete(id);
+    const sessionToken = uid() + "." + Date.now();
+    member.sessions = [...(member.sessions || []), sessionToken].slice(-5);
+    await saveDb(d);
+    return J({ key: sessionToken });
+  }
+  if (remote && !key && r === "db" && m === "GET") {
+    const memberCount = await getWorkspaceMemberCount();
+    if (memberCount > 0) return J({ error: "denied" }, 401);
+    if (!process.env.ADMIN_EMAIL || !pwOk(process.env.ADMIN_PASSWORD)) return J({ setup: true });
+  }
+  const requestedProject = u.searchParams.get("project");
+  const pageSize = Math.min(200, Math.max(1, Number.parseInt(u.searchParams.get("limit") || "100", 10) || 100));
+  const pageOffset = Math.max(0, Number.parseInt(
+    (r === "tickets" ? u.searchParams.get("offset") : u.searchParams.get("ticketOffset")) || "0",
+    10,
+  ) || 0);
+  const d = await load(key ? {
+    sessionToken: key,
+    projectId: requestedProject,
+    ticketOffset: pageOffset,
+    ticketLimit: pageSize,
+  } : undefined);
+  if (d._scopeUnauthorized) return J({ error: "denied" }, 401);
+  if (d._scopeForbidden) return J({ error: "You are not a member of this project" }, 403);
   d.audit = d.audit || []; d.resets = d.resets || []; d.files = d.files || []; d.meetings = d.meetings || []; d.meetingNotes = d.meetingNotes || [];
   d.meetingEditRequests = d.meetingEditRequests || [];
   d.meetings.forEach((meeting) => { if (!meeting.projectId) meeting.projectId = "rewaldo"; });
@@ -282,7 +323,6 @@ async function h(req, p, m) {
   d.invites = d.invites || [];
   d.invites.forEach((invite) => { invite.projectId = invite.projectId || "rewaldo"; });
   if (!d.v5) { d.v5 = true; await save(d); }
-  const requestedProject = u.searchParams.get("project");
   let project = d.projects.find((x) => x.id === requestedProject) || d.projects[0];
   if (requestedProject && !d.projects.some((x) => x.id === requestedProject)) return J({ error: "Project not found" }, 404);
   d.resets = d.resets || [];
@@ -293,7 +333,6 @@ async function h(req, p, m) {
     d.organizations.forEach((organization) => { organization.adminIds = [...new Set([...(organization.adminIds || []), m.id])]; });
     claim(d, m); await save(d);
   }
-  const key = req.headers.get("x-key") || u.searchParams.get("key");
   const account = key && d.members.find((x) => x.status !== "disabled" && (x.key === key || (x.sessions || []).some((v) => v === key && live(v))));
   if (!requestedProject && account) project = d.projects.find((x) => x.members.some((entry) => entry.memberId === account.id && entry.status !== "disabled")) || project;
   d._activeProject = project; d._activeProjectId = project.id;
@@ -353,19 +392,24 @@ async function h(req, p, m) {
         destination.searchParams.set("reason", "profile");
         return Response.redirect(destination);
       }
-      const previousToken = String(profile.email || "").toLowerCase() === String(d.googleCalendar?.email || "").toLowerCase()
-        ? d.googleCalendar?.refreshToken
+      const currentCalendar = googleCalendarForOrganization(d, pendingProject.organizationId);
+      const previousToken = String(profile.email || "").toLowerCase() === String(currentCalendar?.email || "").toLowerCase()
+        ? currentCalendar?.refreshToken
         : "";
       if (!tokens.refresh_token && !previousToken) {
         destination.searchParams.set("google-meet", "error");
         destination.searchParams.set("reason", "refresh-token");
         return Response.redirect(destination);
       }
-      d.googleCalendar = {
-        refreshToken: tokens.refresh_token ? sealGoogleToken(tokens.refresh_token) : previousToken,
-        email: String(profile.email || ""),
-        connectedBy: pending.memberId,
-        connectedAt: new Date().toISOString(),
+      d.googleCalendars = {
+        ...(d.googleCalendars || {}),
+        [pendingProject.organizationId]: {
+          organizationId: pendingProject.organizationId,
+          refreshToken: tokens.refresh_token ? sealGoogleToken(tokens.refresh_token) : previousToken,
+          email: String(profile.email || ""),
+          connectedBy: pending.memberId,
+          connectedAt: new Date().toISOString(),
+        },
       };
       await save(d);
       destination.searchParams.set("google-meet", "connected");
@@ -385,13 +429,14 @@ async function h(req, p, m) {
       const meetingEditAccessExpiresAt = editGrant ? editGrant.expiresAt : null;
       if (me.role === "Client") {
         const mine = d.tickets.filter((t) => t.createdBy === me.id);
-        return J({ me: pub(me), projects, organizations, projectId: project.id, canUseMeetings, canManageMeetings, meetingEditAccess, meetingEditAccessExpiresAt, meetingEditRequests, tickets: mine.map((t) => ({ id: t.id, type: t.type, date: t.date, by: t.by, title: t.title, details: t.details, resolution: t.resolution, notes: t.notes, closed: t.closed, createdBy: t.createdBy, status: ["Completed", "Reopened"].includes(t.status) ? t.status : "In Progress" })), members: [], invites: [], audit: [], files: d.files.filter((x) => mine.some((t) => t.id === x.ticket)) });
+        return J({ me: pub(me), projects, organizations, projectId: project.id, canUseMeetings, canManageMeetings, meetingEditAccess, meetingEditAccessExpiresAt, meetingEditRequests, tickets: mine.map((t) => ({ id: t.id, type: t.type, date: t.date, by: t.by, title: t.title, details: t.details, resolution: t.resolution, notes: t.notes, closed: t.closed, createdBy: t.createdBy, status: ["Completed", "Reopened"].includes(t.status) ? t.status : "In Progress" })), ticketPagination: { offset: d._scope?.ticket_offset || 0, limit: d._scope?.ticket_limit || d.tickets.length, total: d._scope?.ticket_total ?? d.tickets.length, hasMore: (d._scope?.ticket_offset || 0) + d.tickets.length < (d._scope?.ticket_total ?? d.tickets.length) }, members: [], invites: [], audit: [], files: d.files.filter((x) => mine.some((t) => t.id === x.ticket)) });
       }
       const members = project.members.map((entry) => {
         const member = d.members.find((x) => x.id === entry.memberId);
         return member ? { ...pub(member), role: entry.role, status: entry.status === "disabled" || member.status === "disabled" ? "disabled" : "active" } : null;
       }).filter(Boolean);
-      return J({ me: pub(me), projects: projects.map((item) => { const projectItem = d.projects.find((entry) => entry.id === item.id); return { ...item, organizationId: projectItem?.organizationId || defaultOrganization.id }; }), organizations, projectId: project.id, canUseMeetings, canManageMeetings, meetingEditAccess, meetingEditAccessExpiresAt, meetingEditRequests, googleCalendarConfigured: googleOAuthConfigured(), googleCalendarConnected: !!d.googleCalendar?.refreshToken, googleCalendarEmail: me.role === "Admin" ? d.googleCalendar?.email || "" : "", tickets: d.tickets, members, invites: me.role === "Admin" ? d.invites.filter((x) => x.projectId === project.id) : [], audit: me.role === "Admin" ? d.audit.slice(0, 300) : [], files: d.files });
+      const googleCalendar = googleCalendarForOrganization(d, project.organizationId);
+      return J({ me: pub(me), projects: projects.map((item) => { const projectItem = d.projects.find((entry) => entry.id === item.id); return { ...item, organizationId: projectItem?.organizationId || defaultOrganization.id }; }), organizations, projectId: project.id, canUseMeetings, canManageMeetings, meetingEditAccess, meetingEditAccessExpiresAt, meetingEditRequests, googleCalendarConfigured: googleOAuthConfigured(), googleCalendarConnected: !!googleCalendar?.refreshToken, googleCalendarEmail: me.role === "Admin" ? googleCalendar?.email || "" : "", tickets: d.tickets, ticketPagination: { offset: d._scope?.ticket_offset || 0, limit: d._scope?.ticket_limit || d.tickets.length, total: d._scope?.ticket_total ?? d.tickets.length, hasMore: (d._scope?.ticket_offset || 0) + d.tickets.length < (d._scope?.ticket_total ?? d.tickets.length) }, members, invites: me.role === "Admin" ? d.invites.filter((x) => x.projectId === project.id) : [], audit: me.role === "Admin" ? d.audit.slice(0, 300) : [], files: d.files });
     }
     if (m === "GET" && r === "invite") {
       const i = d.invites.find((x) => x.token === u.searchParams.get("t"));
@@ -430,8 +475,8 @@ async function h(req, p, m) {
       if (!canManageMeetings) return J({ error: "Project admin access required" }, 403);
       return J({
         configured: googleOAuthConfigured(),
-        connected: !!d.googleCalendar?.refreshToken,
-        email: d.googleCalendar?.email || "",
+        connected: !!googleCalendarForOrganization(d, project.organizationId)?.refreshToken,
+        email: googleCalendarForOrganization(d, project.organizationId)?.email || "",
       });
     }
     if (r === "meeting-notes" && m === "GET") {
@@ -464,12 +509,25 @@ async function h(req, p, m) {
       if (!audio) return J({ error: "Recording file is missing" }, 404);
       return new Response(audio, { headers: { "Content-Type": clip.type || "audio/webm", "Content-Disposition": `inline; filename="${clip.name}"`, "Cache-Control": "private, no-store" } });
     }
+    if (r === "tickets" && m === "GET") {
+      return J({
+        tickets: d.tickets,
+        pagination: {
+          offset: d._scope?.ticket_offset || 0,
+          limit: d._scope?.ticket_limit || d.tickets.length,
+          total: d._scope?.ticket_total ?? d.tickets.length,
+          hasMore: (d._scope?.ticket_offset || 0) + d.tickets.length < (d._scope?.ticket_total ?? d.tickets.length),
+        },
+      });
+    }
     if (m !== "POST") return J({ error: "not found" }, 404);
     if (r === "google-meet") {
       if (!canManageMeetings) return J({ error: "Project admin access required" }, 403);
       const b = await req.json();
       if (b.action === "disconnect") {
-        delete d.googleCalendar;
+        const calendars = { ...(d.googleCalendars || {}) };
+        delete calendars[project.organizationId];
+        d.googleCalendars = calendars;
         await save(d);
         return J({ ok: true });
       }
@@ -594,9 +652,9 @@ async function h(req, p, m) {
           }
         }
         const meeting = { id: uid().slice(0, 12), projectId: project.id, title, date, time, duration, agenda, weekly: false, online, roomProvider, roomName, roomUrl, attendees: attendees.map((member) => ({ id: member.id, name: member.name, email: member.email })), roster: eligibleMembers.map((member) => ({ id: member.id, name: member.name, email: member.email })), createdBy: account.id, createdByName: me.name, occurrences: {} };
-        if (online && roomProvider === "google-meet" && d.googleCalendar?.refreshToken) {
+        if (online && roomProvider === "google-meet" && googleCalendarForOrganization(d, project.organizationId)?.refreshToken) {
           try {
-            const googleEvent = await createGoogleMeetEvent(d, meeting, timeZone);
+            const googleEvent = await createGoogleMeetEvent(d, meeting, timeZone, project.organizationId);
             meeting.roomUrl = googleEvent.meetLink;
             meeting.googleCalendarEventId = googleEvent.eventId;
           } catch (error) {
@@ -1227,7 +1285,11 @@ async function h(req, p, m) {
       await save(d);
       return J({ ok: true });
     }
-  } catch (e) { return J({ error: String(e) }, 500); }
+  } catch (e) {
+    const message = String(e);
+    const conflict = message.includes("Concurrent update detected") || message.includes("A record was created by another request");
+    return J({ error: conflict ? "This record changed in another request. Reload the page and retry." : message }, conflict ? 409 : 500);
+  }
   return J({ error: "not found" }, 404);
 }
 const handle = async (req, { params }, method) => {
@@ -1235,7 +1297,8 @@ const handle = async (req, { params }, method) => {
     return await h(req, params.p, method);
   } catch (error) {
     console.error("API request failed:", error);
-    return J({ error: `API request failed: ${error.message}` }, 500);
+    const conflict = String(error.message).includes("Concurrent update detected") || String(error.message).includes("A record was created by another request");
+    return J({ error: conflict ? "This record changed in another request. Reload the page and retry." : `API request failed: ${error.message}` }, conflict ? 409 : 500);
   }
 };
 export const GET = (req, context) => handle(req, context, "GET");
