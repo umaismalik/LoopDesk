@@ -23,6 +23,29 @@ const conferenceLaunchUrl = (provider) => ({
   "microsoft-teams": "https://teams.microsoft.com/",
   zoom: "https://zoom.us/start/videomeeting",
 }[provider] || "");
+const meetingCards = (meeting, members) => {
+  const saved = new Map((meeting?.participantSummaries || []).map((card) => [card.memberId, card]));
+  const eligible = members.filter((member) => member.status === "active" && member.role !== "Client");
+  return eligible.map((member) => {
+    const id = member.id;
+    const card = saved.get(id);
+    return { memberId: id, name: member.name, points: card?.points || [], tasks: card?.tasks || [], description: card?.description || "", priority: card?.priority || "Medium" };
+  });
+};
+const meetingVoiceAttendees = (members, me) => {
+  const activeTeam = members.filter((member) => member.status === "active" && member.role !== "Client");
+  if (me?.role === "Admin" && !activeTeam.some((member) => member.id === me.id)) return [...activeTeam, me];
+  return activeTeam;
+};
+const MEMBER_CARD_COLORS = ["#2563eb", "#0f9f8f", "#d97706", "#7c3aed", "#db2777", "#0891b2", "#4f46e5", "#65a30d"];
+const mergeVoiceCards = (existing, incoming) => {
+  const cards = new Map(existing.map((card) => [card.memberId, card]));
+  incoming.forEach((card) => {
+    const previous = cards.get(card.memberId);
+    cards.set(card.memberId, { ...previous, ...card, priority: previous?.priority || card.priority || "Medium" });
+  });
+  return [...cards.values()];
+};
 let jitsiApiScriptPromise;
 function JitsiMeetingEmbed({ roomUrl, title }) {
   const containerRef = useRef(null);
@@ -156,9 +179,16 @@ export default function Page() {
   const [me, setMe] = useState(null);
   const [canUseMeetings, setCanUseMeetings] = useState(false);
   const [canManageMeetings, setCanManageMeetings] = useState(false);
+  const [meetingEditAccess, setMeetingEditAccess] = useState(false);
+  const [meetingEditAccessExpiresAt, setMeetingEditAccessExpiresAt] = useState(null);
+  const [meetingEditRequests, setMeetingEditRequests] = useState([]);
   const [projects, setProjects] = useState([]);
+  const [organizations, setOrganizations] = useState([]);
   const [projectId, setProjectId] = useState("");
   const [projectModal, setProjectModal] = useState(false);
+  const [organizationModal, setOrganizationModal] = useState(false);
+  const [organizationName, setOrganizationName] = useState("");
+  const [projectOrganizationId, setProjectOrganizationId] = useState("");
   const [projectName, setProjectName] = useState("");
   const [tickets, setTickets] = useState([]);
   const [members, setMembers] = useState([]);
@@ -189,11 +219,17 @@ export default function Page() {
   const [meetingFormOpen, setMeetingFormOpen] = useState(false);
   const [meetingForm, setMeetingForm] = useState({ title: "Team meeting", date: today(), time: "10:00", duration: "60", agenda: "", online: true, roomProvider: "google-meet", roomUrl: "", attendeeIds: [] });
   const [participantSummaries, setParticipantSummaries] = useState([]);
+  const [selectedMeetingMemberId, setSelectedMeetingMemberId] = useState("");
+  const [meetingCardView, setMeetingCardView] = useState("selected");
   const [recordingCards, setRecordingCards] = useState([]);
   const [meetingError, setMeetingError] = useState("");
   const [meetingNotice, setMeetingNotice] = useState("");
+  const [dashboardNotice, setDashboardNotice] = useState("");
   const [meetingVoiceError, setMeetingVoiceError] = useState("");
   const [meetingBusy, setMeetingBusy] = useState(false);
+  const [googleCalendarConfigured, setGoogleCalendarConfigured] = useState(false);
+  const [googleCalendarConnected, setGoogleCalendarConnected] = useState(false);
+  const [googleCalendarEmail, setGoogleCalendarEmail] = useState("");
   const [recordingState, setRecordingState] = useState("idle");
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [transcriptionLanguage, setTranscriptionLanguage] = useState("auto");
@@ -201,18 +237,24 @@ export default function Page() {
   const [transcriptionProgress, setTranscriptionProgress] = useState("");
   const [pendingRecording, setPendingRecording] = useState(null);
   const [failedRecording, setFailedRecording] = useState(null);
-  const [recordedClipUrl, setRecordedClipUrl] = useState("");
+  const [recordingClips, setRecordingClips] = useState([]);
   const [recordingTranscript, setRecordingTranscript] = useState("");
-  const [recordingAudio, setRecordingAudio] = useState(null);
   const [recordingSaved, setRecordingSaved] = useState(false);
   const [recordingNoteId, setRecordingNoteId] = useState("");
+  const [sharingParticipantIds, setSharingParticipantIds] = useState([]);
   const [conferenceJoined, setConferenceJoined] = useState(false);
   const recorderRef = useRef(null);
   const recordingStreamRef = useRef(null);
   const recordingTimerRef = useRef(null);
-  useEffect(() => () => {
-    if (recordedClipUrl) URL.revokeObjectURL(recordedClipUrl);
-  }, [recordedClipUrl]);
+  const handleMeetingAccessChange = useCallback((canEdit, expiresAt, requests) => {
+    setMeetingEditAccess(canEdit);
+    setMeetingEditAccessExpiresAt(expiresAt);
+    if (requests) setMeetingEditRequests(requests);
+  }, []);
+  const recordingClipsRef = useRef([]);
+  const recordingNotesStartRef = useRef(null);
+  useEffect(() => { recordingClipsRef.current = recordingClips; }, [recordingClips]);
+  useEffect(() => () => recordingClipsRef.current.forEach((clip) => URL.revokeObjectURL(clip.url)), []);
   useEffect(() => () => {
     clearInterval(recordingTimerRef.current);
     if (recorderRef.current && recorderRef.current.state !== "inactive") recorderRef.current.stop();
@@ -231,16 +273,63 @@ export default function Page() {
     if (!r.ok) { if (r.status === 401) setScreen("login"); else alert(r.error || "Unable to load project"); return; }
     applyDb(r);
     function applyDb(data) {
-      setMe(data.me); setCanUseMeetings(data.canUseMeetings === undefined ? data.me.role !== "Client" : data.canUseMeetings); setCanManageMeetings(!!data.canManageMeetings); setProjects(data.projects || []); setProjectId(data.projectId); localStorage.setItem("rw-project", data.projectId);
+      setMe(data.me); setCanUseMeetings(data.canUseMeetings === undefined ? data.me.role !== "Client" : data.canUseMeetings); setCanManageMeetings(!!data.canManageMeetings); setMeetingEditAccess(!!data.meetingEditAccess); setMeetingEditAccessExpiresAt(data.meetingEditAccessExpiresAt || null); setMeetingEditRequests(data.meetingEditRequests || []); setGoogleCalendarConfigured(!!data.googleCalendarConfigured); setGoogleCalendarConnected(!!data.googleCalendarConnected); setGoogleCalendarEmail(data.googleCalendarEmail || ""); setProjects(data.projects || []); setOrganizations(data.organizations || []); setProjectId(data.projectId); localStorage.setItem("rw-project", data.projectId);
       setView((v) => data.me.role === "Client" && v !== "account" ? "portal" : v); setAcct({ name: data.me.name, phone: data.me.phone || "", current: "", password: "", confirm: "" }); setTickets(data.tickets); setMembers(data.members); setInvites(data.invites || []); setAudit(data.audit || []); setFiles(data.files || []); setScreen("app");
     }
   }, []);
   useEffect(() => {
     const sp = new URLSearchParams(location.search), t = sp.get("invite");
     if (sp.get("reset")) { setScreen("reset"); return; }
+    if (sp.has("google-meet")) {
+      setView("meetings");
+      if (sp.get("google-meet") === "connected") setMeetingNotice("Google Calendar connected. New online meetings can now create shareable Google Meet rooms automatically.");
+      else setMeetingError(`Google Calendar connection did not complete (${sp.get("reason") || "cancelled"}). Check the OAuth setup and try again.`);
+      history.replaceState(null, "", "/");
+    }
     if (t) api("invite?t=" + t).then((r) => { setInv({ ...r, token: t }); setScreen(r.email ? "accept" : "denied"); });
     else { const k = localStorage.getItem("rw-key") || ""; setKey(k); load(k); }
   }, [load]);
+  useEffect(() => {
+    if (!meetingEditAccessExpiresAt) return;
+    const timer = setTimeout(() => {
+      if (Date.now() >= meetingEditAccessExpiresAt) {
+        setMeetingEditAccess(false);
+        setMeetingEditAccessExpiresAt(null);
+      }
+    }, Math.max(0, meetingEditAccessExpiresAt - Date.now()));
+    return () => clearTimeout(timer);
+  }, [meetingEditAccessExpiresAt]);
+  useEffect(() => {
+    if (view === "meetings" || recordingState !== "idle" || !meetingSelected) return;
+    setMeetingSelected(null);
+    setMeetingDraft("");
+    setParticipantSummaries([]);
+    setSelectedMeetingMemberId("");
+    setRecordingTranscript("");
+    setRecordingCards([]);
+    setMeetingError("");
+    setMeetingNotice("");
+  }, [view, recordingState, meetingSelected]);
+  useEffect(() => {
+    const pending = meetingEditRequests.some((item) => item.projectId === projectId && item.memberId === me?.id && item.status === "pending");
+    if (!pending || !key || !projectId) return;
+    const timer = setInterval(async () => {
+      const result = await api("meeting-notes?month=" + monthKey(meetingMonth), null, key, projectId);
+      if (!result.ok) return;
+      setMeetingEditAccess(!!result.canEdit);
+      setMeetingEditAccessExpiresAt(result.expiresAt || null);
+      setMeetingEditRequests(result.requests || []);
+    }, 15000);
+    return () => clearInterval(timer);
+  }, [meetingEditRequests, me, key, projectId, meetingMonth]);
+  useEffect(() => {
+    if (me?.role !== "Admin" || view !== "all" || !key || !projectId) return;
+    const timer = setInterval(async () => {
+      const result = await api("meeting-notes?month=" + monthKey(meetingMonth), null, key, projectId);
+      if (result.ok) setMeetingEditRequests(result.requests || []);
+    }, 30000);
+    return () => clearInterval(timer);
+  }, [me, view, key, projectId, meetingMonth]);
   useEffect(() => {
     if (view !== "meetings" || !key || !projectId) return;
     let cancelled = false;
@@ -274,7 +363,9 @@ export default function Page() {
   const commit = async (next) => { setTickets(next); const r = await api("tickets", { tickets: next }, key, projectId); if (!r.ok) { alert(r.error || "Save failed"); load(key); } };
 
   const admin = me && me.role === "Admin", canEdit = me && me.role !== "Collaborator" && me.role !== "Client", client = me && me.role === "Client";
+  const canEditMeetingContent = !!me && (["Admin", "Collaborator"].includes(me.role) || meetingEditAccess);
   const activeProject = projects.find((p) => p.id === projectId);
+  const activeOrganization = organizations.find((organization) => organization.id === activeProject?.organizationId);
   const canDel = (t) => admin && !(t.assignees || []).includes(me.id);
   const base = useMemo(() => tickets.filter((t) => view === "all" || t.type === view), [tickets, view]);
   const months = useMemo(() => [...new Set(base.map((t) => (t.date || "").slice(0, 7)).filter(Boolean))].sort(), [base]);
@@ -352,21 +443,43 @@ export default function Page() {
   const createMeeting = async (e) => {
     e.preventDefault(); setMeetingError(""); setMeetingNotice(""); setMeetingBusy(true);
     try {
-      const r = await api("meetings", { action: "create", ...meetingForm, duration: Number(meetingForm.duration) }, key, projectId);
+      const r = await api("meetings", { action: "create", ...meetingForm, duration: Number(meetingForm.duration), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC" }, key, projectId);
       if (!r.ok) { setMeetingError(r.error || "Could not create meeting"); return; }
       setMeetingFormOpen(false);
       setMeetingMonth(new Date(meetingForm.date + "T00:00:00"));
       setMeetingSelected({ ...r.meeting, occurrenceDate: meetingForm.date });
       setMeetingDraft("");
-      setParticipantSummaries([]);
+      const savedCards = meetingCards(r.meeting, members);
+      setParticipantSummaries(savedCards);
+      setSelectedMeetingMemberId(savedCards[0]?.memberId || "");
+      setMeetingCardView("selected");
       if (r.inviteEmailsSent < r.inviteEmailsTotal) setMeetingError(`Meeting scheduled, but invitation emails were delivered to ${r.inviteEmailsSent} of ${r.inviteEmailsTotal} invitees. ${r.emailErrors?.[0] || "Check the server email configuration."}`);
       else if (r.inviteEmailsTotal) setMeetingNotice(`Meeting scheduled. Invitation emails sent to ${r.inviteEmailsSent} team member(s).`);
       await refreshMeetings(meetingForm.date.slice(0, 7));
     } catch (error) { setMeetingError(error.message || "Could not create meeting"); }
     finally { setMeetingBusy(false); }
   };
+  const connectGoogleCalendar = async () => {
+    setMeetingError("");
+    const result = await api("google-meet", { action: "connect" }, key, projectId);
+    if (!result.ok || !result.authorizationUrl) {
+      setMeetingError(result.error || "Could not start Google Calendar connection.");
+      return;
+    }
+    window.location.assign(result.authorizationUrl);
+  };
+  const disconnectGoogleCalendar = async () => {
+    const result = await api("google-meet", { action: "disconnect" }, key, projectId);
+    if (!result.ok) {
+      setMeetingError(result.error || "Could not disconnect Google Calendar.");
+      return;
+    }
+    setGoogleCalendarConnected(false);
+    setGoogleCalendarEmail("");
+    setMeetingNotice("Google Calendar disconnected.");
+  };
   const saveMeetingNotes = async () => {
-    if (!meetingSelected) return;
+    if (!meetingSelected || !canEditMeetingContent) return;
     setMeetingError(""); setMeetingNotice(""); setMeetingBusy(true);
     try {
       const r = await api("meetings", { action: "notes", id: meetingSelected.id, occurrenceDate: meetingSelected.occurrenceDate, notes: meetingDraft, participantSummaries }, key, projectId);
@@ -401,17 +514,21 @@ export default function Page() {
     }, 1000);
   };
   const startMeetingRecording = async () => {
-    if (recordingTranscript && !recordingSaved) {
-      setMeetingError("Save the current recording as a monthly note before starting another clip.");
+    if (!recordingSaved && recordingClips.length >= 20) {
+      setMeetingVoiceError("A single recording note can contain up to 20 clips. Save or cancel this recording set before starting another.");
       return;
     }
     setMeetingVoiceError("");
+    setMeetingError("");
     setFailedRecording(null);
-    setRecordingTranscript("");
-    setRecordingAudio(null);
-    setRecordingCards([]);
-    setRecordingSaved(false);
-    setRecordingNoteId("");
+    if (recordingSaved) {
+      recordingClips.forEach((clip) => URL.revokeObjectURL(clip.url));
+      setRecordingClips([]);
+      setRecordingTranscript("");
+      setRecordingCards([]);
+      setRecordingSaved(false);
+      setRecordingNoteId("");
+    }
     if (!window.isSecureContext) {
       setMeetingVoiceError("Microphone recording requires a secure connection (HTTPS). Open the portal using HTTPS, or use localhost for local development.");
       return;
@@ -447,13 +564,14 @@ export default function Page() {
         cleanup();
         const audio = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
         if (!audio.size) { setRecordingState("idle"); setMeetingVoiceError("No audio was recorded."); return; }
-        setRecordedClipUrl(URL.createObjectURL(audio));
-        setRecordingAudio(audio);
+        const clip = { id: crypto.randomUUID(), audio, url: URL.createObjectURL(audio), transcript: "" };
+        setRecordingClips((clips) => [...clips, clip]);
         setHasRecordedVoiceNote(true);
         setFailedRecording(null);
         setRecordingState("transcribing"); setTranscriptionProgress("Preparing on-device transcription…"); setMeetingVoiceError("");
         setPendingRecording(audio);
       };
+      if (recordingSaved || !recordingClips.length) recordingNotesStartRef.current = meetingDraft;
       recorder.start(1000); setRecordingSeconds(0); setRecordingState("recording");
       runRecordingClock(recorder);
     } catch (error) {
@@ -488,34 +606,41 @@ export default function Page() {
     recorderRef.current.stop();
   };
   const onTranscriptionComplete = useCallback((text) => {
-    const attendees = meetingSelected?.roster || meetingSelected?.attendees || [];
+    const attendees = meetingVoiceAttendees(members, me);
     const correctedText = correctTurnNames(text, attendees);
-    setRecordingTranscript(correctedText);
+    setMeetingVoiceError("");
+    setRecordingTranscript((transcript) => transcript ? `${transcript}\n\n${correctedText}` : correctedText);
     const keyPoints = generateEnglishKeyPoints(correctedText);
-    if (keyPoints) setMeetingDraft((notes) => (notes.trim() ? notes.trimEnd() + "\n\n" : "") + keyPoints);
-    const cards = generateMeetingParticipantCards(correctedText, attendees);
-    setRecordingCards(cards);
+    if (keyPoints) setMeetingDraft((notes) => notes.trim() ? `${notes.trimEnd()}\n\n${keyPoints}` : keyPoints);
+    const cards = generateMeetingParticipantCards(correctedText, attendees, selectedMeetingMemberId);
     if (cards.length) {
-      setParticipantSummaries((previous) => {
-        const merged = new Map(previous.map((card) => [card.memberId, card]));
-        cards.forEach((card) => {
-          const earlier = merged.get(card.memberId) || { ...card, points: [], tasks: [] };
-          merged.set(card.memberId, {
-            ...card,
-            points: [...new Set([...earlier.points, ...card.points])].slice(0, 20),
-            tasks: [...new Set([...earlier.tasks, ...card.tasks])].slice(0, 30),
-          });
+      setParticipantSummaries((previous) => mergeVoiceCards(previous, cards));
+      setSelectedMeetingMemberId(cards[0].memberId);
+      setMeetingCardView("selected");
+    }
+    setRecordingCards((previous) => {
+      const merged = new Map(previous.map((card) => [card.memberId, card]));
+      cards.forEach((card) => {
+        const earlier = merged.get(card.memberId) || { ...card, points: [], tasks: [], priority: "Medium" };
+        merged.set(card.memberId, {
+          ...card,
+          points: [...new Set([...earlier.points, ...card.points])].slice(0, 20),
+          tasks: [...new Set([...earlier.tasks, ...card.tasks])].slice(0, 30),
+          priority: earlier.priority || "Medium",
         });
-        return [...merged.values()];
       });
-    } else {
-      setMeetingVoiceError("General English key points were added. No team member was clearly identified by name and a turn-taking phrase, so no individual card was created. Review speaker assignments before sharing.");
+      return [...merged.values()];
+    });
+    setRecordingClips((clips) => clips.map((clip) => clip.audio === pendingRecording ? { ...clip, transcript: correctedText } : clip));
+    if (!cards.length) {
+      setMeetingVoiceError("");
+      setMeetingNotice("Transcript added to shared meeting notes. Say a team member's name or select their card before recording to route spoken updates into their fields.");
     }
     setRecordingState("idle");
     setTranscriptionProgress("");
     setFailedRecording(null);
     setPendingRecording(null);
-  }, [meetingSelected]);
+  }, [key, meetingSelected, pendingRecording, projectId, members, me, selectedMeetingMemberId]);
   const onTranscriptionError = useCallback((message) => {
     setMeetingVoiceError(message);
     setRecordingState("idle");
@@ -531,8 +656,58 @@ export default function Page() {
     setRecordingState("transcribing");
     setPendingRecording(failedRecording);
   };
+  const shareParticipantSummary = async (card) => {
+    if (!meetingSelected || !canEditMeetingContent || sharingParticipantIds.includes(card.memberId)) return;
+    setMeetingError(""); setMeetingNotice("");
+    setSharingParticipantIds((ids) => [...ids, card.memberId]);
+    try {
+      const result = await api("meetings", {
+        action: "participant-summary",
+        id: meetingSelected.id,
+        occurrenceDate: meetingSelected.occurrenceDate || meetingSelected.date,
+        memberId: card.memberId,
+        points: card.points,
+        tasks: card.tasks,
+        priority: card.priority || "Medium",
+      }, key, projectId);
+      if (!result.ok) {
+        setMeetingError(`Could not share ${card.name}'s notes: ${result.error || "email delivery failed"}`);
+        return;
+      }
+      if (result.sent) {
+        const sharedCard = { ...card, points: [...card.points], tasks: [...card.tasks] };
+        const summaries = [...(meetingSelected.participantSummaries || []).filter((item) => item.memberId !== card.memberId), sharedCard];
+        setMeetingSelected((selected) => selected ? { ...selected, participantSummaries: summaries } : selected);
+        setParticipantSummaries(summaries);
+        setSelectedMeetingMemberId(card.memberId);
+        setMeetings((items) => items.map((item) => item.id === meetingSelected.id && item.occurrenceDate === (meetingSelected.occurrenceDate || meetingSelected.date)
+          ? { ...item, participantSummaries: summaries }
+          : item));
+        setMeetingNotice(`${card.name}'s reviewed meeting notes were emailed directly to them.`);
+      } else {
+        setMeetingNotice(`${card.name}'s current notes were already shared.`);
+      }
+    } finally {
+      setSharingParticipantIds((ids) => ids.filter((id) => id !== card.memberId));
+    }
+  };
+  const cancelRecordingNotes = () => {
+    recordingClips.forEach((clip) => URL.revokeObjectURL(clip.url));
+    if (recordingNotesStartRef.current !== null) setMeetingDraft(recordingNotesStartRef.current);
+    recordingNotesStartRef.current = null;
+    setRecordingClips([]);
+    setRecordingTranscript("");
+    setRecordingCards([]);
+    setRecordingSaved(false);
+    setRecordingNoteId("");
+    setFailedRecording(null);
+    setPendingRecording(null);
+    setMeetingVoiceError("");
+    setMeetingError("");
+    setMeetingNotice("Unsaved recording notes were discarded. You can start a new recording.");
+  };
   const saveRecordingAsNote = async () => {
-    if (!meetingSelected || !recordingTranscript.trim()) return;
+    if (!meetingSelected || !canEditMeetingContent || !recordingTranscript.trim()) return;
     setMeetingError(""); setMeetingNotice(""); setMeetingBusy(true);
     try {
       let noteId = recordingNoteId;
@@ -541,7 +716,7 @@ export default function Page() {
         const summary = generateEnglishKeyPoints(recordingTranscript);
         const cards = recordingCards.map((card) => ({ ...card, points: card.points || [], tasks: card.tasks || [] }));
         const tasks = cards.flatMap((card) => card.tasks.map((title) => ({
-          id: crypto.randomUUID(), title, assigneeId: card.memberId, dueDate: "", status: "Open", comments: [],
+          id: crypto.randomUUID(), title, description: (card.description || "").slice(0, 2000), assigneeId: card.memberId, dueDate: "", status: "Open", comments: [], priority: card.priority || "Medium",
         })));
         result = await api("meeting-notes", {
           action: "create", meetingId: meetingSelected.id, date: meetingSelected.occurrenceDate || meetingSelected.date,
@@ -552,13 +727,14 @@ export default function Page() {
         noteId = result.note.id;
         setRecordingNoteId(noteId);
       }
-      if (recordingAudio) {
+      for (const [clipIndex, clip] of recordingClips.entries()) {
         const formData = new FormData();
         formData.append("noteId", noteId);
-        formData.append("file", recordingAudio, "meeting-recording.webm");
+        formData.append("clipIndex", String(clipIndex));
+        formData.append("file", clip.audio, `meeting-recording-${clipIndex + 1}.webm`);
         const upload = await api("meeting-recording", formData, key, projectId);
         if (!upload.ok) {
-          setMeetingNotice("Notes and transcript saved, but recording upload failed: " + (upload.error || "Unknown error"));
+          setMeetingNotice(`Notes saved, but recording clip ${clipIndex + 1} could not be uploaded: ` + (upload.error || "Unknown error"));
           return;
         }
       }
@@ -568,16 +744,44 @@ export default function Page() {
         setMeetingError(`Recording notes saved, but ${emailFailures} member summary or task assignment email(s) failed. ${result.emailErrors?.[0] || "Check the configured email provider."}`);
       } else {
         const sent = (result.summaryEmailsSent || 0) + (result.taskEmailsSent || 0);
-        setMeetingNotice(`Recording and notes saved as a separate monthly entry.${sent ? ` Member summary or task emails sent: ${sent}.` : " No member-specific email was generated for this clip."}`);
+        setMeetingNotice(`Recording notes saved as one monthly entry with ${recordingClips.length} clip(s).${sent ? ` Member summary or task emails sent: ${sent}.` : " No member-specific email was generated."}`);
       }
     } catch (error) { setMeetingError(error.message || "Could not save recording notes"); }
     finally { setMeetingBusy(false); }
   };
   const createProject = async (e) => {
     e.preventDefault();
-    const r = await api("project", { name: projectName }, key, projectId);
+    const r = await api("project", { name: projectName, organizationId: projectOrganizationId || activeOrganization?.id }, key, projectId);
     if (!r.ok) return alert(r.error || "Could not create project");
     setProjectModal(false); setProjectName(""); setView("all"); load(key, r.project.id);
+  };
+  const createOrganization = async (e) => {
+    e.preventDefault();
+    const result = await api("organization", { name: organizationName }, key, projectId);
+    if (!result.ok) return alert(result.error || "Could not create company");
+    setOrganizations((items) => [...items.filter((item) => item.id !== result.organization.id), result.organization]);
+    setProjectOrganizationId(result.organization.id);
+    setOrganizationName("");
+    setOrganizationModal(false);
+    setProjectName("");
+    setProjectModal(true);
+    load(key, projectId);
+  };
+  const requestMeetingEditAccess = async () => {
+    setMeetingError(""); setMeetingNotice("");
+    const result = await api("meeting-notes", { action: "request-edit-access" }, key, projectId);
+    if (!result.ok) { setMeetingError(result.error || "Could not request temporary edit access"); return; }
+    if (result.canEdit) setMeetingEditAccess(true);
+    if (result.request) setMeetingEditRequests((requests) => [...requests.filter((item) => item.id !== result.request.id), result.request]);
+    setMeetingNotice(result.canEdit
+      ? "Your one-hour meeting edit access is active."
+      : `One-hour access request sent. Admin email notifications sent: ${result.adminNotificationsSent || 0}${result.adminNotificationsFailed ? `; email failed: ${result.emailErrors?.[0] || "check server email settings"}` : ""}. Pending requests also appear on the admin dashboard.`);
+  };
+  const reviewMeetingEditRequest = async (requestId, decision) => {
+    const result = await api("meeting-notes", { action: "review-edit-access", requestId, decision }, key, projectId);
+    if (!result.ok) { setDashboardNotice(result.error || "Could not review access request"); return; }
+    setMeetingEditRequests((requests) => requests.map((item) => item.id === requestId ? result.request : item));
+    setDashboardNotice(decision === "approve" ? `${result.request.memberName} has meeting edit access for one hour.` : `Edit request from ${result.request.memberName} was denied.`);
   };
   const sendInvite = async (e) => {
     e.preventDefault();
@@ -590,12 +794,34 @@ export default function Page() {
   const aN = aa ? " - " + ((members.find((m) => m.id === aa) || {}).name || "") : "";
   const fh = (a) => a.url || fl(a);
   const fl = (a) => "/api/file?f=" + a.id + "&n=" + encodeURIComponent(a.name) + "&key=" + key + "&project=" + encodeURIComponent(projectId);
+  const selectMeetingMember = (memberId) => {
+    const member = members.find((item) => item.id === memberId && item.status === "active" && item.role !== "Client");
+    if (!member) return;
+    setParticipantSummaries((items) => items.some((item) => item.memberId === memberId)
+      ? items
+      : [...items, { memberId, name: member.name, points: [], tasks: [], description: "", priority: "Medium" }]);
+    setSelectedMeetingMemberId(memberId);
+    setMeetingCardView("selected");
+  };
+  const updateRecordingCard = (card, changes) => {
+    const updated = { ...card, ...changes };
+    setRecordingCards((items) => items.map((item) => item.memberId === card.memberId ? updated : item));
+    setParticipantSummaries((items) => mergeVoiceCards(items, [updated]));
+    setSelectedMeetingMemberId(card.memberId);
+  };
+  const moveMeetingMember = (direction) => {
+    const eligible = members.filter((member) => member.status === "active" && member.role !== "Client");
+    if (!eligible.length) return;
+    const currentIndex = eligible.findIndex((member) => member.id === selectedMeetingMemberId);
+    const nextIndex = currentIndex < 0 ? 0 : (currentIndex + direction + eligible.length) % eligible.length;
+    selectMeetingMember(eligible[nextIndex].id);
+  };
 
   const L = (k) => ({ value: lf[k], onChange: (e) => setLf({ ...lf, [k]: e.target.value }) });
   const A = (k) => ({ value: (acct || {})[k] || "", onChange: (e) => setAcct({ ...acct, [k]: e.target.value }) });
   if (screen !== "app") return (
     <div className="gate"><div className="modal">
-      <div className="brand dk"><span className="brand-mark"><img src="/solexes-logo.png" alt="Solexes" /></span><div><b>Solexes Ticket Managment portal</b><small>Project management</small></div></div>
+      <div className="brand dk"><span className="brand-mark"><img src="/loopdesk-mark.svg" alt="" /></span><div><b>LoopDesk</b><small>Team &amp; project management</small></div></div>
       {screen === "loading" && <p>Loading...</p>}
       {screen === "denied" && <p>This invitation is invalid or has expired. Please ask an admin for a new one.</p>}
       {screen === "login" && (<form onSubmit={(e) => { e.preventDefault(); join("login", { id: lf.id, password: lf.password }); }}><h2>Sign in</h2>
@@ -629,24 +855,54 @@ export default function Page() {
   return (
     <div className="app">
       <aside className="side">
-        <div className="brand"><span className="brand-mark"><img src="/solexes-logo.png" alt="Solexes" /></span><div><b>Solexes Ticket Managment portal</b><small>Project management</small></div></div>
+        <div className="brand"><span className="brand-mark"><img src="/loopdesk-mark.svg" alt="" /></span><div><b>LoopDesk</b><small>Team &amp; project management</small></div></div>
         <div className="project-picker">
-          <label htmlFor="project-select">PROJECT</label>
-          <select id="project-select" value={projectId} onChange={(e) => { const id = e.target.value; setProjectId(id); setView(client ? "portal" : "all"); setModal(null); setDetail(null); load(key, id); }}>
-            {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          <label htmlFor="organization-select">COMPANY</label>
+          <select id="organization-select" value={activeOrganization?.id || ""} onChange={(event) => {
+            if (event.target.value === "__add_company__") { setOrganizationName(""); setOrganizationModal(true); return; }
+            const nextProject = projects.find((item) => item.organizationId === event.target.value);
+            if (nextProject) { setProjectId(nextProject.id); setMeetingSelected(null); setMeetingDraft(""); setParticipantSummaries([]); setView(client ? "portal" : "all"); setModal(null); setDetail(null); load(key, nextProject.id); }
+          }}>
+            {organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}
+            {admin && <option value="__add_company__">＋ Add company…</option>}
           </select>
-          {admin && <button type="button" className="add-project" onClick={() => { setProjectName(""); setProjectModal(true); }}>+ Add project</button>}
+          <label htmlFor="project-select">PROJECT</label>
+          <select id="project-select" value={projectId} onChange={(e) => {
+            if (e.target.value === "__add_project__") { setProjectName(""); setProjectOrganizationId(activeOrganization?.id || organizations.find((item) => item.canCreateProject)?.id || ""); setProjectModal(true); return; }
+            const id = e.target.value;
+            setProjectId(id); setMeetingSelected(null); setMeetingDraft(""); setParticipantSummaries([]); setView(client ? "portal" : "all"); setModal(null); setDetail(null); load(key, id);
+          }}>
+            {projects.filter((item) => item.organizationId === activeOrganization?.id).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            {organizations.some((item) => item.id === activeOrganization?.id && item.canCreateProject) && <option value="__add_project__">＋ Add project…</option>}
+          </select>
         </div>
-        {nav.map(([k, l]) => (<button key={k} className={"nav " + (view === k ? "on" : "")} onClick={() => setView(k)}>{l}{k !== "meeting-notes" && <em>{k === "files" ? files.length : k === "activity" ? audit.length : k === "team" ? members.length : k === "meetings" ? meetings.length : tickets.filter((t) => k === "all" || k === "portal" || t.type === k).length}</em>}</button>))}
+        {nav.map(([k, l]) => (<button key={k} className={"nav " + (view === k ? "on" : "")} onClick={() => {
+          if (k === "meetings" && view !== "meetings" && recordingState === "idle") {
+            setMeetingSelected(null); setMeetingDraft(""); setParticipantSummaries([]); setSelectedMeetingMemberId("");
+            setRecordingTranscript(""); setRecordingCards([]); setRecordingNoteId(""); setRecordingSaved(false); setMeetingError(""); setMeetingNotice("");
+          }
+          setView(k);
+        }}>{l}{k !== "meeting-notes" && <em>{k === "files" ? files.length : k === "activity" ? audit.length : k === "team" ? members.length : k === "meetings" ? meetings.length : tickets.filter((t) => k === "all" || k === "portal" || t.type === k).length}</em>}</button>))}
         {!client && <button className="nav ghost" onClick={exportCsv}>Export CSV</button>}
         <button className={"nav ghost " + (view === "account" ? "on" : "")} onClick={() => { setAmsg(""); setView("account"); }}>My account</button>
         <button className="nav ghost" onClick={async () => { await api("logout", {}, key); localStorage.removeItem("rw-key"); location.reload(); }}>Sign out</button>
       </aside>
       <main className="main">
         <header className="top">
-          <div><h1>{{ all: "Support Dashboard", issue: "Issues Log", feature: "Features Log", team: "Team & Roles", meetings: "Meeting Calendar", "meeting-notes": "Meeting Notes & Tasks", activity: "Activity Log", files: "Attachments", account: "My Account", portal: "My Tickets" }[view]}</h1><p><b>{activeProject?.name}</b> · Signed in as <b>{me.name}</b> <span className={"pill r" + me.role}>{me.role}</span></p></div>
+          <div><h1>{{ all: "Support Dashboard", issue: "Issues Log", feature: "Features Log", team: "Team & Roles", meetings: "Meeting Calendar", "meeting-notes": "Meeting Notes & Tasks", activity: "Activity Log", files: "Attachments", account: "My Account", portal: "My Tickets" }[view]}</h1><p><b>{activeOrganization?.name}</b> · <b>{activeProject?.name}</b> · Signed in as <b>{me.name}</b> <span className={"pill r" + me.role}>{me.role}</span></p></div>
           {!["team", "activity", "files", "account", "meetings", "meeting-notes"].includes(view) && <div className="acts"><button className="btn alt" onClick={() => setModal(blank("feature"))}>+ New Feature</button><button className="btn" onClick={() => setModal(blank("issue"))}>+ New Issue</button></div>}
         </header>
+
+        {view === "all" && admin && <section className="panel dashboard-access-notifications">
+          <div className="dashboard-access-heading"><div><h2>Meeting edit approvals</h2><p>Temporary edit access requests for this project.</p></div><span>{meetingEditRequests.filter((item) => item.projectId === projectId && item.status === "pending").length} pending</span></div>
+          {dashboardNotice && <div className="meeting-success" role="status">{dashboardNotice}</div>}
+          {meetingEditRequests.filter((item) => item.projectId === projectId && item.status === "pending").length
+            ? meetingEditRequests.filter((item) => item.projectId === projectId && item.status === "pending").map((item) => <article key={item.id}>
+              <div><b>{item.memberName}</b><span>Requested {new Date(item.requestedAt).toLocaleString()} · meeting cards and notes · 1 hour</span></div>
+              <div><button type="button" className="btn" onClick={() => reviewMeetingEditRequest(item.id, "approve")}>Approve 1 hour</button><button type="button" className="btn alt" onClick={() => reviewMeetingEditRequest(item.id, "deny")}>Deny</button></div>
+            </article>)
+            : <p className="meeting-empty">No pending meeting edit requests.</p>}
+        </section>}
 
         {view === "meetings" ? (<section className="meeting-page">
           <div className="meeting-hero">
@@ -666,13 +922,23 @@ export default function Page() {
                 <label>Meeting title<input required maxLength={120} value={meetingForm.title} onChange={(e) => setMeetingForm({ ...meetingForm, title: e.target.value })} /></label>
                 <label>Date<input required type="date" value={meetingForm.date} onChange={(e) => setMeetingForm({ ...meetingForm, date: e.target.value })} /></label>
                 <label>Start time<input required type="time" value={meetingForm.time} onChange={(e) => setMeetingForm({ ...meetingForm, time: e.target.value })} /></label>
-                <label>Duration (minutes)<input required type="number" min="15" max="480" step="15" value={meetingForm.duration} onChange={(e) => setMeetingForm({ ...meetingForm, duration: e.target.value })} /></label>
+                <label>Duration (minutes)<input required type="number" min="15" max="60" step="15" value={meetingForm.duration} onChange={(e) => setMeetingForm({ ...meetingForm, duration: e.target.value })} /></label>
                 <label className="meeting-weekly"><input type="checkbox" checked={meetingForm.online} onChange={(e) => setMeetingForm({ ...meetingForm, online: e.target.checked })} /> Online meeting</label>
                 {meetingForm.online && <>
-                  <label>Conference service<select value={meetingForm.roomProvider} onChange={(e) => setMeetingForm({ ...meetingForm, roomProvider: e.target.value, roomUrl: "" })}><option value="google-meet">Google Meet (free group meetings up to 60 minutes)</option><option value="microsoft-teams">Microsoft Teams</option><option value="zoom">Zoom</option><option value="jitsi">Public Jitsi (service availability/limits may vary)</option></select></label>
-                  {meetingForm.roomProvider !== "jitsi" && <div className="meeting-provider-actions">
-                    <a className="btn alt" href={conferenceLaunchUrl(meetingForm.roomProvider)} target="_blank" rel="noreferrer">Open {meetingForm.roomProvider === "google-meet" ? "Google Meet" : meetingForm.roomProvider === "zoom" ? "Zoom" : "Microsoft Teams"}</a>
-                    <label className="meeting-agenda">Shared join link (optional; needed in invite emails)<input type="url" placeholder={meetingForm.roomProvider === "google-meet" ? "Paste the Meet link after creating it" : "Paste the invite link after creating it"} value={meetingForm.roomUrl} onChange={(e) => setMeetingForm({ ...meetingForm, roomUrl: e.target.value })} /></label>
+                  <label>Conference service<select value={meetingForm.roomProvider} onChange={(e) => setMeetingForm({ ...meetingForm, roomProvider: e.target.value, roomUrl: "" })}><option value="google-meet">Google Meet</option><option value="zoom">Zoom</option></select></label>
+                  {meetingForm.roomProvider === "google-meet" ? <div className="meeting-provider-actions">
+                    {canManageMeetings && googleCalendarConnected
+                      ? <span className="meeting-google-status">Connected to Google Calendar{googleCalendarEmail ? ` · ${googleCalendarEmail}` : ""}</span>
+                      : canManageMeetings && googleCalendarConfigured
+                        ? <button type="button" className="btn alt" onClick={connectGoogleCalendar}>Connect Google Calendar</button>
+                        : canManageMeetings
+                          ? <span className="meeting-invite-hint">Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET on the server to enable Meet room creation.</span>
+                          : <span className="meeting-invite-hint">A project admin must connect Google Calendar to create Meet rooms automatically.</span>}
+                    {canManageMeetings && googleCalendarConnected && <button type="button" className="btn alt" onClick={disconnectGoogleCalendar}>Disconnect</button>}
+                    {!googleCalendarConnected && <label className="meeting-agenda">Existing Google Meet link (optional)<input type="url" placeholder="Paste an existing Meet link if not connecting Google Calendar" value={meetingForm.roomUrl} onChange={(e) => setMeetingForm({ ...meetingForm, roomUrl: e.target.value })} /></label>}
+                  </div> : <div className="meeting-provider-actions">
+                    <a className="btn alt" href={conferenceLaunchUrl("zoom")} target="_blank" rel="noreferrer">Open Zoom</a>
+                    <label className="meeting-agenda">Shared join link (needed in invite emails)<input type="url" placeholder="Paste the Zoom invite link" value={meetingForm.roomUrl} onChange={(e) => setMeetingForm({ ...meetingForm, roomUrl: e.target.value })} /></label>
                   </div>}
                 </>}
                 <fieldset className="meeting-invitees">
@@ -689,7 +955,7 @@ export default function Page() {
                 </fieldset>
                 <label className="meeting-agenda">Agenda<textarea rows="3" maxLength="3000" value={meetingForm.agenda} onChange={(e) => setMeetingForm({ ...meetingForm, agenda: e.target.value })} placeholder="Topics for the team to discuss" /></label>
               </div>
-              <p className="meeting-invite-hint">{meetingForm.online ? meetingForm.roomProvider === "jitsi" ? "Invitees receive a public Jitsi room link. Public room duration/availability is not guaranteed." : "Use the button to open the service. Creating a shared Google Meet or Zoom room requires that provider; paste its resulting invite link above if you want it included in invitation emails. A free personal Google account supports group calls up to 60 minutes." : "This is an in-person meeting; invitees receive the date and time by email."} Recording uses this device's microphone; online-call audio is not captured unless the microphone can hear the room speakers.</p>
+              <p className="meeting-invite-hint">{meetingForm.online ? meetingForm.roomProvider === "google-meet" ? googleCalendarConnected ? "A Google Meet room and shareable link will be created automatically when you schedule." : "Connect Google Calendar to create a shareable Meet room automatically, or paste a Meet link above. Meetings are limited to 60 minutes." : "Open Zoom, create a meeting there, then paste its shareable invite link. Meetings are limited to 60 minutes." : "This is an in-person meeting; invitees receive the date and time by email. Meetings are limited to 60 minutes."} Recording uses this device's microphone; online-call audio is not captured unless the microphone can hear the room speakers.</p>
               <div className="acts end"><button type="button" className="btn alt" onClick={() => setMeetingFormOpen(false)}>Cancel</button><button className="btn" disabled={meetingBusy}>{meetingBusy ? "Saving…" : "Schedule"}</button></div>
             </form>}
             <div className="meeting-calendar">
@@ -698,7 +964,7 @@ export default function Page() {
                 const dateKey = localDateKey(date), inMonth = date.getMonth() === meetingMonth.getMonth();
                 return <div className={"meeting-day" + (inMonth ? "" : " outside") + (dateKey === localDateKey(new Date()) ? " today" : "")} key={dateKey}>
                   <span className="meeting-day-number">{date.getDate()}</span>
-                  {meetings.filter((meeting) => meeting.date === dateKey).map((meeting) => <button disabled={recordingState !== "idle"} className={"meeting-event" + (meetingSelected?.id === meeting.id && meetingSelected?.occurrenceDate === meeting.occurrenceDate ? " selected" : "")} key={meeting.id + dateKey} onClick={() => { setMeetingSelected(meeting); setMeetingDraft(meeting.notes || ""); setParticipantSummaries(meeting.participantSummaries || []); setRecordingTranscript(""); setRecordingAudio(null); setRecordingSaved(false); setRecordingNoteId(""); setRecordingCards([]); setConferenceJoined(false); setMeetingError(""); setMeetingNotice(""); setMeetingVoiceError(""); setHasRecordedVoiceNote(false); setRecordingSeconds(0); setRecordedClipUrl(""); setFailedRecording(null); }}>
+                  {meetings.filter((meeting) => meeting.date === dateKey).map((meeting) => <button disabled={recordingState !== "idle" || (!!recordingClips.length && !recordingSaved)} className={"meeting-event" + (meetingSelected?.id === meeting.id && meetingSelected?.occurrenceDate === meeting.occurrenceDate ? " selected" : "")} key={meeting.id + dateKey} onClick={() => { setMeetingSelected(meeting); setMeetingDraft(meeting.notes || ""); const cards = meetingCards(meeting, members); setParticipantSummaries(cards); setSelectedMeetingMemberId(cards[0]?.memberId || ""); setMeetingCardView("selected"); setRecordingTranscript(""); recordingClips.forEach((clip) => URL.revokeObjectURL(clip.url)); setRecordingClips([]); setRecordingSaved(false); setRecordingNoteId(""); setRecordingCards([]); setConferenceJoined(false); setMeetingError(""); setMeetingNotice(""); setMeetingVoiceError(""); setHasRecordedVoiceNote(false); setRecordingSeconds(0); setFailedRecording(null); }}>
                     <b>{meeting.time}</b> {meeting.title}{meeting.online && <small>Online</small>}
                   </button>)}
                 </div>;
@@ -712,6 +978,8 @@ export default function Page() {
             <div className="meeting-detail-head"><div><h2>{meetingSelected.title}</h2><p>{fmt(meetingSelected.occurrenceDate)} · {meetingSelected.time} · {meetingSelected.duration} minutes · {activeProject?.name}</p></div>
               {(meetingSelected.createdBy === me.id || canManageMeetings) && <button className="ic dl" onClick={() => deleteMeeting(meetingSelected)}>Delete meeting</button>}
             </div>
+            {!canEditMeetingContent && <div className="meeting-access-banner"><div><b>View-only meeting cards</b><span>Only Admins and Collaborators can edit meeting cards and notes. Request a one-hour approval from a project admin; you can still change status on tasks assigned to you in Meeting Notes.</span></div><button type="button" className="btn" disabled={meetingBusy || meetingEditRequests.some((item) => item.projectId === projectId && item.memberId === me.id && item.status === "pending")} onClick={requestMeetingEditAccess}>{meetingEditRequests.some((item) => item.projectId === projectId && item.memberId === me.id && item.status === "pending") ? "Request pending" : "Request 1-hour edit access"}</button></div>}
+            {!["Admin", "Collaborator"].includes(me.role) && meetingEditAccess && meetingEditAccessExpiresAt && <div className="meeting-access-banner active"><div><b>Temporary edit access is active</b><span>Expires {new Date(meetingEditAccessExpiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.</span></div></div>}
               {meetingSelected.online && <section className="meeting-room">
                 <div className="meeting-room-toolbar"><div><h3>{meetingSelected.roomProvider === "jitsi" ? "Jitsi conference room" : `${meetingSelected.roomProvider === "google-meet" ? "Google Meet" : meetingSelected.roomProvider === "zoom" ? "Zoom" : "Microsoft Teams"} conference`}</h3>{meetingSelected.roomUrl ? <a href={meetingSelected.roomUrl} target="_blank" rel="noreferrer">{meetingSelected.roomUrl}</a> : <span className="meeting-invite-hint">No shared invite link is saved.</span>}</div>
                   {meetingSelected.roomProvider === "jitsi" ? <button className="btn" onClick={() => setConferenceJoined((joined) => !joined)}>{conferenceJoined ? "Close room" : "Join in dashboard"}</button> : <a className="btn" href={meetingSelected.roomUrl || conferenceLaunchUrl(meetingSelected.roomProvider)} target="_blank" rel="noreferrer">{meetingSelected.roomUrl ? "Join meeting" : `Open ${meetingSelected.roomProvider === "google-meet" ? "Google Meet" : meetingSelected.roomProvider === "zoom" ? "Zoom" : "Teams"}`}</a>}
@@ -721,26 +989,79 @@ export default function Page() {
                 <p className="meeting-invite-hint">{meetingSelected.roomProvider === "jitsi" ? "Public Jitsi room: anyone with the link may join, and duration/availability is not guaranteed." : meetingSelected.roomUrl ? "The conference opens in a new tab; meeting duration and recording depend on that provider's account." : "The button opens the conference service, but does not create a shared room or send an invite link. Create the room there and share its join link with invitees."}</p>
               </section>}
             {meetingSelected.agenda && <div className="meeting-agenda-read"><b>Agenda</b><p>{meetingSelected.agenda}</p></div>}
-            <div className="meeting-attendee-list"><b>Invited team members</b><span>{(meetingSelected.attendees || []).length ? meetingSelected.attendees.map((attendee) => attendee.name).join(", ") : "No invitees selected"}</span></div>
-            {recordedClipUrl && <div className="meeting-audio-preview"><span>Latest recorded clip</span><audio controls preload="metadata" src={recordedClipUrl}>Audio preview unavailable in this browser.</audio></div>}
-            {!!participantSummaries.length && <section className="meeting-summary-cards" aria-label="Individual participant meeting summaries">
-              <h3>Individual key points & action items <small>Speaker attribution is inferred from name and turn-taking phrases; review and edit before saving or emailing.</small></h3>
-              <div className="meeting-summary-grid">{participantSummaries.map((card) => <article className="meeting-summary-card" key={card.memberId}>
+            <div className="meeting-attendee-list"><b>Meeting invitees</b><span>{(meetingSelected.attendees || []).length ? meetingSelected.attendees.map((attendee) => attendee.name).join(", ") : "No invitees selected"} Voice routing recognizes all active team members, including the admin.</span></div>
+            {!!recordingClips.length && <div className="meeting-audio-preview"><span>Recording clips ({recordingClips.length})</span><div>{recordingClips.map((clip, index) => <div key={clip.id}><label>Clip {index + 1}</label><audio controls preload="metadata" src={clip.url}>Audio preview unavailable in this browser.</audio></div>)}</div></div>}
+            {!!recordingTranscript && <label className="meeting-transcript-review">English transcript (AI-generated; review and correct before sharing)<textarea disabled={!canEditMeetingContent} rows="6" value={recordingTranscript} onChange={(event) => {
+              const transcript = event.target.value;
+              setRecordingTranscript(transcript);
+              const keyPoints = generateEnglishKeyPoints(transcript);
+              const baseNotes = recordingNotesStartRef.current || "";
+              setMeetingDraft(keyPoints ? (baseNotes.trim() ? `${baseNotes.trimEnd()}\n\n` : "") + keyPoints : baseNotes);
+              const suggestions = generateMeetingParticipantCards(transcript, meetingVoiceAttendees(members, me), selectedMeetingMemberId);
+              setRecordingCards((previous) => suggestions.map((card) => ({ ...card, priority: previous.find((item) => item.memberId === card.memberId)?.priority || "Medium" })));
+              if (suggestions.length) {
+                setParticipantSummaries((previous) => mergeVoiceCards(previous, suggestions));
+                setSelectedMeetingMemberId(suggestions[0].memberId);
+                setMeetingCardView("selected");
+              }
+            }} /></label>}
+            {!!recordingCards.length && <section className="meeting-summary-cards" aria-label="Recording participant notes">
+              <h3>Member notes from this recording <small>Check the speaker and correct these AI-generated notes before sharing. Only the card you choose is emailed to that member.</small></h3>
+              <div className="meeting-summary-grid">{recordingCards.map((card) => <article className="meeting-summary-card" key={card.memberId}>
                 <h4>{card.name}</h4>
-                <label>Key points (one per line)<textarea rows="4" value={card.points.join("\n")} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, points: event.target.value.split("\n").map((line) => line.trim()).filter(Boolean) } : item))} /></label>
-                <label>Action items (one per line)<textarea rows="3" value={card.tasks.join("\n")} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, tasks: event.target.value.split("\n").map((line) => line.trim()).filter(Boolean) } : item))} /></label>
+                <label>Key points (one per line)<textarea disabled={!canEditMeetingContent} rows="4" value={card.points.join("\n")} onChange={(event) => updateRecordingCard(card, { points: event.target.value.split("\n") })} /></label>
+                <label>Priority<select disabled={!canEditMeetingContent} value={card.priority || "Medium"} onChange={(event) => updateRecordingCard(card, { priority: event.target.value })}><option>High</option><option>Medium</option><option>Low</option></select></label>
+                <label>Action items (one per line)<textarea disabled={!canEditMeetingContent} rows="3" value={card.tasks.join("\n")} onChange={(event) => updateRecordingCard(card, { tasks: event.target.value.split("\n") })} /></label>
+                <button className="btn" disabled={!canEditMeetingContent || meetingBusy || recordingState !== "idle" || sharingParticipantIds.includes(card.memberId) || (!card.points.length && !card.tasks.length)} onClick={() => shareParticipantSummary(card)}>
+                  {sharingParticipantIds.includes(card.memberId) ? "Sharing…" : `Share ${card.name}'s notes by email`}
+                </button>
               </article>)}</div>
             </section>}
-            <label className="meeting-notes-label">Shared meeting notes<textarea rows="10" maxLength="20000" value={meetingDraft} onChange={(e) => setMeetingDraft(e.target.value)} placeholder="Capture decisions, action items, and follow-ups here." /></label>
+            <section className="meeting-summary-cards" aria-label="Team member updates and upcoming tasks">
+              <div className="meeting-cards-heading"><h3>Team task cards <small>Say a member's name to route their update automatically, or click a card before recording to use it as the default. Clicking alone does not add or change any notes.</small></h3>
+                <div className="meeting-member-controls">
+                  <label>Select team member<select aria-label="Select team member card" value={selectedMeetingMemberId} onChange={(event) => selectMeetingMember(event.target.value)}><option value="">Choose a member…</option>{members.filter((member) => member.status === "active" && member.role !== "Client").map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>
+                  <button type="button" className="btn alt" onClick={() => moveMeetingMember(-1)} disabled={!members.some((member) => member.status === "active" && member.role !== "Client")}>‹ Previous</button>
+                  <button type="button" className="btn alt" onClick={() => moveMeetingMember(1)} disabled={!members.some((member) => member.status === "active" && member.role !== "Client")}>Next member ›</button>
+                  <button type="button" className={"btn " + (meetingCardView === "all" ? "" : "alt")} aria-pressed={meetingCardView === "all"} onClick={() => setMeetingCardView((mode) => mode === "all" ? "selected" : "all")}>{meetingCardView === "all" ? "Show selected" : "Show all members"}</button>
+                </div>
+              </div>
+              <div className="meeting-member-picker" aria-label="Choose a member card">{members.filter((member) => member.status === "active" && member.role !== "Client").map((member, index) => {
+                const hasCard = participantSummaries.some((card) => card.memberId === member.id);
+                return <button type="button" key={member.id} className={"meeting-member-chip" + (selectedMeetingMemberId === member.id ? " selected" : "")} style={{ "--member-accent": MEMBER_CARD_COLORS[index % MEMBER_CARD_COLORS.length] }} aria-pressed={selectedMeetingMemberId === member.id} onClick={() => { selectMeetingMember(member.id); setMeetingCardView("selected"); }}>
+                  <span>{member.name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase()}</span><b>{member.name}</b>{hasCard && <small>Notes</small>}
+                </button>;
+              })}</div>
+              <div className={"meeting-summary-grid " + (meetingCardView === "all" ? "all-member-cards" : "single-member-card")}>{participantSummaries.filter((card) => meetingCardView === "all" || card.memberId === selectedMeetingMemberId).map((card) => {
+                const memberIndex = members.filter((member) => member.status === "active" && member.role !== "Client").findIndex((member) => member.id === card.memberId);
+                const recentWork = tickets.filter((ticket) => (ticket.assignees || []).includes(card.memberId)).sort((a, b) => (b.closed || b.date || "").localeCompare(a.closed || a.date || "")).slice(0, 3);
+                return <article className={"meeting-summary-card" + (selectedMeetingMemberId === card.memberId ? " selected-member-card" : "")} key={card.memberId} style={{ "--member-accent": MEMBER_CARD_COLORS[(memberIndex < 0 ? 0 : memberIndex) % MEMBER_CARD_COLORS.length] }} onClick={(event) => {
+                  if (meetingCardView === "all" && !event.target.closest("input,textarea,select,button,label")) {
+                    setSelectedMeetingMemberId(card.memberId);
+                    setMeetingCardView("selected");
+                  }
+                }}>
+                  <h4>{card.name}<span>{members.find((member) => member.id === card.memberId)?.role || "Team member"}</span></h4>
+                  <div className="meeting-recent-work"><b>Recent task updates</b>{recentWork.length ? recentWork.map((ticket) => <p key={ticket.id}><span>{ticket.title}</span><em>{ticket.status} · {ticket.closed || ticket.date}</em></p>) : <small>No recent ticket updates.</small>}</div>
+                  <label>Previous task update (one per line)<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="3" value={(card.points || []).join("\n")} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, points: event.target.value.split("\n") } : item))} placeholder="Summarize progress or blockers from the last task" /></label>
+                  <label>Task description / context<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="3" value={card.description || ""} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, description: event.target.value } : item))} placeholder="Add notes or context for the assigned task" /></label>
+                  <label>Priority for upcoming tasks<select disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} value={card.priority || "Medium"} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, priority: event.target.value } : item))}><option>High</option><option>Medium</option><option>Low</option></select></label>
+                  <label>Next tasks (one per line)<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="3" value={(card.tasks || []).join("\n")} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, tasks: event.target.value.split("\n") } : item))} placeholder="Write the next action; details and deadline can be managed in Meeting Notes" /></label>
+                </article>;
+              })}
+                {!selectedMeetingMemberId && <div className="meeting-member-empty"><b>Ready for the next update?</b><span>Select a team member above, or start recording and their turn will be selected when their name is recognized.</span></div>}
+              </div>
+            </section>
+            <label className="meeting-notes-label">Shared meeting notes<textarea disabled={!["Admin", "Collaborator"].includes(me.role)} rows="10" maxLength="20000" value={meetingDraft} onChange={(e) => setMeetingDraft(e.target.value)} placeholder="Capture decisions, action items, and follow-ups here." /></label>
             <div className="meeting-note-tools">
               <label className="meeting-language-setting">Spoken language
                 <select value={transcriptionLanguage} onChange={(event) => setTranscriptionLanguage(event.target.value)} disabled={recordingState !== "idle"}>
                   <option value="auto">Auto-detect</option>
                   <option value="english">English</option>
-                  <option value="urdu">Urdu</option>
+                  <option value="urdu">Urdu / Urdu-English</option>
                 </select>
               </label>
-              {recordingState === "idle" && <button className="btn meeting-record-button" disabled={!!recordingTranscript && !recordingSaved} onClick={startMeetingRecording}>{hasRecordedVoiceNote ? "Record another clip" : "Start microphone recording"}</button>}
+              {recordingState === "idle" && !failedRecording && (!recordingNoteId || recordingSaved) && <button className="btn meeting-record-button" disabled={!["Admin", "Collaborator"].includes(me.role)} onClick={startMeetingRecording}>{hasRecordedVoiceNote ? "Record another clip" : "Start microphone recording"}</button>}
               {recordingState === "recording" && <>
                 <button className="btn alt meeting-record-button" onClick={pauseMeetingRecording}>Pause</button>
                 <button className="btn meeting-record-button recording" onClick={stopMeetingRecording}>Finish & transcribe</button>
@@ -750,15 +1071,15 @@ export default function Page() {
                 <button className="btn alt meeting-record-button" onClick={stopMeetingRecording}>Finish & transcribe</button>
               </>}
               {recordingState === "transcribing" && <button className="btn meeting-record-button" disabled>Transcribing…</button>}
-              {recordingState === "idle" && failedRecording && <button className="btn alt meeting-record-button" onClick={retryLastTranscription}>Retry last clip</button>}
-              <span className={"meeting-record-status " + recordingState} aria-live="polite">{recordingState === "recording" ? `Recording · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")} · max 60 minutes` : recordingState === "paused" ? `Recording paused · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")}` : recordingState === "transcribing" ? transcriptionProgress || "Translating and preparing English key points…" : "Name-and-turn phrases help suggest member notes. This is a text heuristic, not voice identification; check speaker assignments."}</span>
-              <button className="btn" disabled={meetingBusy || recordingState !== "idle"} onClick={saveMeetingNotes}>{meetingBusy ? "Saving…" : "Save notes"}</button>
+              {recordingState === "idle" && failedRecording && <button className="btn alt meeting-record-button" disabled={!["Admin", "Collaborator"].includes(me.role)} onClick={retryLastTranscription}>Retry last clip</button>}
+              <span className={"meeting-record-status " + recordingState} aria-live="polite">{recordingState === "recording" ? `Recording · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")} · max 60 minutes` : recordingState === "paused" ? `Recording paused · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")}` : recordingState === "transcribing" ? transcriptionProgress || "Translating and preparing English key points…" : "For Urdu-English speech, select Urdu / Urdu-English. Repeated output is retried with a more accurate model. Review the transcript and speaker suggestions before saving."}</span>
+              {canEditMeetingContent && (!recordingClips.length || recordingSaved) && <button className="btn" disabled={meetingBusy || recordingState !== "idle"} onClick={saveMeetingNotes}>{meetingBusy ? "Saving…" : "Save notes"}</button>}
             </div>
-            {recordingTranscript && <div className="meeting-record-save"><span>Transcription ready. Save this clip separately in the project's monthly Meeting Notes list.</span><button className="btn" disabled={meetingBusy || recordingSaved} onClick={saveRecordingAsNote}>{meetingBusy ? "Saving…" : recordingSaved ? "Saved to Meeting Notes" : "Save recording as note"}</button></div>}
+            {!!recordingClips.length && !recordingSaved && <div className="meeting-record-save"><span>{recordingNoteId ? "The note is saved. Retry to finish uploading its clips." : `${recordingClips.filter((clip) => clip.transcript).length} of ${recordingClips.length} clip(s) transcribed. Add more clips, then save them together as one monthly note. Cancel removes this set's generated text from Shared meeting notes.`}</span><div>{!recordingNoteId && <button className="btn alt" disabled={meetingBusy || recordingState !== "idle"} onClick={cancelRecordingNotes}>Cancel recording notes</button>}{recordingNoteId || (recordingClips.every((clip) => clip.transcript) && recordingTranscript) ? <button className="btn" disabled={!["Admin", "Collaborator"].includes(me.role) || meetingBusy || recordingState !== "idle"} onClick={saveRecordingAsNote}>{meetingBusy ? "Saving…" : "Save recording as note"}</button> : null}</div></div>}
             {meetingVoiceError && <div className="meeting-alert meeting-voice-alert" role="alert"><b>Voice note unavailable</b><span>{meetingVoiceError}</span></div>}
-            <p className="meeting-privacy">The lighter Whisper Base model translates Urdu or English speech into English, then extracts up to five key-point bullets. It downloads the smaller model on first use; each 30-second audio chunk reports elapsed processing time. Audio remains on this device unless you explicitly save the recording as a monthly note; saved audio is uploaded to the app's configured storage. Base is faster but can be less accurate than larger models. Review the generated points before sharing.</p>
+            <p className="meeting-privacy">Whisper Base handles English; Urdu / Urdu-English uses Whisper Small. Unclear or placeholder output is retried with a more careful decode and rejected rather than shown as a confident transcript if still unusable. Edit the transcript and review the individual member cards before sharing. No email is sent automatically from an unreviewed transcript; use the Share button on a member's card to email only that member. Audio remains on this device unless you explicitly save the recording as a monthly note; saved audio is uploaded to the app's configured storage.</p>
           </div>}
-        </section>) : view === "meeting-notes" ? <MeetingNotes projectId={projectId} keyValue={key} members={members} canDelete={admin} /> : view === "portal" ? (<section className="panel"><div className="wrap"><table className="tm"><thead><tr><th>ID</th><th>Ticket</th><th>Type</th><th>Raised</th><th>Status</th><th>Completed</th><th>Actions</th></tr></thead><tbody>
+        </section>) : view === "meeting-notes" ? <MeetingNotes projectId={projectId} keyValue={key} members={members} canDelete={admin} canManageContent={!!me && ["Admin", "Collaborator"].includes(me.role)} me={me} onAccessChange={handleMeetingAccessChange} /> : view === "portal" ? (<section className="panel"><div className="wrap"><table className="tm"><thead><tr><th>ID</th><th>Ticket</th><th>Type</th><th>Raised</th><th>Status</th><th>Completed</th><th>Actions</th></tr></thead><tbody>
           {[...tickets].sort((a, b) => (b.date || "").localeCompare(a.date || "")).map((t) => (<tr key={t.id}>
             <td><b className={"id " + t.type}>{t.id}</b></td><td className="tt">{t.title}</td><td>{t.type === "issue" ? "Issue" : "Feature"}</td><td className="nw">{fmt(t.date)}</td>
             <td><span className={"pill st " + t.status.replace(" ", "")}>{t.status}</span></td><td className="nw">{fmt(t.closed)}</td>
@@ -817,7 +1138,7 @@ export default function Page() {
                 <button className="ic" onClick={() => adm("status", { id: m.id, disabled: m.status !== "disabled" })}>{m.status === "disabled" ? "Enable" : "Disable"}</button>
                 <button className="ic dl" onClick={() => confirm("Remove " + m.name + "?") && adm("remove", { id: m.id })}><Ic d={TRASH} /></button></>)}</td></tr>))}
           </tbody></table></div>
-          <p className="note">Roles and team membership apply only to {activeProject?.name}. Admin: full access. Developer: create, edit, assign, change status. Collaborator: create tickets, view and add attachments. Client: sees only tickets they raised in this project; can create, update and reopen them. Nobody can delete a ticket assigned to themselves.</p></section>
+          <p className="note">Roles and team membership apply only to {activeProject?.name} in {activeOrganization?.name}. Admin: full access. Developer: create, edit, assign, change status. Collaborator: create tickets, view and add attachments. For meeting cards, saved meeting notes, and task details, only Admins and Collaborators can edit; other team members can change status on tasks assigned to them or request one-hour admin-approved edit access. Client: sees only tickets they raised in this project; can create, update and reopen them. Nobody can delete a ticket assigned to themselves.</p></section>
         </>) : (<>
           {view === "all" && (<>
             <section className="cards">{stats.map(([l, n, c]) => (<div key={l} className={"card " + c}><span>{l}</span><b>{n}</b></div>))}</section>
@@ -891,9 +1212,16 @@ export default function Page() {
 
       {projectModal && (<div className="ov" onClick={() => setProjectModal(false)}><form className="modal project-modal" onClick={(e) => e.stopPropagation()} onSubmit={createProject}>
         <h2>Add a project</h2>
-        <p className="note">A new project gets its own tickets, files, and activity log. Team accounts are shared.</p>
+        <p className="note">Each company can have multiple isolated projects. Project members, notes, tasks, files, and meetings stay scoped to their project.</p>
+        <label>Company<select required value={projectOrganizationId} onChange={(event) => setProjectOrganizationId(event.target.value)}>{organizations.filter((item) => item.canCreateProject || item.id === projectOrganizationId).map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}</select></label>
         <label>Project name<input autoFocus required maxLength={60} value={projectName} onChange={(e) => setProjectName(e.target.value)} placeholder="e.g. DocuTect" /></label>
         <div className="acts end"><button type="button" className="btn alt" onClick={() => setProjectModal(false)}>Cancel</button><button className="btn">Create project</button></div>
+      </form></div>)}
+      {organizationModal && (<div className="ov" onClick={() => setOrganizationModal(false)}><form className="modal project-modal" onClick={(e) => e.stopPropagation()} onSubmit={createOrganization}>
+        <h2>Add a company</h2>
+        <p className="note">Create an isolated company workspace, then add multiple projects under it. You will be its initial company admin.</p>
+        <label>Company name<input autoFocus required maxLength={80} value={organizationName} onChange={(event) => setOrganizationName(event.target.value)} placeholder="e.g. Northstar Labs" /></label>
+        <div className="acts end"><button type="button" className="btn alt" onClick={() => setOrganizationModal(false)}>Cancel</button><button className="btn">Create company</button></div>
       </form></div>)}
 
       {dt && (<div className="ov" onClick={() => setDetail(null)}><div className="modal" onClick={(e) => e.stopPropagation()}>

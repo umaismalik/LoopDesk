@@ -19,6 +19,93 @@ const save = async (d) => {
 };
 const uid = () => crypto.randomBytes(16).toString("hex");
 const J = (o, s = 200) => Response.json(o, { status: s });
+const googleOAuthConfigured = () => !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
+const googleRedirectUri = (origin) => new URL("/api/google-meet?action=callback", siteUrl(origin)).toString();
+const sealGoogleToken = (token) => {
+  const key = crypto.createHash("sha256").update(process.env.GOOGLE_CLIENT_SECRET || "").digest();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([cipher.update(token, "utf8"), cipher.final()]);
+  return [iv, cipher.getAuthTag(), encrypted].map((part) => part.toString("base64url")).join(".");
+};
+const openGoogleToken = (sealed) => {
+  const [iv, tag, encrypted] = String(sealed || "").split(".").map((part) => Buffer.from(part, "base64url"));
+  const key = crypto.createHash("sha256").update(process.env.GOOGLE_CLIENT_SECRET || "").digest();
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
+};
+async function googleAccessToken(d) {
+  if (!googleOAuthConfigured() || !d.googleCalendar?.refreshToken) {
+    throw new Error("Connect a Google Calendar account first. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET on the server.");
+  }
+  const response = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      refresh_token: openGoogleToken(d.googleCalendar.refreshToken),
+      grant_type: "refresh_token",
+    }),
+    cache: "no-store",
+  });
+  const result = await response.json();
+  if (!response.ok || !result.access_token) {
+    throw new Error("Google Calendar authorization expired. Disconnect and reconnect the Google account.");
+  }
+  return result.access_token;
+}
+async function createGoogleMeetEvent(d, meeting, timeZone) {
+  const accessToken = await googleAccessToken(d);
+  const [year, month, day] = meeting.date.split("-").map(Number);
+  const [hour, minute] = meeting.time.split(":").map(Number);
+  const endDateTime = new Date(Date.UTC(year, month - 1, day, hour, minute + meeting.duration)).toISOString().slice(0, 19);
+  const eventsUrl = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
+  const eventUrl = `${eventsUrl}/${meeting.id}`;
+  let response = await fetch(`${eventsUrl}?conferenceDataVersion=1&sendUpdates=none`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: meeting.id,
+      summary: meeting.title,
+      description: meeting.agenda,
+      start: { dateTime: `${meeting.date}T${meeting.time}:00`, timeZone },
+      end: { dateTime: endDateTime, timeZone },
+      conferenceData: {
+        createRequest: {
+          requestId: `${meeting.id}-${uid()}`,
+          conferenceSolutionKey: { type: "hangoutsMeet" },
+        },
+      },
+    }),
+    cache: "no-store",
+  });
+  let event = await response.json();
+  if (response.status === 409) {
+    response = await fetch(eventUrl, { headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store" });
+    event = await response.json();
+  }
+  if (!response.ok) {
+    const message = event.error?.message || "Google Calendar could not create the meeting";
+    if (response.status === 401) throw new Error("Google Calendar authorization expired. Disconnect and reconnect the Google account.");
+    throw new Error(message);
+  }
+  let meetLink = event.hangoutLink || event.conferenceData?.entryPoints?.find((entry) => entry.entryPointType === "video")?.uri;
+  for (let attempt = 0; !meetLink && attempt < 5; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    response = await fetch(eventUrl, { headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store" });
+    if (!response.ok) break;
+    event = await response.json();
+    meetLink = event.hangoutLink || event.conferenceData?.entryPoints?.find((entry) => entry.entryPointType === "video")?.uri;
+  }
+  if (!meetLink) {
+    const cleanup = await fetch(eventUrl, { method: "DELETE", headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store" });
+    if (!cleanup.ok && cleanup.status !== 404) throw new Error("Google did not return a Meet link and the temporary calendar event could not be removed. Check Google Calendar before retrying.");
+    throw new Error("Google created the calendar event but did not return a Meet link yet. The temporary event was removed; please try again in a moment.");
+  }
+  return { meetLink, eventId: event.id };
+}
 const pub = (m) => ({ id: m.id, name: m.name, email: m.email, phone: m.phone || "", role: m.role, hasPw: !!m.pw, status: m.status || "active" });
 const ROLES = ["Admin", "Developer", "Collaborator", "Client"];
 const td = () => new Date().toISOString().slice(0, 10);
@@ -72,6 +159,12 @@ const auditValue = (field, value, members) => {
   return String(value);
 };
 const memberName = (members, id) => members.find((member) => member.id === id)?.name || String(id);
+const deadlineLabel = (value) => {
+  const text = String(value || "");
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+  const date = new Date(text);
+  return Number.isFinite(date.getTime()) ? `${date.toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short", timeZone: "UTC" })} UTC` : text;
+};
 const ticketChanges = (oldTicket, newTicket, members) => TICKET_AUDIT_FIELDS.flatMap(([field, label]) =>
   JSON.stringify(oldTicket[field]) === JSON.stringify(newTicket[field]) ? [] : [{
     field: label,
@@ -86,9 +179,13 @@ async function send(to, subject, html) {
   return result;
 }
 async function emailAssignedTasks(d, { tasks, previousTasks = [], title, projectName }) {
-  const previousAssignments = new Map(previousTasks.map((task) => [task.id, task.assigneeId]));
+  const previousById = new Map(previousTasks.map((task) => [task.id, task]));
   const assignedByMember = new Map();
-  tasks.filter((task) => task.assigneeId && previousAssignments.get(task.id) !== task.assigneeId).forEach((task) => {
+  tasks.filter((task) => {
+    if (!task.assigneeId) return false;
+    const previous = previousById.get(task.id);
+    return !previous || previous.assigneeId !== task.assigneeId || previous.title !== task.title || previous.description !== task.description || previous.priority !== task.priority || previous.dueDate !== task.dueDate;
+  }).forEach((task) => {
     const assigned = assignedByMember.get(task.assigneeId) || [];
     assigned.push(task);
     assignedByMember.set(task.assigneeId, assigned);
@@ -96,17 +193,17 @@ async function emailAssignedTasks(d, { tasks, previousTasks = [], title, project
   return Promise.all([...assignedByMember.entries()].map(async ([memberId, assignedTasks]) => {
     const member = d.members.find((item) => item.id === memberId && item.status !== "disabled");
     if (!member) return { sent: false, skipped: true };
-    const lines = assignedTasks.map((task) => `<li>${emailHtml(task.title)}${task.dueDate ? ` — due ${emailHtml(task.dueDate)}` : ""}</li>`).join("");
+    const lines = assignedTasks.map((task) => `<li>${emailHtml(task.title)} · ${emailHtml(task.priority || "Medium")} priority${task.description ? `<br>${emailHtml(task.description).replace(/\n/g, "<br>")}` : ""}${task.dueDate ? ` — due ${emailHtml(deadlineLabel(task.dueDate))}` : ""}</li>`).join("");
     const result = await send(member.email, `Action items assigned: ${title}`, `<p>Hello ${emailHtml(member.name)},</p><p>These action items from <b>${emailHtml(title)}</b>${projectName ? ` in <b>${emailHtml(projectName)}</b>` : ""} were assigned to you:</p><ul>${lines}</ul><p>Open the project portal → Meeting Notes to manage deadlines, status, and comments.</p>`);
     return { sent: result.sent, error: result.error, skipped: false };
   }));
 }
-const mail = (to, link, role, projectName) => send(to, "Project invitation: " + projectName, `<p>You have been invited as <b>${emailHtml(role)}</b> to the <b>${emailHtml(projectName)}</b> project on the Solexes Ticket Managment portal.</p><p><a href="${link}">Accept invitation</a></p>`);
+const mail = (to, link, role, projectName) => send(to, "Project invitation: " + projectName, `<p>You have been invited as <b>${emailHtml(role)}</b> to the <b>${emailHtml(projectName)}</b> project on LoopDesk.</p><p><a href="${link}">Accept invitation</a></p>`);
 async function resetLink(d, m, origin) {
   const token = uid();
   d.resets = d.resets.filter((x) => x.id !== m.id).concat({ id: m.id, token, at: Date.now() });
   const link = siteUrl(origin) + "/?reset=" + token;
-  const result = await send(m.email, "Reset your Support Tracker password", `<p>Hello ${emailHtml(m.name)},</p><p>Use this link to set a new password. It expires in 1 hour and works once.</p><p><a href="${link}">Reset password</a></p><p>If you did not request this, you can ignore this email.</p>`);
+  const result = await send(m.email, "Reset your LoopDesk password", `<p>Hello ${emailHtml(m.name)},</p><p>Use this link to set a new password. It expires in 1 hour and works once.</p><p><a href="${link}">Reset password</a></p><p>If you did not request this, you can ignore this email.</p>`);
   log(d, m.name, "Password reset link issued");
   return { link, sent: result.sent, emailError: result.error };
 }
@@ -119,6 +216,7 @@ async function h(req, p, m) {
   }
   const d = await load();
   d.audit = d.audit || []; d.resets = d.resets || []; d.files = d.files || []; d.meetings = d.meetings || []; d.meetingNotes = d.meetingNotes || [];
+  d.meetingEditRequests = d.meetingEditRequests || [];
   d.meetings.forEach((meeting) => { if (!meeting.projectId) meeting.projectId = "rewaldo"; });
   if (!d.v2) await migrate(d);
   if (!d.v3) {
@@ -163,6 +261,24 @@ async function h(req, p, m) {
       x.members = existingTeam.map((member) => ({ memberId: member.id, role: member.role || "Admin", status: "active" }));
     }
   });
+  d.organizations = d.organizations || [];
+  let defaultOrganization = d.organizations.find((item) => item.id === "solexes");
+  if (!defaultOrganization) {
+    defaultOrganization = {
+      id: "solexes",
+      name: "My Company",
+      adminIds: [...new Set(d.projects.flatMap((item) => item.members.filter((entry) => entry.role === "Admin" && entry.status !== "disabled").map((entry) => entry.memberId)))],
+    };
+    d.organizations.push(defaultOrganization);
+  }
+  d.projects.forEach((item) => {
+    if (!item.organizationId) item.organizationId = defaultOrganization.id;
+    const organization = d.organizations.find((entry) => entry.id === item.organizationId);
+    if (organization) {
+      organization.adminIds = [...new Set([...(organization.adminIds || []), ...item.members.filter((entry) => entry.role === "Admin" && entry.status !== "disabled").map((entry) => entry.memberId)])];
+    }
+  });
+  if (!d.v6) { d.v6 = true; await save(d); }
   d.invites = d.invites || [];
   d.invites.forEach((invite) => { invite.projectId = invite.projectId || "rewaldo"; });
   if (!d.v5) { d.v5 = true; await save(d); }
@@ -174,6 +290,7 @@ async function h(req, p, m) {
     const m = { id: uid().slice(0, 8), name: process.env.ADMIN_NAME || "Admin", email: process.env.ADMIN_EMAIL.trim().toLowerCase(), phone: "", pw: hash(process.env.ADMIN_PASSWORD), role: "Admin", sessions: [] };
     d.members.push(m);
     d.projects.forEach((x) => { x.members.push({ memberId: m.id, role: "Admin", status: "active" }); });
+    d.organizations.forEach((organization) => { organization.adminIds = [...new Set([...(organization.adminIds || []), m.id])]; });
     claim(d, m); await save(d);
   }
   const key = req.headers.get("x-key") || u.searchParams.get("key");
@@ -188,19 +305,93 @@ async function h(req, p, m) {
   const canUseMeetings = !!meetingMemberships?.some((entry) => entry.role !== "Client");
   const canManageMeetings = !!meetingMemberships?.some((entry) => entry.role === "Admin");
   try {
+    if (r === "google-meet" && m === "GET" && u.searchParams.get("action") === "callback") {
+      const state = u.searchParams.get("state") || "";
+      const pendingStates = Array.isArray(d.googleOAuthStates) ? d.googleOAuthStates : [];
+      const pending = pendingStates.find((item) => item.state === state && item.expiresAt > Date.now());
+      const pendingProject = pending && d.projects.find((item) => item.id === pending.projectId);
+      const pendingMembership = pendingProject?.members.find((entry) => entry.memberId === pending.memberId && entry.role === "Admin" && entry.status !== "disabled");
+      const pendingMember = d.members.find((member) => member.id === pending?.memberId && member.status !== "disabled");
+      d.googleOAuthStates = pendingStates.filter((item) => item.state !== state);
+      await save(d);
+      const destination = new URL("/", siteUrl(u.origin));
+      if (!pending || !pendingMembership || !pendingMember || u.searchParams.has("error") || !u.searchParams.get("code")) {
+        destination.searchParams.set("google-meet", "error");
+        destination.searchParams.set("reason", pending ? pendingMembership ? "consent" : "permission" : "state");
+        return Response.redirect(destination);
+      }
+      if (!googleOAuthConfigured()) {
+        destination.searchParams.set("google-meet", "error");
+        destination.searchParams.set("reason", "configuration");
+        return Response.redirect(destination);
+      }
+      const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: process.env.GOOGLE_CLIENT_ID,
+          client_secret: process.env.GOOGLE_CLIENT_SECRET,
+          code: u.searchParams.get("code"),
+          grant_type: "authorization_code",
+          redirect_uri: googleRedirectUri(u.origin),
+        }),
+        cache: "no-store",
+      });
+      const tokens = await tokenResponse.json();
+      if (!tokenResponse.ok || !tokens.access_token) {
+        destination.searchParams.set("google-meet", "error");
+        destination.searchParams.set("reason", "token");
+        return Response.redirect(destination);
+      }
+      const profileResponse = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+        headers: { Authorization: `Bearer ${tokens.access_token}` },
+        cache: "no-store",
+      });
+      const profile = profileResponse.ok ? await profileResponse.json() : {};
+      if (!profile.email) {
+        destination.searchParams.set("google-meet", "error");
+        destination.searchParams.set("reason", "profile");
+        return Response.redirect(destination);
+      }
+      const previousToken = String(profile.email || "").toLowerCase() === String(d.googleCalendar?.email || "").toLowerCase()
+        ? d.googleCalendar?.refreshToken
+        : "";
+      if (!tokens.refresh_token && !previousToken) {
+        destination.searchParams.set("google-meet", "error");
+        destination.searchParams.set("reason", "refresh-token");
+        return Response.redirect(destination);
+      }
+      d.googleCalendar = {
+        refreshToken: tokens.refresh_token ? sealGoogleToken(tokens.refresh_token) : previousToken,
+        email: String(profile.email || ""),
+        connectedBy: pending.memberId,
+        connectedAt: new Date().toISOString(),
+      };
+      await save(d);
+      destination.searchParams.set("google-meet", "connected");
+      return Response.redirect(destination);
+    }
     if (m === "GET" && r === "db") {
       if (!d.members.length) return J({ setup: true });
       if (!me) return J({ error: account ? "You are not a member of this project" : "denied" }, account ? 403 : 401);
-      const projects = d.projects.filter((x) => x.members.some((entry) => entry.memberId === account.id && entry.status !== "disabled")).map(({ id, name }) => ({ id, name }));
+      const projects = d.projects.filter((x) => x.members.some((entry) => entry.memberId === account.id && entry.status !== "disabled")).map(({ id, name, organizationId }) => ({ id, name, organizationId: organizationId || defaultOrganization.id }));
+      const organizations = d.organizations
+        .filter((organization) => (organization.adminIds || []).includes(account.id) || projects.some((item) => d.projects.find((projectItem) => projectItem.id === item.id)?.organizationId === organization.id))
+        .map(({ id, name, adminIds }) => ({ id, name, canCreateProject: (adminIds || []).includes(account.id) }));
+      const elevatedMeetingRole = ["Admin", "Collaborator"].includes(me.role);
+      const editGrant = d.meetingEditRequests.find((item) => item.projectId === project.id && item.memberId === account.id && item.status === "approved" && item.expiresAt > Date.now());
+      const meetingEditRequests = d.meetingEditRequests.filter((item) => item.projectId === project.id && (me.role === "Admin" ? true : item.memberId === account.id));
+      const meetingEditAccess = elevatedMeetingRole || !!editGrant;
+      const meetingEditAccessExpiresAt = editGrant ? editGrant.expiresAt : null;
       if (me.role === "Client") {
         const mine = d.tickets.filter((t) => t.createdBy === me.id);
-        return J({ me: pub(me), projects, projectId: project.id, canUseMeetings, canManageMeetings, tickets: mine.map((t) => ({ id: t.id, type: t.type, date: t.date, by: t.by, title: t.title, details: t.details, resolution: t.resolution, notes: t.notes, closed: t.closed, createdBy: t.createdBy, status: ["Completed", "Reopened"].includes(t.status) ? t.status : "In Progress" })), members: [], invites: [], audit: [], files: d.files.filter((x) => mine.some((t) => t.id === x.ticket)) });
+        return J({ me: pub(me), projects, organizations, projectId: project.id, canUseMeetings, canManageMeetings, meetingEditAccess, meetingEditAccessExpiresAt, meetingEditRequests, tickets: mine.map((t) => ({ id: t.id, type: t.type, date: t.date, by: t.by, title: t.title, details: t.details, resolution: t.resolution, notes: t.notes, closed: t.closed, createdBy: t.createdBy, status: ["Completed", "Reopened"].includes(t.status) ? t.status : "In Progress" })), members: [], invites: [], audit: [], files: d.files.filter((x) => mine.some((t) => t.id === x.ticket)) });
       }
       const members = project.members.map((entry) => {
         const member = d.members.find((x) => x.id === entry.memberId);
         return member ? { ...pub(member), role: entry.role, status: entry.status === "disabled" || member.status === "disabled" ? "disabled" : "active" } : null;
       }).filter(Boolean);
-      return J({ me: pub(me), projects, projectId: project.id, canUseMeetings, canManageMeetings, tickets: d.tickets, members, invites: me.role === "Admin" ? d.invites.filter((x) => x.projectId === project.id) : [], audit: me.role === "Admin" ? d.audit.slice(0, 300) : [], files: d.files });
+      return J({ me: pub(me), projects: projects.map((item) => { const projectItem = d.projects.find((entry) => entry.id === item.id); return { ...item, organizationId: projectItem?.organizationId || defaultOrganization.id }; }), organizations, projectId: project.id, canUseMeetings, canManageMeetings, meetingEditAccess, meetingEditAccessExpiresAt, meetingEditRequests, googleCalendarConfigured: googleOAuthConfigured(), googleCalendarConnected: !!d.googleCalendar?.refreshToken, googleCalendarEmail: me.role === "Admin" ? d.googleCalendar?.email || "" : "", tickets: d.tickets, members, invites: me.role === "Admin" ? d.invites.filter((x) => x.projectId === project.id) : [], audit: me.role === "Admin" ? d.audit.slice(0, 300) : [], files: d.files });
     }
     if (m === "GET" && r === "invite") {
       const i = d.invites.find((x) => x.token === u.searchParams.get("t"));
@@ -235,21 +426,71 @@ async function h(req, p, m) {
       });
       return J({ meetings: results.sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time)) });
     }
+    if (r === "google-meet" && m === "GET" && u.searchParams.get("action") === "status") {
+      if (!canManageMeetings) return J({ error: "Project admin access required" }, 403);
+      return J({
+        configured: googleOAuthConfigured(),
+        connected: !!d.googleCalendar?.refreshToken,
+        email: d.googleCalendar?.email || "",
+      });
+    }
     if (r === "meeting-notes" && m === "GET") {
       if (!canUseMeetings || me.role === "Client") return J({ error: "Team access required" }, 403);
+      const elevatedMeetingRole = ["Admin", "Collaborator"].includes(me.role);
+      const editGrant = d.meetingEditRequests.find((item) => item.projectId === project.id && item.memberId === account.id && item.status === "approved" && item.expiresAt > Date.now());
+      const access = {
+        canEdit: elevatedMeetingRole || !!editGrant,
+        expiresAt: editGrant?.expiresAt || null,
+        requests: d.meetingEditRequests.filter((item) => item.projectId === project.id && (me.role === "Admin" || item.memberId === account.id)),
+      };
       const month = u.searchParams.get("month") || "";
+      const from = u.searchParams.get("from") || "", to = u.searchParams.get("to") || "";
+      if (from || to) {
+        const validDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(new Date(`${value}T00:00:00Z`).getTime()) && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
+        if (!validDate(from) || !validDate(to) || from > to || (new Date(`${to}T00:00:00Z`) - new Date(`${from}T00:00:00Z`)) / 864e5 > 366) return J({ error: "Enter a valid report range of no more than one year" }, 400);
+        return J({ ...access, notes: d.meetingNotes.filter((note) => note.projectId === project.id && note.date >= from && note.date <= to).sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)) });
+      }
       if (!/^\d{4}-\d{2}$/.test(month) || Number(month.slice(5)) < 1 || Number(month.slice(5)) > 12) return J({ error: "Invalid notes month" }, 400);
-      return J({ notes: d.meetingNotes.filter((note) => note.projectId === project.id && note.date.startsWith(month)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)) });
+      return J({ ...access, notes: d.meetingNotes.filter((note) => note.projectId === project.id && note.date.startsWith(month)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)) });
     }
     if (r === "meeting-recording" && m === "GET") {
       if (!canUseMeetings || me.role === "Client") return J({ error: "Team access required" }, 403);
       const note = d.meetingNotes.find((item) => item.id === u.searchParams.get("id") && item.projectId === project.id);
-      if (!note?.audioFile) return J({ error: "Recording not found" }, 404);
-      const audio = await getFile(note.audioFile.id);
+      const clipIndex = Number(u.searchParams.get("clip") || 0);
+      if (!Number.isInteger(clipIndex) || clipIndex < 0) return J({ error: "Invalid recording clip" }, 400);
+      const clip = note?.audioFiles?.[clipIndex] || (clipIndex === 0 ? note?.audioFile : null);
+      if (!clip) return J({ error: "Recording not found" }, 404);
+      const audio = await getFile(clip.id);
       if (!audio) return J({ error: "Recording file is missing" }, 404);
-      return new Response(audio, { headers: { "Content-Type": note.audioFile.type || "audio/webm", "Content-Disposition": `inline; filename="${note.audioFile.name}"`, "Cache-Control": "private, no-store" } });
+      return new Response(audio, { headers: { "Content-Type": clip.type || "audio/webm", "Content-Disposition": `inline; filename="${clip.name}"`, "Cache-Control": "private, no-store" } });
     }
     if (m !== "POST") return J({ error: "not found" }, 404);
+    if (r === "google-meet") {
+      if (!canManageMeetings) return J({ error: "Project admin access required" }, 403);
+      const b = await req.json();
+      if (b.action === "disconnect") {
+        delete d.googleCalendar;
+        await save(d);
+        return J({ ok: true });
+      }
+      if (b.action !== "connect") return J({ error: "Invalid Google Meet action" }, 400);
+      if (!googleOAuthConfigured()) return J({ error: "Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in the server environment before connecting Google Calendar." }, 400);
+      const state = uid();
+      d.googleOAuthStates = (d.googleOAuthStates || []).filter((item) => item.expiresAt > Date.now()).slice(-9);
+      d.googleOAuthStates.push({ state, memberId: account.id, projectId: project.id, expiresAt: Date.now() + 10 * 60 * 1000 });
+      await save(d);
+      const authorizationUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+      authorizationUrl.search = new URLSearchParams({
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        redirect_uri: googleRedirectUri(u.origin),
+        response_type: "code",
+        scope: "openid email https://www.googleapis.com/auth/calendar.events",
+        access_type: "offline",
+        prompt: "consent",
+        state,
+      }).toString();
+      return J({ ok: true, authorizationUrl: authorizationUrl.toString() });
+    }
     const chk = (b) => {
       if (!b.name) return "Name is required";
       if (!pwOk(b.password)) return PWMSG;
@@ -307,15 +548,26 @@ async function h(req, p, m) {
     if (!me) return J({ error: "denied" }, 401);
     if (r === "meetings") {
       if (!canUseMeetings) return J({ error: "Team access required" }, 403);
+      const activeMembers = project.members
+        .filter((entry) => entry.status !== "disabled")
+        .map((entry) => d.members.find((member) => member.id === entry.memberId && member.status !== "disabled"))
+        .filter(Boolean);
       const b = await req.json();
+      const activeMeetingGrant = d.meetingEditRequests.some((item) => item.projectId === project.id && item.memberId === account.id && item.status === "approved" && item.expiresAt > Date.now());
+      const canEditMeetingContent = ["Admin", "Collaborator"].includes(me.role) || activeMeetingGrant;
+      const canManageAllMeetingContent = ["Admin", "Collaborator"].includes(me.role);
+      const canEditMemberContent = (memberId) => canManageAllMeetingContent || (activeMeetingGrant && String(memberId) === account.id);
       if (b.action === "create") {
         const title = String(b.title || "").trim().slice(0, 120), agenda = String(b.agenda || "").trim().slice(0, 3000);
         const date = String(b.date || ""), time = String(b.time || ""), duration = Number(b.duration || 60);
+        const timeZone = String(b.timeZone || "UTC");
         const attendeeIds = Array.isArray(b.attendeeIds) ? [...new Set(b.attendeeIds.map(String))] : [];
         const parsedDate = new Date(`${date}T00:00:00Z`);
+        try { new Intl.DateTimeFormat("en-US", { timeZone }); }
+        catch { return J({ error: "Select a valid meeting time zone" }, 400); }
         if (!title || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(parsedDate.getTime()) || parsedDate.toISOString().slice(0, 10) !== date ||
-          !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time) || !Number.isInteger(duration) || duration < 15 || duration > 480) {
-          return J({ error: "Enter a title, valid date and time, and a duration between 15 and 480 minutes" }, 400);
+          !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time) || !Number.isInteger(duration) || duration < 15 || duration > 60) {
+          return J({ error: "Enter a title, valid date and time, and a duration between 15 and 60 minutes" }, 400);
         }
         if (attendeeIds.length > 100) return J({ error: "A meeting can have at most 100 invitees" }, 400);
         const eligibleMembers = project.members
@@ -325,19 +577,15 @@ async function h(req, p, m) {
         const attendees = attendeeIds.map((id) => eligibleMembers.find((member) => member.id === id));
         if (attendees.some((member) => !member)) return J({ error: "One or more selected invitees are not active team members in this project" }, 400);
         const online = b.online === true;
-        const roomProvider = online ? String(b.roomProvider || "jitsi") : "";
+        const roomProvider = online ? String(b.roomProvider || "google-meet") : "";
         let roomName = "", roomUrl = "";
-        if (online && roomProvider === "jitsi") {
-          roomName = `solexes-${project.id.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${uid().slice(0, 16)}`;
-          roomUrl = "https://meet.jit.si/" + roomName;
-        } else if (online) {
-          if (!["google-meet", "microsoft-teams", "zoom"].includes(roomProvider)) return J({ error: "Select a supported online meeting service" }, 400);
+        if (online) {
+          if (!["google-meet", "zoom"].includes(roomProvider)) return J({ error: "Select Google Meet or Zoom" }, 400);
           if (b.roomUrl) {
             try {
               const parsedRoomUrl = new URL(String(b.roomUrl));
               const validHost = roomProvider === "google-meet" ? parsedRoomUrl.hostname === "meet.google.com"
-                : roomProvider === "microsoft-teams" ? ["teams.microsoft.com", "teams.live.com"].includes(parsedRoomUrl.hostname)
-                  : parsedRoomUrl.hostname === "zoom.us" || parsedRoomUrl.hostname.endsWith(".zoom.us");
+                : parsedRoomUrl.hostname === "zoom.us" || parsedRoomUrl.hostname.endsWith(".zoom.us");
               if (parsedRoomUrl.protocol !== "https:" || parsedRoomUrl.username || parsedRoomUrl.password || !validHost) return J({ error: "Paste a valid HTTPS meeting link from the selected conference service" }, 400);
               roomUrl = parsedRoomUrl.toString();
             } catch {
@@ -346,6 +594,17 @@ async function h(req, p, m) {
           }
         }
         const meeting = { id: uid().slice(0, 12), projectId: project.id, title, date, time, duration, agenda, weekly: false, online, roomProvider, roomName, roomUrl, attendees: attendees.map((member) => ({ id: member.id, name: member.name, email: member.email })), roster: eligibleMembers.map((member) => ({ id: member.id, name: member.name, email: member.email })), createdBy: account.id, createdByName: me.name, occurrences: {} };
+        if (online && roomProvider === "google-meet" && d.googleCalendar?.refreshToken) {
+          try {
+            const googleEvent = await createGoogleMeetEvent(d, meeting, timeZone);
+            meeting.roomUrl = googleEvent.meetLink;
+            meeting.googleCalendarEventId = googleEvent.eventId;
+          } catch (error) {
+            return J({ error: `Could not create Google Meet room: ${error.message}` }, 502);
+          }
+        } else if (online && roomProvider === "google-meet" && !roomUrl) {
+          return J({ error: "Connect Google Calendar as a project admin to create a Meet room automatically, or paste a Google Meet link." }, 400);
+        }
         d.meetings.push(meeting); await save(d);
         const invitationResults = await Promise.all(attendees.map((member) => send(
           member.email,
@@ -356,7 +615,88 @@ async function h(req, p, m) {
         const emailErrors = [...new Set(invitationResults.filter((result) => !result.sent).map((result) => result.error))];
         return J({ ok: true, meeting: { ...meeting, occurrenceDate: date, notes: "", participantSummaries: [] }, inviteEmailsSent: sent, inviteEmailsTotal: attendees.length, emailErrors });
       }
+      if (b.action === "participant-tasks") {
+        if (!canManageAllMeetingContent) return J({ error: "Only an Admin or Collaborator can email meeting action items" }, 403);
+        if (!canEditMeetingContent) return J({ error: "Admin or Collaborator access, or a current one-hour admin approval, is required to email meeting action items" }, 403);
+        const meeting = d.meetings.find((item) => item.id === String(b.id || "") && item.projectId === project.id);
+        const occurrenceDate = String(b.occurrenceDate || "");
+        const occurrence = new Date(`${occurrenceDate}T00:00:00Z`);
+        if (!meeting || occurrenceDate !== meeting.date || !Number.isFinite(occurrence.getTime()) || occurrence.toISOString().slice(0, 10) !== occurrenceDate) {
+          return J({ error: "Meeting occurrence not found" }, 404);
+        }
+        const attendee = d.members.find((member) => member.id === String(b.memberId || "") && member.status !== "disabled" && project.members.some((entry) => entry.memberId === member.id && entry.status !== "disabled"));
+        if (!attendee?.email) return J({ error: "The identified team member is not on this meeting roster" }, 400);
+        const tasks = Array.isArray(b.tasks)
+          ? [...new Set(b.tasks.slice(0, 10).map((task) => String(task).trim().slice(0, 500)).filter(Boolean))]
+          : [];
+        if (!tasks.length) return J({ ok: true, sent: false, skipped: true });
+
+        meeting.occurrences = meeting.occurrences || {};
+        const previous = meeting.occurrences[occurrenceDate] || {};
+        const emailedTasks = previous.emailedTasks || {};
+        const alreadySent = new Set(emailedTasks[attendee.id] || []);
+        const newTasks = tasks.filter((task) => !alreadySent.has(task.toLowerCase()));
+        if (!newTasks.length) return J({ ok: true, sent: false, skipped: true });
+
+        const taskList = newTasks.map((task) => `<li>${emailHtml(task)}</li>`).join("");
+        const result = await send(
+          attendee.email,
+          `Action items for you: ${meeting.title}`,
+          `<p>Hello ${emailHtml(attendee.name)},</p><p>These action items were identified for you during <b>${emailHtml(meeting.title)}</b> on ${emailHtml(occurrenceDate)}:</p><ul>${taskList}</ul><p>Please review and correct these items in the project portal if needed.</p>`
+        );
+        if (!result.sent) return J({ ok: false, error: result.error || "Could not email the identified member's action items" }, 502);
+        emailedTasks[attendee.id] = [...new Set([...alreadySent, ...newTasks.map((task) => task.toLowerCase())])].slice(-50);
+        meeting.occurrences[occurrenceDate] = { ...previous, emailedTasks };
+        await save(d);
+        return J({ ok: true, sent: true, memberName: attendee.name, taskCount: newTasks.length });
+      }
+      if (b.action === "participant-summary") {
+        if (!canEditMemberContent(b.memberId)) return J({ error: "Temporary edit access only allows changes to your own member card" }, 403);
+        if (!canEditMeetingContent) return J({ error: "Admin or Collaborator access, or a current one-hour admin approval, is required to edit meeting cards" }, 403);
+        const meeting = d.meetings.find((item) => item.id === String(b.id || "") && item.projectId === project.id);
+        const occurrenceDate = String(b.occurrenceDate || "");
+        const occurrence = new Date(`${occurrenceDate}T00:00:00Z`);
+        if (!meeting || occurrenceDate !== meeting.date || !Number.isFinite(occurrence.getTime()) || occurrence.toISOString().slice(0, 10) !== occurrenceDate) {
+          return J({ error: "Meeting occurrence not found" }, 404);
+        }
+        const attendee = d.members.find((member) => member.id === String(b.memberId || "") && member.status !== "disabled" && project.members.some((entry) => entry.memberId === member.id && entry.status !== "disabled"));
+        if (!attendee?.email) return J({ error: "The identified team member is not on this meeting roster" }, 400);
+        const cleanLines = (value, limit) => Array.isArray(value)
+          ? [...new Set(value.slice(0, limit).map((line) => String(line).trim().slice(0, 500)).filter(Boolean))]
+          : [];
+        const points = cleanLines(b.points, 10);
+        const tasks = cleanLines(b.tasks, 10);
+        if (!points.length && !tasks.length) return J({ error: "Add at least one key point or action item before sharing" }, 400);
+        const priority = ["High", "Medium", "Low"].includes(b.priority) ? b.priority : "Medium";
+        const content = JSON.stringify({ points, tasks, priority });
+        meeting.occurrences = meeting.occurrences || {};
+        const previous = meeting.occurrences[occurrenceDate] || {};
+        const sentSummaries = previous.sentSummaries || {};
+        if (sentSummaries[attendee.id] === content) return J({ ok: true, sent: false, skipped: true, memberName: attendee.name });
+        const lines = [
+          ...points.map((line) => `<li>${emailHtml(line)}</li>`),
+          ...tasks.map((line) => `<li><b>${emailHtml(priority)} priority action:</b> ${emailHtml(line)}</li>`),
+        ].join("");
+        const result = await send(
+          attendee.email,
+          `Meeting notes for you: ${meeting.title}`,
+          `<p>Hello ${emailHtml(attendee.name)},</p><p>Here are your reviewed notes from <b>${emailHtml(meeting.title)}</b> on ${emailHtml(occurrenceDate)}:</p><ul>${lines}</ul><p>These notes were shared with you by ${emailHtml(me.name)}.</p>`
+        );
+        if (!result.sent) return J({ ok: false, error: result.error || "Could not email the participant's notes" }, 502);
+        const participantSummaries = previous.participantSummaries || [];
+        const card = { memberId: attendee.id, name: attendee.name, points, tasks, priority };
+        meeting.occurrences[occurrenceDate] = {
+          ...previous,
+          participantSummaries: [...participantSummaries.filter((summary) => summary.memberId !== attendee.id), card],
+          sentSummaries: { ...sentSummaries, [attendee.id]: content },
+          updatedAt: new Date().toISOString(),
+          updatedBy: me.name,
+        };
+        await save(d);
+        return J({ ok: true, sent: true, memberName: attendee.name });
+      }
       if (b.action === "notes") {
+        if (!canEditMeetingContent) return J({ error: "Admin or Collaborator access, or a current one-hour admin approval, is required to edit meeting notes" }, 403);
         const meeting = d.meetings.find((item) => item.id === b.id && item.projectId === project.id), occurrenceDate = String(b.occurrenceDate || "");
         const occurrence = new Date(`${occurrenceDate}T00:00:00Z`);
         if (!meeting || !/^\d{4}-\d{2}-\d{2}$/.test(occurrenceDate) || !Number.isFinite(occurrence.getTime()) || occurrence.toISOString().slice(0, 10) !== occurrenceDate) return J({ error: "Meeting not found" }, 404);
@@ -366,24 +706,54 @@ async function h(req, p, m) {
         meeting.occurrences = meeting.occurrences || {};
         const submitted = Array.isArray(b.participantSummaries) ? b.participantSummaries : [];
         if (submitted.length > 100) return J({ error: "Too many participant summaries" }, 400);
-        const attendees = meeting.roster || meeting.attendees || [];
-        const participantSummaries = submitted.map((summary) => {
+        const attendees = activeMembers.filter((member) => member.role !== "Client");
+        let participantSummaries = submitted.map((summary) => {
           const attendee = attendees.find((member) => member.id === String(summary.memberId));
           if (!attendee) return null;
           const cleanLines = (value, maximum) => Array.isArray(value)
-            ? value.slice(0, maximum).map((line) => String(line).trim().slice(0, 500)).filter(Boolean)
+            ? [...new Set(value.slice(0, maximum).map((line) => String(line).trim().slice(0, 500)).filter(Boolean))]
             : [];
-          return { memberId: attendee.id, name: attendee.name, points: cleanLines(summary.points, 5), tasks: cleanLines(summary.tasks, 10) };
+          return {
+            memberId: attendee.id,
+            name: attendee.name,
+            points: cleanLines(summary.points, 10),
+            tasks: cleanLines(summary.tasks, 10),
+            description: String(summary.description || "").trim().slice(0, 2000),
+            priority: ["High", "Medium", "Low"].includes(summary.priority) ? summary.priority : "Medium",
+          };
         });
         if (participantSummaries.some((summary) => !summary)) return J({ error: "A participant summary does not belong to this meeting's invitees" }, 400);
-        const summaryLength = participantSummaries.reduce((total, summary) => total + summary.points.concat(summary.tasks).reduce((length, line) => length + line.length, 0), 0);
+        const summaryLength = participantSummaries.reduce((total, summary) => total + summary.points.concat(summary.tasks).reduce((length, line) => length + line.length, 0) + summary.description.length, 0);
         if (summaryLength > 50000) return J({ error: "Participant summaries must contain 50,000 characters or fewer" }, 400);
         const previous = meeting.occurrences[occurrenceDate] || {};
+        if (!canManageAllMeetingContent) {
+          if (notes !== String(previous.notes || "")) return J({ error: "Temporary edit access only allows changes to your own member card, not shared meeting notes" }, 403);
+          const previousCards = previous.participantSummaries || [];
+          const signature = (card) => JSON.stringify({
+            name: card.name, points: card.points || [], tasks: card.tasks || [],
+            description: card.description || "", priority: card.priority || "Medium",
+          });
+          const blank = (card) => !(card.points || []).length && !(card.tasks || []).length && !card.description && (!card.priority || card.priority === "Medium");
+          const oldCardsValid = previousCards.every((oldCard) => {
+            const submittedCard = participantSummaries.find((card) => card.memberId === oldCard.memberId);
+            return submittedCard && (canEditMemberContent(oldCard.memberId) || signature(submittedCard) === signature(oldCard));
+          });
+          const newCardsValid = participantSummaries.every((card) => {
+            if (canEditMemberContent(card.memberId)) return true;
+            const oldCard = previousCards.find((item) => item.memberId === card.memberId);
+            return oldCard ? signature(card) === signature(oldCard) : blank(card);
+          });
+          if (!oldCardsValid || !newCardsValid) return J({ error: "Temporary edit access only allows changes to your own member card" }, 403);
+          const ownCard = participantSummaries.find((card) => card.memberId === account.id);
+          participantSummaries = ownCard && !blank(ownCard)
+            ? [...previousCards.filter((card) => card.memberId !== account.id), ownCard]
+            : previousCards;
+        }
         const sentSummaries = previous.sentSummaries || {};
         const mailResults = await Promise.all(participantSummaries.map(async (summary) => {
-          const lines = [...summary.points.map((line) => `<li>${emailHtml(line)}</li>`), ...summary.tasks.map((line) => `<li><b>Action:</b> ${emailHtml(line)}</li>`)];
+          const lines = summary.points.map((line) => `<li>${emailHtml(line)}</li>`);
           if (!lines.length) return { id: summary.memberId, sent: false, skipped: true };
-          const content = JSON.stringify({ points: summary.points, tasks: summary.tasks });
+          const content = JSON.stringify({ points: summary.points });
           if (sentSummaries[summary.memberId] === content) return { id: summary.memberId, sent: false, skipped: true };
           const attendee = attendees.find((member) => member.id === summary.memberId);
           const result = await send(attendee.email, `Meeting notes: ${meeting.title}`, `<p>Hello ${emailHtml(attendee.name)},</p><p>Here are your key points and action items from <b>${emailHtml(meeting.title)}</b> on ${emailHtml(occurrenceDate)}:</p><ul>${lines.join("")}</ul><p>Please reply to the meeting organizer if anything needs correcting.</p>`);
@@ -401,7 +771,10 @@ async function h(req, p, m) {
         const managedNote = d.meetingNotes.find((item) => item.projectId === project.id && item.meetingId === meeting.id && item.date === occurrenceDate && item.entryType === "meeting");
         const generatedTasks = participantSummaries.flatMap((summary) => summary.tasks.map((title) => {
           const existing = (managedNote?.tasks || []).find((task) => task.title.toLowerCase() === title.toLowerCase() && task.assigneeId === summary.memberId);
-          return existing || { id: uid().slice(0, 12), title, assigneeId: summary.memberId, dueDate: "", status: "Open", comments: [] };
+          const description = (summary.description || "").slice(0, 2000);
+          return existing
+            ? { ...existing, description: description || existing.description || "", priority: summary.priority || "Medium" }
+            : { id: uid().slice(0, 12), title, description, assigneeId: summary.memberId, dueDate: "", status: "Open", comments: [], priority: summary.priority || "Medium", remindersSent: [] };
         }));
         const taskMap = new Map((managedNote?.tasks || []).map((task) => [task.id, task]));
         generatedTasks.forEach((task) => taskMap.set(task.id, task));
@@ -419,7 +792,12 @@ async function h(req, p, m) {
         savedNote.updatedAt = new Date().toISOString();
         if (!managedNote) d.meetingNotes.push(savedNote);
         await save(d);
-        const taskEmailResults = await emailAssignedTasks(d, { tasks: generatedTasks, previousTasks: managedNote?.tasks || [], title: meeting.title, projectName: project.name });
+        const taskEmailResults = await emailAssignedTasks(d, {
+          tasks: generatedTasks,
+          previousTasks: managedNote?.tasks || [],
+          title: meeting.title,
+          projectName: project.name,
+        });
         return J({
           ok: true,
           note: savedNote,
@@ -442,19 +820,27 @@ async function h(req, p, m) {
     }
     if (r === "meeting-recording") {
       if (!canUseMeetings || me.role === "Client") return J({ error: "Team access required" }, 403);
+      const activeMeetingGrant = d.meetingEditRequests.some((item) => item.projectId === project.id && item.memberId === account.id && item.status === "approved" && item.expiresAt > Date.now());
+      if (!["Admin", "Collaborator"].includes(me.role)) return J({ error: "Only an Admin or Collaborator can change shared meeting recordings" }, 403);
       const formData = await req.formData();
       const noteId = String(formData.get("noteId") || "");
+      const clipIndex = Number(formData.get("clipIndex") || 0);
       const file = formData.get("file");
       const note = d.meetingNotes.find((item) => item.id === noteId && item.projectId === project.id);
       if (!note || !file || typeof file.arrayBuffer !== "function") return J({ error: "Meeting note or recording file is missing" }, 400);
+      if (!Number.isInteger(clipIndex) || clipIndex < 0 || clipIndex >= 20) return J({ error: "Recording clip index is invalid" }, 400);
       if (!String(file.type || "").startsWith("audio/")) return J({ error: "The uploaded recording must be an audio file" }, 400);
       const maxBytes = remote ? 4e6 : 25e6;
       if (file.size < 1 || file.size > maxBytes) return J({ error: `Recording must be smaller than ${maxBytes / 1e6} MB` }, 413);
       const extension = file.type.includes("ogg") ? ".ogg" : file.type.includes("mp4") ? ".mp4" : ".webm";
       const name = uid() + extension;
       await putFile(name, Buffer.from(await file.arrayBuffer()), file.type || "audio/webm");
-      if (note.audioFile?.id) await delFile(note.audioFile.id);
-      note.audioFile = { id: name, name: `${note.title.replace(/[^a-z0-9]+/gi, "-").slice(0, 60)}${extension}`, type: file.type || "audio/webm", size: file.size };
+      const audioFiles = note.audioFiles || (note.audioFile ? [note.audioFile] : []);
+      const previousClip = audioFiles[clipIndex];
+      audioFiles[clipIndex] = { id: name, name: `${note.title.replace(/[^a-z0-9]+/gi, "-").slice(0, 60)}-${clipIndex + 1}${extension}`, type: file.type || "audio/webm", size: file.size };
+      note.audioFiles = audioFiles;
+      note.audioFile = audioFiles[0];
+      if (previousClip?.id && previousClip.id !== name) await delFile(previousClip.id);
       note.updatedAt = new Date().toISOString();
       await save(d);
       return J({ ok: true, note });
@@ -474,10 +860,59 @@ async function h(req, p, m) {
         const cards = value.map((card) => {
           const member = activeMembers.find((item) => item.id === String(card.memberId));
           if (!member) return null;
-          return { memberId: member.id, name: member.name, points: cleanLines(card.points, 10, 500), tasks: cleanLines(card.tasks, 20, 500) };
+          return {
+            memberId: member.id,
+            name: member.name,
+            points: cleanLines(card.points, 10, 500),
+            tasks: cleanLines(card.tasks, 20, 500),
+            description: String(card.description || "").trim().slice(0, 2000),
+            priority: ["High", "Medium", "Low"].includes(card.priority) ? card.priority : "Medium",
+          };
         });
         return cards.some((card) => !card) ? null : cards;
       };
+      const activeMeetingGrant = d.meetingEditRequests.some((item) => item.projectId === project.id && item.memberId === account.id && item.status === "approved" && item.expiresAt > Date.now());
+      const canEditMeetingContent = ["Admin", "Collaborator"].includes(me.role) || activeMeetingGrant;
+      const canManageAllMeetingContent = ["Admin", "Collaborator"].includes(me.role);
+      const canEditMemberContent = (memberId) => canManageAllMeetingContent || (activeMeetingGrant && String(memberId) === account.id);
+      if (b.action === "request-edit-access") {
+        if (["Admin", "Collaborator"].includes(me.role)) return J({ ok: true, canEdit: true });
+        const existing = d.meetingEditRequests.find((item) => item.projectId === project.id && item.memberId === account.id && (item.status === "pending" || (item.status === "approved" && item.expiresAt > Date.now())));
+        if (existing) return J({ ok: true, request: existing, canEdit: existing.status === "approved" });
+        const request = { id: uid().slice(0, 12), projectId: project.id, memberId: account.id, memberName: me.name, status: "pending", requestedAt: new Date().toISOString() };
+        d.meetingEditRequests = [...d.meetingEditRequests.filter((item) => !(item.projectId === project.id && item.memberId === account.id && item.status !== "pending" && !(item.status === "approved" && item.expiresAt > Date.now()))), request].slice(-1000);
+        await save(d);
+        const admins = project.members
+          .filter((entry) => entry.role === "Admin" && entry.status !== "disabled")
+          .map((entry) => d.members.find((member) => member.id === entry.memberId && member.status !== "disabled" && member.email))
+          .filter(Boolean);
+        const origin = u.origin;
+        const notificationResults = await Promise.all(admins.map((admin) => send(
+          admin.email,
+          `Meeting edit approval requested: ${project.name}`,
+          `<p>Hello ${emailHtml(admin.name)},</p><p><b>${emailHtml(me.name)}</b> requested temporary meeting edit access for <b>${emailHtml(project.name)}</b>.</p><p>Approval grants edit access for one hour. Open the project dashboard and review the pending request.</p><p><a href="${emailHtml(origin)}">Open dashboard</a></p>`
+        )));
+        return J({
+          ok: true,
+          request,
+          adminNotificationsSent: notificationResults.filter((item) => item.sent).length,
+          adminNotificationsFailed: notificationResults.filter((item) => !item.sent).length,
+          emailErrors: [...new Set(notificationResults.filter((item) => !item.sent).map((item) => item.error).filter(Boolean))],
+        });
+      }
+      if (b.action === "review-edit-access") {
+        if (me.role !== "Admin") return J({ error: "Only a project admin can approve temporary meeting edit access" }, 403);
+        const accessRequest = d.meetingEditRequests.find((item) => item.id === String(b.requestId || "") && item.projectId === project.id && item.status === "pending");
+        if (!accessRequest) return J({ error: "Pending access request not found" }, 404);
+        if (!["approve", "deny"].includes(b.decision)) return J({ error: "Select approve or deny" }, 400);
+        accessRequest.status = b.decision === "approve" ? "approved" : "denied";
+        accessRequest.reviewedAt = new Date().toISOString();
+        accessRequest.reviewedBy = me.name;
+        if (b.decision === "approve") accessRequest.expiresAt = Date.now() + 60 * 60 * 1000;
+        await save(d);
+        return J({ ok: true, request: accessRequest });
+      }
+      if (b.action === "create" && !canManageAllMeetingContent) return J({ error: "Only an Admin or Collaborator can create a shared meeting note" }, 403);
       const cleanTasks = (value, previousTasks = []) => {
         if (!Array.isArray(value) || value.length > 200) return null;
         const ids = new Set();
@@ -488,13 +923,16 @@ async function h(req, p, m) {
           const assigneeId = String(task.assigneeId || "");
           if (assigneeId && !activeMembers.some((member) => member.id === assigneeId && member.role !== "Client")) return null;
           const dueDate = String(task.dueDate || "");
-          const parsedDueDate = dueDate ? new Date(`${dueDate}T00:00:00Z`) : null;
-          if (dueDate && (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || !Number.isFinite(parsedDueDate.getTime()) || parsedDueDate.toISOString().slice(0, 10) !== dueDate)) return null;
-          const comments = previousTasks.find((previous) => previous.id === id)?.comments || [];
+          const parsedDueDate = dueDate ? new Date(dueDate) : null;
+          const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(dueDate);
+          if (dueDate && (!Number.isFinite(parsedDueDate.getTime()) || (dateOnly && parsedDueDate.toISOString().slice(0, 10) !== dueDate) || (!dateOnly && !/^\d{4}-\d{2}-\d{2}T/.test(dueDate)))) return null;
+          const previous = previousTasks.find((item) => item.id === id);
+          const comments = previous?.comments || [];
           const status = ["Open", "In Progress", "Completed"].includes(task.status) ? task.status : "Open";
           const title = String(task.title || "").trim().slice(0, 300);
+          const description = String(task.description || "").trim().slice(0, 2000);
           if (!title) return null;
-          return { id, title, assigneeId, dueDate, status, comments };
+          return { id, title, description, assigneeId, dueDate, status, comments, priority: ["High", "Medium", "Low"].includes(task.priority) ? task.priority : "Medium", remindersSent: previous?.dueDate === dueDate ? previous.remindersSent || [] : [] };
         });
         return tasks.some((task) => !task) ? null : tasks;
       };
@@ -506,7 +944,7 @@ async function h(req, p, m) {
         if (!title || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(parsedDate.getTime()) || parsedDate.toISOString().slice(0, 10) !== date || (meeting && meeting.date !== date) || summary.length > 20000 || transcript.length > 50000) {
           return J({ error: "Enter a title, valid date, and notes within the allowed length" }, 400);
         }
-        const participantSummaries = cleanCards(b.participantSummaries || []);
+        let participantSummaries = cleanCards(b.participantSummaries || []);
         const tasks = cleanTasks(b.tasks || []);
         if (!participantSummaries || !tasks) return J({ error: "Invalid member-specific notes or action items" }, 400);
         const note = {
@@ -515,17 +953,20 @@ async function h(req, p, m) {
           createdBy: account.id, createdByName: me.name, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
         };
         d.meetingNotes.push(note); await save(d);
-        const summaryResults = await Promise.all(participantSummaries.map(async (card) => {
+        const summaryResults = b.deferEmails ? [] : await Promise.all(participantSummaries.map(async (card) => {
           const member = activeMembers.find((item) => item.id === card.memberId);
-          const lines = [
-            ...card.points.map((line) => `<li>${emailHtml(line)}</li>`),
-            ...card.tasks.map((line) => `<li><b>Action:</b> ${emailHtml(line)}</li>`),
-          ];
+          const lines = card.points.map((line) => `<li>${emailHtml(line)}</li>`);
           if (!member || !lines.length) return { sent: false, skipped: true };
           const result = await send(member.email, `Meeting notes for you: ${title}`, `<p>Hello ${emailHtml(member.name)},</p><p>Here are the notes assigned to you from <b>${emailHtml(project.name)}</b> on ${emailHtml(date)}.</p><p><b>Shared key points:</b><br>${emailHtml(summary).replace(/\n/g, "<br>")}</p><ul>${lines.join("")}</ul><p>Open the project portal and select Meeting Notes to review or comment on action items.</p>`);
           return { sent: result.sent, error: result.error, skipped: false };
         }));
-        const taskEmailResults = await emailAssignedTasks(d, { tasks, title, projectName: project.name });
+        const alreadyEmailedTasks = meeting?.occurrences?.[date]?.emailedTasks || {};
+        const emailedTaskKeys = new Set(Object.entries(alreadyEmailedTasks).flatMap(([memberId, titles]) => titles.map((taskTitle) => `${memberId}:${taskTitle}`)));
+        const taskEmailResults = b.deferEmails ? [] : await emailAssignedTasks(d, {
+          tasks: tasks.filter((task) => !emailedTaskKeys.has(`${task.assigneeId}:${task.title.toLowerCase()}`)),
+          title,
+          projectName: project.name,
+        });
         return J({
           ok: true, note,
           summaryEmailsSent: summaryResults.filter((result) => result.sent).length,
@@ -537,12 +978,42 @@ async function h(req, p, m) {
       }
       const note = d.meetingNotes.find((item) => item.id === String(b.noteId || "") && item.projectId === project.id);
       if (!note) return J({ error: "Meeting note not found" }, 404);
+      if (b.action === "task-status") {
+        if (!["Open", "In Progress", "Completed"].includes(b.status)) return J({ error: "Choose Open, In Progress, or Completed" }, 400);
+        const task = (note.tasks || []).find((item) => item.id === String(b.taskId || ""));
+        if (!task) return J({ error: "Task not found" }, 404);
+        if (task.assigneeId !== account.id) return J({ error: "You can only update the status of tasks assigned to you" }, 403);
+        task.status = b.status;
+        note.updatedAt = new Date().toISOString();
+        await save(d);
+        return J({ ok: true, note });
+      }
+      if (!canEditMeetingContent) return J({ error: "Admin or Collaborator access, or a current one-hour admin approval, is required to edit meeting notes and tasks" }, 403);
       if (b.action === "update") {
         const title = String(b.title || "").trim().slice(0, 160), summary = String(b.summary || ""), transcript = String(b.transcript || "");
         const participantSummaries = cleanCards(b.participantSummaries || []);
         const tasks = cleanTasks(b.tasks || [], note.tasks || []);
         if (!title || summary.length > 20000 || transcript.length > 50000 || !participantSummaries || !tasks) return J({ error: "Invalid note or action item data" }, 400);
         const previousTasks = note.tasks || [];
+        if (!canManageAllMeetingContent) {
+          if (title !== note.title || summary !== note.summary || transcript !== note.transcript) return J({ error: "Temporary edit access only allows changes to your member card and your assigned tasks" }, 403);
+          const previousCards = note.participantSummaries || [];
+          if (participantSummaries.length !== previousCards.length || previousCards.some((previous) => {
+            const submitted = participantSummaries.find((card) => card.memberId === previous.memberId);
+            return !submitted || (!canEditMemberContent(previous.memberId) && JSON.stringify(submitted) !== JSON.stringify(previous));
+          })) return J({ error: "Temporary edit access only allows changes to your own member card" }, 403);
+          const taskSignature = (task) => JSON.stringify({
+            title: task.title, description: task.description || "", assigneeId: task.assigneeId || "",
+            dueDate: task.dueDate || "", status: task.status || "Open", priority: task.priority || "Medium",
+            comments: task.comments || [], remindersSent: task.remindersSent || [],
+          });
+          if (tasks.length !== previousTasks.length || previousTasks.some((previous) => {
+            const submitted = tasks.find((task) => task.id === previous.id);
+            return !submitted || (previous.assigneeId === account.id
+              ? submitted.assigneeId !== account.id || JSON.stringify(submitted.comments || []) !== JSON.stringify(previous.comments || [])
+              : taskSignature(submitted) !== taskSignature(previous));
+          })) return J({ error: "Temporary edit access only allows changes to tasks assigned to you; you cannot add, remove, reassign, or edit another member's tasks" }, 403);
+        }
         note.title = title; note.summary = summary; note.transcript = transcript;
         note.participantSummaries = participantSummaries; note.tasks = tasks; note.updatedAt = new Date().toISOString();
         await save(d);
@@ -558,6 +1029,7 @@ async function h(req, p, m) {
         const task = note.tasks.find((item) => item.id === String(b.taskId || ""));
         const text = String(b.text || "").trim().slice(0, 2000);
         if (!task || !text) return J({ error: "Task or comment is missing" }, 400);
+        if (!canManageAllMeetingContent && (!activeMeetingGrant || task.assigneeId !== account.id)) return J({ error: "Temporary edit access only allows comments on your own assigned tasks" }, 403);
         task.comments.push({ id: uid().slice(0, 12), by: me.name, text, createdAt: new Date().toISOString() });
         task.comments = task.comments.slice(-100);
         note.updatedAt = new Date().toISOString();
@@ -566,7 +1038,8 @@ async function h(req, p, m) {
       }
       if (b.action === "delete") {
         if (me.role !== "Admin") return J({ error: "Only an admin can delete meeting notes" }, 403);
-        if (note.audioFile?.id) await delFile(note.audioFile.id);
+        const audioIds = new Set([...(note.audioFiles || []), note.audioFile].filter(Boolean).map((clip) => clip.id));
+        for (const audioId of audioIds) await delFile(audioId);
         d.meetingNotes = d.meetingNotes.filter((item) => item.id !== note.id); await save(d);
         return J({ ok: true });
       }
@@ -589,15 +1062,31 @@ async function h(req, p, m) {
       account.email = account.email.toLowerCase(); log(d, account.name, b.password ? "Changed password" : "Updated account"); await save(d);
       return J({ ok: true });
     }
+    if (r === "organization") {
+      if (me.role !== "Admin") return J({ error: "Admin only" }, 403);
+      const body = await req.json();
+      const name = String(body.name || "").trim().slice(0, 80);
+      if (!name) return J({ error: "Company name is required" }, 400);
+      if (d.organizations.some((item) => item.name.toLowerCase() === name.toLowerCase())) return J({ error: "A company with this name already exists" }, 400);
+      const organization = { id: uid().slice(0, 12), name, adminIds: [account.id] };
+      d.organizations.push(organization);
+      await save(d);
+      return J({ ok: true, organization });
+    }
     if (r === "project") {
       if (me.role !== "Admin") return J({ error: "Admin only" }, 403);
-      const name = String((await req.json()).name || "").trim().slice(0, 60);
+      const body = await req.json();
+      const name = String(body.name || "").trim().slice(0, 60);
       if (!name) return J({ error: "Project name is required" }, 400);
-      if (d.projects.some((x) => x.name.toLowerCase() === name.toLowerCase())) return J({ error: "A project with this name already exists" }, 400);
-      const created = { id: uid().slice(0, 12), name, tickets: [], files: [], audit: [], members: [{ memberId: account.id, role: "Admin", status: "active" }] };
+      const organizationId = String(body.organizationId || project.organizationId || defaultOrganization.id);
+      const organization = d.organizations.find((item) => item.id === organizationId);
+      if (!organization || !(organization.adminIds || []).includes(account.id)) return J({ error: "Only an admin of this company can create a project in it" }, 403);
+      if (d.projects.some((x) => x.organizationId === organizationId && x.name.toLowerCase() === name.toLowerCase())) return J({ error: "A project with this name already exists in this company" }, 400);
+      const created = { id: uid().slice(0, 12), organizationId, name, tickets: [], files: [], audit: [], members: [{ memberId: account.id, role: "Admin", status: "active" }] };
+      organization.adminIds = [...new Set([...(organization.adminIds || []), account.id])];
       created.audit.unshift({ at: new Date().toISOString(), who: me.name, act: "Created project", detail: name });
       d.projects.push(created); await save(d);
-      return J({ ok: true, project: { id: created.id, name: created.name } });
+      return J({ ok: true, project: { id: created.id, name: created.name, organizationId: created.organizationId } });
     }
     if (r === "tickets") {
       if (me.role === "Client") return J({ error: "Not allowed" }, 403);
@@ -616,7 +1105,7 @@ async function h(req, p, m) {
           log(d, me.name, "Updated " + t.id, changes.length ? changes : t.title);
           const c = d.members.find((m) => m.id === t.createdBy);
           if (c && o.status !== "Completed" && t.status === "Completed") jobs.push(send(c.email, "Your ticket " + t.id + " has been resolved",
-            `<p>Hello ${esc(c.name)},</p><p>Your ticket <b>${t.id}</b> - ${esc(t.title)} has been marked as resolved.</p><p>Please <a href="${SITE || u.origin}">sign in to the portal</a> to review the solution and check the fix in your product. If you are not satisfied, you can reopen the ticket from the portal.</p>`));
+            `<p>Hello ${emailHtml(c.name)},</p><p>Your ticket <b>${emailHtml(t.id)}</b> - ${emailHtml(t.title)} has been marked as resolved.</p><p>Please <a href="${emailHtml(siteUrl(u.origin))}">sign in to the portal</a> to review the solution and check the fix in your product. If you are not satisfied, you can reopen the ticket from the portal.</p>`));
         }
       });
       gone.forEach((t) => log(d, me.name, "Deleted " + t.id, t.title));
@@ -699,7 +1188,7 @@ async function h(req, p, m) {
     }
     if (r === "testmail") {
       const st = emailStatus();
-      const result = await sendEmail({ to: account.email, subject: "Test email from Support Tracker", html: "<p>Your email setup works. This message was sent from the portal.</p>" });
+      const result = await sendEmail({ to: account.email, subject: "Test email from LoopDesk", html: "<p>Your email setup works. This message was sent from LoopDesk Team & Project Management.</p>" });
       return J({ ...result, to: account.email, from: st.from, replyTo: st.replyTo });
     }
     if (r === "adminreset") {
