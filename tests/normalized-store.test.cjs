@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { createMemberSession, diffTables, fromTables, hasNormalizedData, loadWorkspaceMemberCount, saveNormalizedState, toTables } = require("../lib/normalized-store.cjs");
+const { createMemberSession, diffTables, fromTables, hasNormalizedData, loadPublicFlowState, loadWorkspaceMemberCount, saveNormalizedState, toTables } = require("../lib/normalized-store.cjs");
 
 const sampleWorkspace = () => ({
   organizations: [{ id: "org-1", name: "Example", adminIds: ["member-1"] }],
@@ -284,4 +284,25 @@ test("database functions never raise SQLSTATEs that PostgREST retries forever", 
   const sql = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "supabase.sql"), "utf8");
   // PostgREST transparently re-runs transactions failing with 40001/40P01; a deterministic raise loops until the pool is exhausted.
   assert.doesNotMatch(sql, /errcode\s*=\s*'40(001|P01)'/);
+});
+
+test("public invite lookups retry gateway errors but not client errors", async () => {
+  const originalFetch = global.fetch;
+  let attempts = 0;
+  global.fetch = async () => {
+    attempts += 1;
+    return attempts < 3
+      ? new Response("upstream unavailable", { status: 503 })
+      : new Response(JSON.stringify({ flow_found: true }), { status: 200 });
+  };
+  try {
+    assert.deepEqual(await loadPublicFlowState("https://example.supabase.co", "k", "invite", "t"), { flow_found: true });
+    assert.equal(attempts, 3);
+    attempts = 0;
+    global.fetch = async () => { attempts += 1; return new Response(JSON.stringify({ code: "42883" }), { status: 400 }); };
+    await assert.rejects(loadPublicFlowState("https://example.supabase.co", "k", "invite", "t"));
+    assert.equal(attempts, 1);
+  } finally {
+    global.fetch = originalFetch;
+  }
 });

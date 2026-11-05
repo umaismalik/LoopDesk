@@ -313,7 +313,20 @@ export default function Page() {
       else setMeetingError(`Google Calendar connection did not complete (${sp.get("reason") || "cancelled"}). Check the OAuth setup and try again.`);
       history.replaceState(null, "", "/");
     }
-    if (t) api("invite?t=" + t).then((r) => { setInv({ ...r, token: t }); setScreen(r.email ? "accept" : "denied"); });
+    if (t) {
+      // Only a 404 means the invite is gone; retry transient server/network failures instead of reporting them as expired.
+      const openInvite = async () => {
+        let r;
+        for (const delay of [0, 800, 2000, 4000]) {
+          if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+          r = await api("invite?t=" + encodeURIComponent(t));
+          if (r.email || (r.status >= 400 && r.status < 500)) break;
+        }
+        setInv({ ...r, token: t });
+        setScreen(r.email ? "accept" : r.status >= 400 && r.status < 500 ? "denied" : "inviteError");
+      };
+      openInvite();
+    }
     else { const k = localStorage.getItem("rw-key") || ""; setKey(k); load(k); }
   }, [load]);
   useEffect(() => {
@@ -940,6 +953,7 @@ export default function Page() {
       <div className="brand dk"><span className="brand-mark"><img src="/loopdesk-mark.svg" alt="" /></span><div><b>LoopDesk</b><small>Team &amp; project management</small></div></div>
       {screen === "loading" && <p>Loading...</p>}
       {screen === "denied" && <p>This invitation is invalid or has expired. Please ask an admin for a new one.</p>}
+      {screen === "inviteError" && <><p>We could not open this invitation because the server had a temporary problem. Your invitation is still valid.</p>{inv?.error && <p className="muted">{inv.error}</p>}<div className="acts end"><button className="btn" onClick={() => location.reload()}>Try again</button></div></>}
       {screen === "login" && (<form onSubmit={(e) => { e.preventDefault(); join("login", { id: lf.id, password: lf.password }); }}><h2>Sign in</h2>
         <div className="g"><label className="full">Email or phone number<input required autoComplete="username" {...L("id")} /></label>
           <label className="full">Password<input required type="password" autoComplete="current-password" {...L("password")} /></label></div>
