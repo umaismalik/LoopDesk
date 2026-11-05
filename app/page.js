@@ -464,11 +464,17 @@ export default function Page() {
     return result;
   };
 
-  const admin = me && me.role === "Admin", canEdit = me && me.role !== "Collaborator" && me.role !== "Client", client = me && me.role === "Client";
+  const admin = me && me.role === "Admin", client = me && me.role === "Client";
+  // Admins and Collaborators manage every ticket; other team members update only tickets assigned to
+  // them or raised by them, and cannot reassign or delete. The server enforces the same rules.
+  const manager = !!me && ["Admin", "Collaborator"].includes(me.role);
+  const ownsTicket = (t) => !!me && ((t.assignees || []).includes(me.id) || t.raisedBy === me.id);
+  const canEditTicket = (t) => manager || (!!me && !client && ownsTicket(t));
+  const canDeleteFiles = !!me && !["Collaborator", "Client"].includes(me.role);
   const canEditMeetingContent = !!me && (["Admin", "Collaborator"].includes(me.role) || meetingEditAccess);
   const activeProject = projects.find((p) => p.id === projectId);
   const activeOrganization = organizations.find((organization) => organization.id === activeProject?.organizationId);
-  const canDel = (t) => admin && !(t.assignees || []).includes(me.id);
+  const canDel = () => manager;
   const base = useMemo(() => tickets.filter((t) => view === "all" || t.type === view), [tickets, view]);
   const months = useMemo(() => [...new Set(base.map((t) => (t.date || "").slice(0, 7)).filter(Boolean))].sort(), [base]);
   const rows = useMemo(() => base.filter((t) =>
@@ -509,6 +515,12 @@ export default function Page() {
       savedId = result.renamed?.[t.id] || t.id;
     } else if (!(await commit(tickets.map((x) => x.id === t.id ? t : x)))) return;
     await attachAll(savedId, m); load(key);
+  };
+  const deleteOwnTicket = async (t) => {
+    if (!confirm(`Delete ${t.clientRef || t.id} "${t.title}"? It will be removed for the support team as well.`)) return;
+    const r = await api("client", { action: "delete", id: t.id }, key, projectId);
+    if (!r.ok) alert(r.error || "Could not delete the ticket");
+    setDetail(null); load(key);
   };
   const reopen = async (t) => {
     const reason = prompt("Why are you not satisfied with the solution? (required)");
@@ -1269,7 +1281,8 @@ export default function Page() {
             <td><span className={"pill st " + t.status.replace(" ", "")}>{t.status}</span></td><td className="nw">{fmt(t.closed)}</td>
             <td className="ra"><button className="ic" title="View details, solution and attachments" onClick={() => setDetail(t.id)}><Ic d={EYE} /></button>
               {t.status !== "Completed" && <button className="ic" title="Edit" onClick={() => setModal({ ...t })}><Ic d={PEN} /></button>}
-              {t.status === "Completed" && <button className="ic" onClick={() => reopen(t)}>Reopen</button>}</td></tr>))}
+              {t.status === "Completed" && <button className="ic" onClick={() => reopen(t)}>Reopen</button>}
+              <button className="ic dl" title="Delete ticket" onClick={() => deleteOwnTicket(t)}><Ic d={TRASH} /></button></td></tr>))}
           {!tickets.length && <tr><td colSpan="7" className="empty">You have not raised any tickets yet. Use the buttons above to raise one.</td></tr>}</tbody></table></div>
           <div className="tools"><span className="note">Showing {tickets.length ? ticketOffset + 1 : 0}–{ticketOffset + tickets.length} of {ticketTotal} tickets</span><button className="btn alt" disabled={ticketOffset === 0 || ticketPageLoading} onClick={() => loadTicketPage(Math.max(0, ticketOffset - 100))}>Previous</button><button className="btn alt" disabled={!ticketHasMore || ticketPageLoading} onClick={() => loadTicketPage(ticketOffset + 100)}>{ticketPageLoading ? "Loading…" : "Next"}</button></div></section>) : view === "account" ? (<section className="acc">
           <div className="panel"><h3>Profile</h3>
@@ -1293,7 +1306,7 @@ export default function Page() {
           <div className="tools up"><input placeholder="Or add a document link (Google Drive, Docs...)" value={lk.url} onChange={(e) => setLk({ ...lk, url: e.target.value })} /><input placeholder="Name (optional)" value={lk.name} onChange={(e) => setLk({ ...lk, name: e.target.value })} /><button className="btn alt" onClick={addLink}>Add link</button></div>
           <div className="wrap"><table className="tm"><thead><tr><th>File</th><th>Size</th><th>Uploaded by</th><th>Date</th><th>Ticket</th><th></th></tr></thead><tbody>
             {files.filter((x) => x.cat === CATS[fc]).map((a) => (<tr key={a.id}><td className="tt">{a.url ? <a className="fl" href={fh(a)} target="_blank" rel="noreferrer"><Ic d={CLIP} /> {a.name}</a> : <button type="button" className="fl" onClick={() => openFile(a)}><Ic d={CLIP} /> {a.name}</button>}</td><td className="nw">{a.url ? "Link" : Math.ceil(a.size / 1024) + " KB"}</td><td>{a.by}</td><td className="nw">{fmt(a.at)}</td><td className="nw">{a.ticket || "-"}</td>
-              <td className="ra">{a.url ? <a className="ic" href={fh(a)} target="_blank" rel="noreferrer">Open link</a> : <button type="button" className="ic" onClick={() => openFile(a)}>Download</button>}{canEdit && <button type="button" className="ic dl" onClick={() => confirm("Delete " + a.name + "?") && adm("filedel", { id: a.id })}><Ic d={TRASH} /></button>}</td></tr>))}
+              <td className="ra">{a.url ? <a className="ic" href={fh(a)} target="_blank" rel="noreferrer">Open link</a> : <button type="button" className="ic" onClick={() => openFile(a)}>Download</button>}{canDeleteFiles && <button type="button" className="ic dl" onClick={() => confirm("Delete " + a.name + "?") && adm("filedel", { id: a.id })}><Ic d={TRASH} /></button>}</td></tr>))}
             {!files.some((x) => x.cat === CATS[fc]) && <tr><td colSpan="6" className="empty">No files in this category yet.</td></tr>}</tbody></table></div>
           <div className="tools"><span className="note">Showing {files.length ? fileOffset + 1 : 0}–{fileOffset + files.length} of {fileTotal} files</span><button className="btn alt" disabled={!fileOffset || fileLoading} onClick={() => loadFilePage(Math.max(0, fileOffset - 100))}>Previous</button><button className="btn alt" disabled={!fileHasMore || fileLoading} onClick={() => loadFilePage(fileOffset + 100)}>{fileLoading ? "Loading…" : "Next"}</button></div>
         </section>) : view === "activity" ? (<section className="panel"><div className="wrap"><table className="tm"><thead><tr><th>Time</th><th>User</th><th>Action</th><th>Details</th></tr></thead><tbody>
@@ -1324,7 +1337,7 @@ export default function Page() {
                 <button className="ic" onClick={() => adm("status", { id: m.id, disabled: m.status !== "disabled" })}>{m.status === "disabled" ? "Enable" : "Disable"}</button>
                 <button className="ic dl" onClick={() => confirm("Remove " + m.name + "?") && adm("remove", { id: m.id })}><Ic d={TRASH} /></button></>)}</td></tr>))}
           </tbody></table></div>
-          <p className="note">Roles and team membership apply only to {activeProject?.name} in {activeOrganization?.name}. Admin: full access. Developer: create, edit, assign, change status. Collaborator: create tickets, view and add attachments. For meeting cards, saved meeting notes, and task details, only Admins and Collaborators can edit; other team members can change status on tasks assigned to them or request one-hour admin-approved edit access. Client: sees only tickets they raised in this project; can create, update and reopen them. Nobody can delete a ticket assigned to themselves.</p></section>
+          <p className="note">Roles and team membership apply only to {activeProject?.name} in {activeOrganization?.name}. Admin and Collaborator: full access to tickets (create, edit, assign, change status, delete). Developer: create tickets, and edit or change the status of tickets assigned to them or raised by them; cannot reassign or delete. Assignees are emailed the full task when they are assigned. For meeting cards, saved meeting notes, and task details, only Admins and Collaborators can edit; other team members can change status on tasks assigned to them or request one-hour admin-approved edit access. Client: sees only tickets they raised in this project; can create, update, reopen and delete them.</p></section>
         </>) : (<>
           {view === "all" && (<>
             <section className="cards">{stats.map(([l, n, c]) => (<div key={l} className={"card " + c}><span>{l}</span><b>{n}</b></div>))}</section>
@@ -1351,15 +1364,15 @@ export default function Page() {
                     <td><b className={"id " + t.type}>{t.id}</b></td>
                     <td><div className="tt">{t.title}</div></td>
                     <td className="nw">{fmt(t.date)}<div className="dd">{t.by}</div></td>
-                    <td>{t.by === "Client" ? <select className={"psel " + (t.priority || "none")} disabled={!canEdit} value={t.priority || ""} onChange={(e) => patch(t.id, { priority: e.target.value })}><option value="">Set priority</option>{PRIO.map((x) => <option key={x}>{x}</option>)}</select> : <span className={"pill " + t.priority}>{t.priority}</span>}</td>
-                    <td><Assign t={t} members={members.filter((x) => x.role !== "Client")} can={canEdit} onChange={(v) => patch(t.id, { assignees: v })} /></td>
+                    <td>{t.by === "Client" ? <select className={"psel " + (t.priority || "none")} disabled={!canEditTicket(t)} value={t.priority || ""} onChange={(e) => patch(t.id, { priority: e.target.value })}><option value="">Set priority</option>{PRIO.map((x) => <option key={x}>{x}</option>)}</select> : <span className={"pill " + t.priority}>{t.priority}</span>}</td>
+                    <td><Assign t={t} members={members.filter((x) => x.role !== "Client")} can={manager} onChange={(v) => patch(t.id, { assignees: v })} /></td>
                     <td className="nw">{t.version || "-"}<div className="dd">{fmt(t.deployed)}</div></td>
-                    <td><select className={"st " + t.status.replace(" ", "")} disabled={!canEdit} value={t.status} onChange={(e) => setStatus(t, e.target.value)}>{STATUS.map((s) => <option key={s}>{s}</option>)}</select></td>
+                    <td><select className={"st " + t.status.replace(" ", "")} disabled={!canEditTicket(t)} title={canEditTicket(t) ? undefined : "Only the assignee, an admin or a collaborator can change this"} value={t.status} onChange={(e) => setStatus(t, e.target.value)}>{STATUS.map((s) => <option key={s}>{s}</option>)}</select></td>
                     <td className="nw">{fmt(t.closed)}{t.deadline && <div className="dd">Due {fmt(t.deadline)}</div>}</td>
                     <td className="ra">
                       <button className="ic" title="View details and attachments" onClick={() => setDetail(t.id)}><Ic d={EYE} /></button>
-                      {canEdit && <button className="ic" title="Edit" onClick={() => setModal({ ...t })}><Ic d={PEN} /></button>}
-                      <button className="ic dl" disabled={!canDel(t)} title={canDel(t) ? "Delete" : (t.assignees || []).includes(me.id) ? "You cannot delete a ticket assigned to you" : "Only admins can delete"} onClick={() => del(t)}><Ic d={TRASH} /></button>
+                      {canEditTicket(t) && <button className="ic" title="Edit" onClick={() => setModal({ ...t })}><Ic d={PEN} /></button>}
+                      <button className="ic dl" disabled={!canDel(t)} title={canDel(t) ? "Delete" : "Only admins and collaborators can delete tickets"} onClick={() => del(t)}><Ic d={TRASH} /></button>
                     </td></tr>);
                   return out;
                 })}
@@ -1381,13 +1394,13 @@ export default function Page() {
           {!client && (<>
           <label>Priority<select {...f("priority")}>{modal.by === "Client" && <option value="">Not set</option>}{PRIO.map((s) => <option key={s}>{s}</option>)}</select></label>
           <label>Status<select {...f("status")}>{STATUS.map((s) => <option key={s}>{s}</option>)}</select></label>
-          <label>Raised by<select {...f("by")}><option>Team</option><option>Client</option></select></label>
-          <label>Assignees<Assign t={modal} members={members.filter((x) => x.role !== "Client")} can onChange={(v) => setModal({ ...modal, assignees: v })} /></label>
+          <label>Raised by<select disabled={!manager && !!modal.id} {...f("by")}><option>Team</option><option>Client</option></select></label>
+          <label>Assignees<Assign t={modal} members={members.filter((x) => x.role !== "Client")} can={manager || !modal.id} onChange={(v) => setModal({ ...modal, assignees: v })} /></label>
           <label>Raised / requested on<input type="date" {...f("date")} /></label>
           <label>Version<input placeholder="1.0.1" {...f("version")} /></label>
           <label>Deployed on<input type="date" {...f("deployed")} /></label>
           <label>Deadline<input type="date" {...f("deadline")} /></label>
-          <label>Client (notified when closed)<select {...f("createdBy")}><option value="">None</option>{members.filter((x) => x.role === "Client").map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}</select></label>
+          <label>Client (notified when closed)<select disabled={!manager && !!modal.id} {...f("createdBy")}><option value="">None</option>{members.filter((x) => x.role === "Client").map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}</select></label>
           </>)}
           {client && <p className="note full">The date is added automatically.</p>}
           <label className="full">{client ? "Description" : "Description / fix details"}<textarea rows="4" {...f("details")} /></label>

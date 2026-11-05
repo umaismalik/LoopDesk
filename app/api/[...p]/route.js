@@ -2,7 +2,7 @@ import path from "path";
 import crypto from "crypto";
 import { SEED } from "../../../lib/seed";
 import { sendEmail, emailStatus } from "../../../lib/email";
-import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, loadProjectTicketIds, loadClientTickets, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
+import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, loadProjectTicketIds, loadClientTickets, deleteTicketFiles, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
 import { check } from "../../../lib/reminders";
 
 export const dynamic = "force-dynamic";
@@ -149,6 +149,34 @@ const nextTicketId = (ids, type) => {
   const n = Math.max(0, ...ids.filter((id) => String(id).startsWith(prefix)).map((id) => parseInt(String(id).split("-").pop(), 10) || 0)) + 1;
   return prefix + String(n).padStart(2, "0");
 };
+// Ticket permissions: Admins and Collaborators manage everything; other team members own the tickets
+// assigned to them or raised by them.
+const canManageTickets = (member) => ["Admin", "Collaborator"].includes(member?.role);
+const ownsTicket = (ticket, memberId) => (ticket.assignees || []).includes(memberId) || ticket.raisedBy === memberId;
+const sameIds = (a, b) => JSON.stringify([...(a || [])].sort()) === JSON.stringify([...(b || [])].sort());
+// Field-order-insensitive comparison that ignores values the server maintains itself.
+const SERVER_TICKET_FIELDS = new Set(["rem", "attachments", "clientRef", "raisedBy"]);
+const canonicalTicket = (t) => JSON.stringify(Object.keys(t || {}).filter((k) => !SERVER_TICKET_FIELDS.has(k) && t[k] !== undefined).sort().map((k) => [k, k === "assignees" ? [...(t[k] || [])].sort() : t[k]]));
+const sameTicket = (a, b) => canonicalTicket(a) === canonicalTicket(b);
+// One email per member newly added as an assignee, with the full task, as a deferred send.
+function assignmentEmails(d, t, previousAssignees, actor, projectName, siteLink) {
+  const added = (t.assignees || []).filter((id) => !(previousAssignees || []).includes(id) && id !== actor.id);
+  if (!added.length) return [];
+  const name = (id) => d.members.find((m) => m.id === id)?.name || "";
+  const kind = t.type === "feature" ? "feature" : "issue";
+  const rows = [
+    ["Type", kind === "feature" ? "Feature" : "Issue"], ["Status", t.status], ["Priority", t.priority], ["Deadline", t.deadline],
+    ["Raised on", t.date], ["Raised by", t.by === "Client" ? "Client" : name(t.raisedBy) || t.by], ["Version", t.version],
+    ["Assigned to", (t.assignees || []).map(name).filter(Boolean).join(", ")],
+  ].filter(([, value]) => value).map(([label, value]) => `<tr><td style="padding:4px 14px 4px 0;color:#64748b;white-space:nowrap">${emailHtml(label)}</td><td style="padding:4px 0">${emailHtml(value)}</td></tr>`).join("");
+  const block = (label, value) => value ? `<p style="margin:14px 0 4px"><b>${emailHtml(label)}</b></p><div style="white-space:pre-wrap;padding:10px 12px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc">${emailHtml(value)}</div>` : "";
+  return d.members.filter((m) => added.includes(m.id) && m.status !== "disabled" && m.email).map((m) => () => send(m.email,
+    `Assigned to you: ${t.id} - ${t.title}`,
+    `<p>Hello ${emailHtml(m.name)},</p><p><b>${emailHtml(actor.name)}</b> assigned you ${kind === "feature" ? "a feature" : "an issue"} in <b>${emailHtml(projectName)}</b>.</p>`
+    + `<h3 style="margin:16px 0 8px">${emailHtml(t.id)} - ${emailHtml(t.title)}</h3><table style="border-collapse:collapse;font-size:14px">${rows}</table>`
+    + block("Description / details", t.details) + block("Notes", (t.notes || []).map((n) => `${n.at || ""} ${n.by || ""}: ${n.text || ""}`.trim()).join("\n"))
+    + `<p style="margin-top:18px"><a href="${emailHtml(siteLink)}">Open LoopDesk</a> to view the ticket and its attachments.</p>`));
+}
 // Clients see their own serial ("ISS-01", "ISS-02", …) instead of the project-wide ticket id, which
 // stays the database key. `clientRef` is stored on the ticket. This gives every loaded ticket of the
 // client that lacks one the next serial in its type, oldest first, and reports whether any changed.
@@ -1379,10 +1407,28 @@ async function h(req, p, m) {
     if (r === "tickets") {
       if (me.role === "Client") return J({ error: "Not allowed" }, 403);
       const b = await req.json();
+      if (!Array.isArray(b.tickets)) return J({ error: "Invalid input" }, 400);
       const gone = d.tickets.filter((t) => !b.tickets.some((x) => x.id === t.id));
-      if (gone.some((t) => me.role !== "Admin" || (t.assignees || []).includes(me.id))) return J({ error: "Not allowed to delete" }, 403);
       const old = Object.fromEntries(d.tickets.map((t) => [t.id, t]));
-      if (me.role === "Collaborator" && b.tickets.some((t) => old[t.id] && JSON.stringify({ ...old[t.id], attachments: 0 }) !== JSON.stringify({ ...t, attachments: 0 }))) return J({ error: "Not allowed" }, 403);
+      // Admins and Collaborators manage every ticket. Other team members may raise tickets and update
+      // the ones that are theirs (assigned to them or raised by them), but not reassign or delete.
+      const manager = canManageTickets(me);
+      if (!manager) {
+        if (gone.length) return J({ error: "Only admins and collaborators can delete tickets" }, 403);
+        for (const t of b.tickets) {
+          const o = old[t.id];
+          if (!o || sameTicket(o, t)) continue;
+          if (!ownsTicket(o, me.id)) return J({ error: `You can only update tickets assigned to you (${o.id} is not)` }, 403);
+          if (!sameIds(o.assignees, t.assignees)) return J({ error: "Only admins and collaborators can change assignees" }, 403);
+          if ((o.raisedBy || "") !== (t.raisedBy || "") || (o.createdBy || "") !== (t.createdBy || "")) return J({ error: "Not allowed" }, 403);
+        }
+      }
+      // Remember which team member raised each new ticket; never let an edit rewrite it.
+      b.tickets.forEach((t) => {
+        const o = old[t.id];
+        if (o) { if (o.raisedBy) t.raisedBy = o.raisedBy; else delete t.raisedBy; }
+        else t.raisedBy = me.id;
+      });
       // The browser numbers new tickets from the page it has loaded, which can miss tickets on other
       // pages or created by clients. Re-number any new ticket whose id is already taken project-wide.
       const renamed = {};
@@ -1409,26 +1455,44 @@ async function h(req, p, m) {
       for (const clientId of new Set(b.tickets.filter((t) => !t.clientRef && clientIds.has(t.createdBy)).map((t) => t.createdBy))) {
         await assignClientRefs({ tickets: b.tickets }, project.id, clientId);
       }
+      // Emails go out only after the save succeeds, so nobody is told about a change that was rejected.
       const jobs = [];
       b.tickets.forEach((t) => {
         const o = old[t.id];
         if (o) t.rem = o.deadline !== t.deadline ? [] : (o.rem || []);
+        jobs.push(...assignmentEmails(d, t, o?.assignees || [], me, project.name, browserSiteUrl(u.origin)));
         if (!o) log(d, me.name, "Created " + t.id, t.title);
-        else if (JSON.stringify(o) !== JSON.stringify(t)) {
+        else if (!sameTicket(o, t)) {
           const changes = ticketChanges(o, t, d.members);
           log(d, me.name, "Updated " + t.id, changes.length ? changes : t.title);
           const c = d.members.find((m) => m.id === t.createdBy);
-          if (c && o.status !== "Completed" && t.status === "Completed") jobs.push(send(c.email, "Your ticket " + (t.clientRef || t.id) + " has been resolved",
+          if (c && o.status !== "Completed" && t.status === "Completed") jobs.push(() => send(c.email, "Your ticket " + (t.clientRef || t.id) + " has been resolved",
             `<p>Hello ${emailHtml(c.name)},</p><p>Your ticket <b>${emailHtml(t.clientRef || t.id)}</b> - ${emailHtml(t.title)} has been marked as resolved.</p><p>Please <a href="${emailHtml(browserSiteUrl(u.origin))}">sign in to the portal</a> to review the solution and check the fix in your product. If you are not satisfied, you can reopen the ticket from the portal.</p>`));
         }
       });
       gone.forEach((t) => log(d, me.name, "Deleted " + t.id, t.title));
-      d.tickets = b.tickets; await save(d); await Promise.all(jobs);
+      const goneIds = gone.map((t) => t.id);
+      if (goneIds.length && !remote) d.files = d.files.filter((file) => !goneIds.includes(file.ticket));
+      d.tickets = b.tickets; await save(d);
+      if (goneIds.length && remote) await deleteTicketFiles(project.id, goneIds).catch((error) => console.warn("Could not remove attachments of deleted tickets:", error?.message || error));
+      await Promise.all(jobs.map((job) => job()));
       return J({ ok: true, renamed });
     }
     if (r === "client") {
       if (me.role !== "Client") return J({ error: "Not allowed" }, 403);
       const b = await req.json();
+      if (b.action === "delete") {
+        // A client may delete a ticket they raised; it disappears for the team as well.
+        const t = d.tickets.find((x) => x.id === b.id && x.createdBy === me.id);
+        if (!t) return J({ error: "This ticket cannot be deleted" }, 404);
+        d.tickets = d.tickets.filter((x) => x !== t);
+        if (!remote) d.files = d.files.filter((file) => file.ticket !== t.id);
+        log(d, me.name, "Deleted " + t.id + (t.clientRef ? " (client " + t.clientRef + ")" : ""), t.title);
+        await save(d);
+        if (remote) await deleteTicketFiles(project.id, [t.id]).catch((error) => console.warn("Could not remove attachments of a deleted ticket:", error?.message || error));
+        await Promise.all(emails(d, t.assignees || []).map((e) => send(e, "Ticket deleted by client: " + t.id, `<p>${esc(me.name)} deleted <b>${esc(t.id)}</b> - ${esc(t.title)}. It has been removed from the project.</p>`)));
+        return J({ ok: true });
+      }
       if (b.action === "reopen") {
         const t = d.tickets.find((x) => x.id === b.id && x.createdBy === me.id), why = String(b.reason || "").trim().slice(0, 500);
         if (!t || t.status !== "Completed" || !why) return J({ error: "This ticket cannot be reopened" }, 400);
