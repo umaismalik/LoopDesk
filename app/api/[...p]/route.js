@@ -147,6 +147,12 @@ const siteUrl = (origin) => {
   if (!CONFIGURED_SITE || CONFIGURED_SITE.toLowerCase().includes("your-project.vercel.app")) return origin;
   try { return new URL(CONFIGURED_SITE).origin; } catch { return origin; }
 };
+// Links that a person opens from an email point back to the site the request came from, so a stale
+// or mistyped APP_URL cannot send invitees to a deployment without this API. APP_URL is only the fallback.
+const browserSiteUrl = (origin) => {
+  try { const parsed = new URL(origin); if (/^https?:$/.test(parsed.protocol) && parsed.hostname) return parsed.origin; } catch {}
+  return siteUrl(origin);
+};
 const live = (x) => { const t = +String(x).split(".")[1]; return !t || Date.now() - t < SESSION; };
 const pwOk = (p) => p && p.length >= 8 && /[a-z]/i.test(p) && /\d/.test(p);
 const PWMSG = "Password must be 8+ characters with at least one letter and one number";
@@ -209,7 +215,7 @@ const mail = (to, link, role, projectName) => send(to, "Project invitation: " + 
 async function resetLink(d, m, origin) {
   const token = uid();
   d.resets = d.resets.filter((x) => x.id !== m.id).concat({ id: m.id, token, at: Date.now() });
-  const link = siteUrl(origin) + "/?reset=" + token;
+  const link = browserSiteUrl(origin) + "/?reset=" + token;
   const result = await send(m.email, "Reset your LoopDesk password", `<p>Hello ${emailHtml(m.name)},</p><p>Use this link to set a new password. It expires in 1 hour and works once.</p><p><a href="${link}">Reset password</a></p><p>If you did not request this, you can ignore this email.</p>`);
   log(d, m.name, "Password reset link issued");
   return { link, sent: result.sent, emailError: result.error };
@@ -1339,7 +1345,7 @@ async function h(req, p, m) {
           log(d, me.name, "Updated " + t.id, changes.length ? changes : t.title);
           const c = d.members.find((m) => m.id === t.createdBy);
           if (c && o.status !== "Completed" && t.status === "Completed") jobs.push(send(c.email, "Your ticket " + t.id + " has been resolved",
-            `<p>Hello ${emailHtml(c.name)},</p><p>Your ticket <b>${emailHtml(t.id)}</b> - ${emailHtml(t.title)} has been marked as resolved.</p><p>Please <a href="${emailHtml(siteUrl(u.origin))}">sign in to the portal</a> to review the solution and check the fix in your product. If you are not satisfied, you can reopen the ticket from the portal.</p>`));
+            `<p>Hello ${emailHtml(c.name)},</p><p>Your ticket <b>${emailHtml(t.id)}</b> - ${emailHtml(t.title)} has been marked as resolved.</p><p>Please <a href="${emailHtml(browserSiteUrl(u.origin))}">sign in to the portal</a> to review the solution and check the fix in your product. If you are not satisfied, you can reopen the ticket from the portal.</p>`));
         }
       });
       gone.forEach((t) => log(d, me.name, "Deleted " + t.id, t.title));
@@ -1414,7 +1420,7 @@ async function h(req, p, m) {
       const existing = d.members.find((x) => x.email === b.email);
       if (existing && project.members.some((x) => x.memberId === existing.id)) return J({ error: "Already a member of " + project.name }, 400);
       if (d.invites.some((x) => x.projectId === project.id && x.email === b.email)) return J({ error: "An invitation is already pending for this project" }, 400);
-      const token = uid(), link = siteUrl(u.origin) + "/?invite=" + token;
+      const token = uid(), link = browserSiteUrl(u.origin) + "/?invite=" + token;
       d.invites.push({ token, email: b.email, role: b.role, projectId: project.id }); await save(d);
       log(d, me.name, "Invited member", b.email + " to " + project.name + " as " + b.role); await save(d);
       const result = await mail(b.email, link, b.role, project.name);
