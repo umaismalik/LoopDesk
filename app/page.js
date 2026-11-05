@@ -461,6 +461,7 @@ export default function Page() {
     setTicketTotal(total);
     setTicketHasMore(ticketOffset + next.length < total);
     if (!next.length && ticketOffset > 0) loadTicketPage(Math.max(0, ticketOffset - 100));
+    return result;
   };
 
   const admin = me && me.role === "Admin", canEdit = me && me.role !== "Collaborator" && me.role !== "Client", client = me && me.role === "Client";
@@ -499,8 +500,15 @@ export default function Page() {
       await attachAll(r.id, m); return load(key);
     }
     t.closed = t.status === "Completed" ? (t.closed || today()) : "";
-    if (!t.id) { t.id = nextId(tickets, t.type); await commit([...tickets, t]); } else await commit(tickets.map((x) => x.id === t.id ? t : x));
-    await attachAll(t.id, m); load(key);
+    let savedId = t.id;
+    if (!t.id) {
+      t.id = nextId(tickets, t.type);
+      const result = await commit([...tickets, t]);
+      if (!result) return;
+      // The server may renumber the ticket if its id is already used outside the loaded page.
+      savedId = result.renamed?.[t.id] || t.id;
+    } else if (!(await commit(tickets.map((x) => x.id === t.id ? t : x)))) return;
+    await attachAll(savedId, m); load(key);
   };
   const reopen = async (t) => {
     const reason = prompt("Why are you not satisfied with the solution? (required)");

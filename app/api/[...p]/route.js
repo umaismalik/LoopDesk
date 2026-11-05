@@ -2,7 +2,7 @@ import path from "path";
 import crypto from "crypto";
 import { SEED } from "../../../lib/seed";
 import { sendEmail, emailStatus } from "../../../lib/email";
-import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
+import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, loadProjectTicketIds, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
 import { check } from "../../../lib/reminders";
 
 export const dynamic = "force-dynamic";
@@ -143,6 +143,12 @@ const hash = (p) => { const s = crypto.randomBytes(16).toString("hex"); return s
 const verify = (p, h) => { if (!h) return false; const [s, x] = h.split(":"); return crypto.timingSafeEqual(crypto.scryptSync(p, s, 64), Buffer.from(x, "hex")); };
 const fails = new Map();
 const SESSION = 30 * 864e5, CONFIGURED_SITE = process.env.APP_URL || "";
+// Next ticket id of a type ("ISS-07", "FTR-12") after the highest number already in `ids`.
+const nextTicketId = (ids, type) => {
+  const prefix = type === "feature" ? "FTR-" : "ISS-";
+  const n = Math.max(0, ...ids.filter((id) => String(id).startsWith(prefix)).map((id) => parseInt(String(id).split("-").pop(), 10) || 0)) + 1;
+  return prefix + String(n).padStart(2, "0");
+};
 const siteUrl = (origin) => {
   if (!CONFIGURED_SITE || CONFIGURED_SITE.toLowerCase().includes("your-project.vercel.app")) return origin;
   try { return new URL(CONFIGURED_SITE).origin; } catch { return origin; }
@@ -433,15 +439,19 @@ async function h(req, p, m) {
     }
   });
   d.organizations = d.organizations || [];
+  // Signed-in and public-flow requests load only the caller's slice of the workspace, so a missing
+  // "solexes" row there does not mean it is missing from the database. Only a full, unscoped load may
+  // create the default organization; otherwise re-inserting it on every save is rejected as a conflict.
+  const scopedLoad = !!(key || d._publicFlow);
   let defaultOrganization = d.organizations.find((item) => item.id === "solexes")
-    || (d._publicFlow ? d.organizations[0] : null);
+    || (scopedLoad ? d.organizations[0] : null);
   if (!defaultOrganization) {
     defaultOrganization = {
       id: "solexes",
       name: "My Company",
       adminIds: [...new Set(d.projects.flatMap((item) => item.members.filter((entry) => entry.role === "Admin" && entry.status !== "disabled").map((entry) => entry.memberId)))],
     };
-    if (!d._publicFlow) d.organizations.push(defaultOrganization);
+    if (!scopedLoad) d.organizations.push(defaultOrganization);
   }
   d.projects.forEach((item) => {
     if (!item.organizationId) item.organizationId = defaultOrganization.id;
@@ -1340,6 +1350,22 @@ async function h(req, p, m) {
       if (gone.some((t) => me.role !== "Admin" || (t.assignees || []).includes(me.id))) return J({ error: "Not allowed to delete" }, 403);
       const old = Object.fromEntries(d.tickets.map((t) => [t.id, t]));
       if (me.role === "Collaborator" && b.tickets.some((t) => old[t.id] && JSON.stringify({ ...old[t.id], attachments: 0 }) !== JSON.stringify({ ...t, attachments: 0 }))) return J({ error: "Not allowed" }, 403);
+      // The browser numbers new tickets from the page it has loaded, which can miss tickets on other
+      // pages or created by clients. Re-number any new ticket whose id is already taken project-wide.
+      const renamed = {};
+      const newTickets = b.tickets.filter((t) => !old[t.id]);
+      if (newTickets.length) {
+        const taken = (await loadProjectTicketIds(project.id)) || d.tickets.map((t) => t.id);
+        const used = new Set(taken);
+        for (const t of newTickets) {
+          if (used.has(t.id)) {
+            const next = nextTicketId([...used], t.type);
+            renamed[t.id] = next;
+            t.id = next;
+          }
+          used.add(t.id);
+        }
+      }
       const jobs = [];
       b.tickets.forEach((t) => {
         const o = old[t.id];
@@ -1355,7 +1381,7 @@ async function h(req, p, m) {
       });
       gone.forEach((t) => log(d, me.name, "Deleted " + t.id, t.title));
       d.tickets = b.tickets; await save(d); await Promise.all(jobs);
-      return J({ ok: true });
+      return J({ ok: true, renamed });
     }
     if (r === "client") {
       if (me.role !== "Client") return J({ error: "Not allowed" }, 403);
@@ -1385,9 +1411,22 @@ async function h(req, p, m) {
         return J({ id: t.id });
       }
       const type = x.type === "feature" ? "feature" : "issue";
-      const n = Math.max(0, ...d.tickets.filter((y) => y.type === type).map((y) => parseInt(y.id.split("-").pop()) || 0)) + 1;
-      const t = { id: (type === "issue" ? "ISS-" : "FTR-") + String(n).padStart(2, "0"), type, date: td(), by: "Client", title, priority: "", assignees: [], details, version: "", deployed: "", status: "Open", closed: "", createdBy: me.id };
-      d.tickets.push(t); log(d, me.name, "Created " + t.id, title); await save(d);
+      // A client only sees their own tickets, so number against every ticket in the project. If another
+      // request takes the same number first, the save is rejected as a conflict; pick the next one.
+      const projectTicketIds = async () => (await loadProjectTicketIds(project.id)) || d.tickets.map((y) => y.id);
+      const t = { id: nextTicketId(await projectTicketIds(), type), type, date: td(), by: "Client", title, priority: "", assignees: [], details, version: "", deployed: "", status: "Open", closed: "", createdBy: me.id };
+      d.tickets.push(t); log(d, me.name, "Created " + t.id, title);
+      const createdEvent = d.audit[0];
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          await save(d);
+          break;
+        } catch (error) {
+          if (attempt >= 2 || !String(error?.message || error).includes("A record was created by another request")) throw error;
+          t.id = nextTicketId([...await projectTicketIds(), t.id], type);
+          createdEvent.act = "Created " + t.id;
+        }
+      }
       await Promise.all(d.members.filter((m) => m.role === "Admin").map((m) => send(m.email, "New client ticket " + t.id, `<p>${esc(me.name)} raised <b>${t.id}</b>: ${esc(title)}</p>`)));
       return J({ id: t.id });
     }
