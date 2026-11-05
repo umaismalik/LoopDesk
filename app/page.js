@@ -4,12 +4,12 @@ import { createPortal } from "react-dom";
 import dynamic from "next/dynamic";
 import { correctTurnNames, generateEnglishKeyPoints, generateMeetingParticipantCards } from "../lib/local-transcription";
 import MeetingNotes from "../components/MeetingNotes";
+import Dashboard from "./dashboard";
 
 const LocalTranscriber = dynamic(() => import("../components/LocalTranscriber"), { ssr: false });
 
 const STATUS = ["Open", "In Progress", "Testing", "Completed", "Reopened"], PRIO = ["High", "Medium", "Low"], ROLES = ["Admin", "Developer", "Collaborator", "Client"];
 const CATS = ["Requirements & Design", "Reports & Releases", "Guides & Communication", "Other"];
-const COL = ["#ef4444", "#f59e0b", "#06b6d4", "#10b981", "#a855f7"];
 const today = () => new Date().toISOString().slice(0, 10);
 const localDateKey = (d) => [d.getFullYear(), String(d.getMonth() + 1).padStart(2, "0"), String(d.getDate()).padStart(2, "0")].join("-");
 const monthKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
@@ -151,32 +151,6 @@ function Assign({ t, members, can, onChange }) {
   </div>);
 }
 
-function Chart({ title, list }) {
-  const ms = [...new Set(list.map((t) => (t.date || "").slice(0, 7)).filter(Boolean))].sort();
-  const rc = ms.map((m) => STATUS.map((s) => list.filter((t) => (t.date || "").startsWith(m) && t.status === s).length));
-  const mx = Math.max(1, ...rc.flat()), st = STATUS.map((s) => list.filter((t) => t.status === s).length), tot = list.length || 1;
-  let a = 0;
-  const grad = st.map((n, i) => { const s = a; a += (n / tot) * 100; return COL[i] + " " + s + "% " + a + "%"; }).join(",");
-  return (
-    <div className="panel">
-      <h3>{title}</h3>
-      <div className="ch">
-        <svg viewBox={"0 0 " + (ms.length * 104 + 16) + " 160"} className="svg">
-          {rc.map((row, i) => (<g key={i}>
-            {row.map((n, j) => (<g key={j}>
-              <rect x={i * 104 + 12 + j * 16} y={120 - (n / mx) * 100} width="14" height={(n / mx) * 100} rx="3" fill={COL[j]} />
-              {n > 0 && <text x={i * 104 + 19 + j * 16} y={116 - (n / mx) * 100} textAnchor="middle" fontSize="9" fill="#334155">{n}</text>}
-            </g>))}
-            <text x={i * 104 + 52} y="140" textAnchor="middle" fontSize="11" fill="#64748b">{ml(ms[i], 1)}</text>
-          </g>))}
-        </svg>
-        <div className="donut" style={{ background: "conic-gradient(" + (list.length ? grad : "#e5e9f2,#e5e9f2") + ")" }}><b>{list.length}</b></div>
-      </div>
-      <div className="leg">{STATUS.map((s, i) => (<span key={s}><i style={{ background: COL[i] }} />{s} {st[i]}</span>))}</div>
-    </div>
-  );
-}
-
 export default function Page() {
   const [screen, setScreen] = useState("loading");
   const [key, setKey] = useState("");
@@ -213,13 +187,12 @@ export default function Page() {
   const [fileLoading, setFileLoading] = useState(false);
   const [fc, setFc] = useState(0);
   const [lk, setLk] = useState({ url: "", name: "" });
-  const [fa, setFa] = useState(""), [aa, setAa] = useState("");
+  const [fa, setFa] = useState("");
   const [amsg, setAmsg] = useState("");
   const [inv, setInv] = useState(null);
   const [invPassword, setInvPassword] = useState("");
   const [view, setView] = useState("all");
   const [q, setQ] = useState(""), [fs, setFs] = useState(""), [fp, setFp] = useState(""), [fm, setFm] = useState("");
-  const [col, setCol] = useState({});
   const [modal, setModal] = useState(null);
   const [detail, setDetail] = useState(null);
   const [ucat, setUcat] = useState(CATS[0]);
@@ -263,6 +236,8 @@ export default function Page() {
   const [recordingNoteId, setRecordingNoteId] = useState("");
   const [sharingParticipantIds, setSharingParticipantIds] = useState([]);
   const [conferenceJoined, setConferenceJoined] = useState(false);
+  // Shared notes stay out of the way until the meeting actually starts (join or record) or already has notes.
+  const [meetingNotesOpen, setMeetingNotesOpen] = useState(false);
   const recorderRef = useRef(null);
   const recordingStreamRef = useRef(null);
   const recordingTimerRef = useRef(null);
@@ -475,6 +450,11 @@ export default function Page() {
   const activeProject = projects.find((p) => p.id === projectId);
   const activeOrganization = organizations.find((organization) => organization.id === activeProject?.organizationId);
   const canDel = () => manager;
+  // Dashboard lists cover the whole project; a ticket outside the loaded page opens via its log search.
+  const openTicket = (id) => {
+    if (tickets.some((t) => t.id === id)) { setDetail(id); return; }
+    setView(id.startsWith("FTR-") ? "feature" : "issue"); setQ(id);
+  };
   const base = useMemo(() => tickets.filter((t) => view === "all" || t.type === view), [tickets, view]);
   const months = useMemo(() => [...new Set(base.map((t) => (t.date || "").slice(0, 7)).filter(Boolean))].sort(), [base]);
   const rows = useMemo(() => base.filter((t) =>
@@ -483,8 +463,6 @@ export default function Page() {
   ).sort((a, b) => view === "issue" || view === "feature"
     ? ticketNumber(a) - ticketNumber(b) || a.id.localeCompare(b.id)
     : (a.date || "").localeCompare(b.date || "") || a.id.localeCompare(b.id)), [base, q, fs, fp, fm, fa, members, view]);
-  const cnt = (s) => base.filter((t) => t.status === s).length;
-  const stats = [["Total tickets", base.length, "c1"], ["Open / In progress", cnt("Open") + cnt("In Progress") + cnt("Reopened"), "c2"], ["In testing", cnt("Testing"), "c3"], ["Completed", cnt("Completed"), "c4"], ["High priority open", base.filter((t) => t.priority === "High" && t.status !== "Completed").length, "c5"]];
 
   const patch = (id, o) => commit(tickets.map((t) => t.id === id ? { ...t, ...o } : t));
   const setStatus = (t, status) => patch(t.id, { status, closed: status === "Completed" ? (t.closed || today()) : "" });
@@ -637,6 +615,7 @@ export default function Page() {
     const cards = meetingCards(meeting, members);
     setMeetingSelected(meeting); setMeetingDraft(meeting.notes || ""); setParticipantSummaries(cards);
     setSelectedMeetingMemberId(cards[0]?.memberId || ""); setMeetingCardView("selected");
+    setMeetingNotesOpen(!!String(meeting.notes || "").trim());
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
   const closeMeeting = () => {
@@ -664,6 +643,7 @@ export default function Page() {
     }, 1000);
   };
   const startMeetingRecording = async () => {
+    setMeetingNotesOpen(true);
     if (!recordingSaved && recordingClips.length >= 20) {
       setMeetingVoiceError("A single recording note can contain up to 20 clips. Save or cancel this recording set before starting another.");
       return;
@@ -941,7 +921,6 @@ export default function Page() {
   };
   const f = (k) => ({ value: modal[k] || "", onChange: (e) => setModal({ ...modal, [k]: e.target.value }) });
   const anames = (ids) => members.filter((m) => (ids || []).includes(m.id)).map((m) => m.name).join(", ") || "Unassigned";
-  const aN = aa ? " - " + ((members.find((m) => m.id === aa) || {}).name || "") : "";
   const fh = (a) => a.url || fl(a);
   const fl = (a) => "/api/file?f=" + encodeURIComponent(a.id) + "&n=" + encodeURIComponent(a.name) + "&project=" + encodeURIComponent(projectId);
   const openFile = async (file) => {
@@ -1018,11 +997,9 @@ export default function Page() {
   );
 
   const nav = client ? [["portal", "My Tickets"], ...(canUseMeetings ? [["meetings", "Meetings"]] : [])] : [["all", "Dashboard"], ["issue", "Issues"], ["feature", "Features"], ["files", "Attachments"], ["team", "Team"], ...(canUseMeetings ? [["meetings", "Meetings"], ["meeting-notes", "Meeting Notes"]] : []), ...(admin ? [["activity", "Activity"]] : [])];
-  const counts = {}; rows.forEach((t) => { const m = (t.date || "").slice(0, 7); counts[m] = (counts[m] || 0) + 1; });
   const firstOfMonth = new Date(meetingMonth.getFullYear(), meetingMonth.getMonth(), 1);
   const calendarStart = new Date(firstOfMonth); calendarStart.setDate(firstOfMonth.getDate() - ((firstOfMonth.getDay() + 6) % 7));
   const calendarDates = Array.from({ length: 42 }, (_, i) => { const date = new Date(calendarStart); date.setDate(calendarStart.getDate() + i); return date; });
-  let last = null;
   return (
     <div className="app">
       <aside className="side">
@@ -1215,28 +1192,28 @@ export default function Page() {
                     }}>
                       <h4>{card.name}<span>{members.find((member) => member.id === card.memberId)?.role || "Team member"}</span></h4>
                       <div className="meeting-recent-work"><b>Recent task updates</b>{recentWork.length ? recentWork.map((ticket) => <p key={ticket.id}><span>{ticket.title}</span><em>{ticket.status} · {ticket.closed || ticket.date}</em></p>) : <small>No recent ticket updates.</small>}</div>
-                      <label>Previous task update (one per line)<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="3" value={(card.points || []).join("\n")} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, points: event.target.value.split("\n") } : item))} placeholder="Summarize progress or blockers from the last task" /></label>
-                      <label>Task description / context<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="3" value={card.description || ""} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, description: event.target.value } : item))} placeholder="Add notes or context for the assigned task" /></label>
+                      <label>Previous task update (one per line)<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="2" value={(card.points || []).join("\n")} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, points: event.target.value.split("\n") } : item))} placeholder="Summarize progress or blockers from the last task" /></label>
+                      <label>Task description / context<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="2" value={card.description || ""} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, description: event.target.value } : item))} placeholder="Add notes or context for the assigned task" /></label>
                       <label>Priority for upcoming tasks<select disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} value={card.priority || "Medium"} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, priority: event.target.value } : item))}><option>High</option><option>Medium</option><option>Low</option></select></label>
-                      <label>Next tasks (one per line)<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="3" value={(card.tasks || []).join("\n")} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, tasks: event.target.value.split("\n") } : item))} placeholder="Write the next action; details and deadline can be managed in Meeting Notes" /></label>
+                      <label>Next tasks (one per line)<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="2" value={(card.tasks || []).join("\n")} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, tasks: event.target.value.split("\n") } : item))} placeholder="Write the next action; details and deadline can be managed in Meeting Notes" /></label>
                     </article>;
                   })}
                     {!selectedMeetingMemberId && <div className="meeting-member-empty"><b>Ready for the next update?</b><span>Select a team member above, or start recording and their turn will be selected when their name is recognized.</span></div>}
                   </div>
                 </section>
-                <section className="panel meeting-notes-panel">
+                {meetingNotesOpen && <section className="panel meeting-notes-panel">
                   <label className="meeting-notes-label">Shared meeting notes<textarea disabled={!["Admin", "Collaborator"].includes(me.role)} rows="10" maxLength="20000" value={meetingDraft} onChange={(e) => setMeetingDraft(e.target.value)} placeholder="Capture decisions, action items, and follow-ups here." /></label>
-                  <div className="meeting-notes-actions">
-                      {canEditMeetingContent && (!recordingClips.length || recordingSaved) && <button className="btn" disabled={meetingBusy || recordingState !== "idle"} onClick={saveMeetingNotes}>{meetingBusy ? "Saving…" : "Save notes"}</button>}
-                  </div>
-                </section>
+                </section>}
+                <div className="meeting-notes-actions">
+                    {canEditMeetingContent && (!recordingClips.length || recordingSaved) && <button className="btn" disabled={meetingBusy || recordingState !== "idle"} onClick={saveMeetingNotes}>{meetingBusy ? "Saving…" : "Save notes"}</button>}
+                </div>
               </div>
               <aside className="meeting-workspace-side">
                 <section className="panel meeting-side-card" aria-label="Meeting details">
                   <h3>Details</h3>
                       {meetingSelected.online && <section className="meeting-room">
                         <div className="meeting-room-toolbar"><div><h3>{meetingSelected.roomProvider === "jitsi" ? "Jitsi conference room" : `${meetingSelected.roomProvider === "google-meet" ? "Google Meet" : meetingSelected.roomProvider === "zoom" ? "Zoom" : "Microsoft Teams"} conference`}</h3>{meetingSelected.roomUrl ? <a href={meetingSelected.roomUrl} target="_blank" rel="noreferrer">{meetingSelected.roomUrl}</a> : <span className="meeting-invite-hint">No shared invite link is saved.</span>}</div>
-                          {meetingSelected.roomProvider === "jitsi" ? <button className="btn" onClick={() => setConferenceJoined((joined) => !joined)}>{conferenceJoined ? "Close room" : "Join in dashboard"}</button> : <a className="btn" href={meetingSelected.roomUrl || conferenceLaunchUrl(meetingSelected.roomProvider)} target="_blank" rel="noreferrer">{meetingSelected.roomUrl ? "Join meeting" : `Open ${meetingSelected.roomProvider === "google-meet" ? "Google Meet" : meetingSelected.roomProvider === "zoom" ? "Zoom" : "Teams"}`}</a>}
+                          {meetingSelected.roomProvider === "jitsi" ? <button className="btn" onClick={() => { setMeetingNotesOpen(true); setConferenceJoined((joined) => !joined); }}>{conferenceJoined ? "Close room" : "Join in dashboard"}</button> : <a className="btn" href={meetingSelected.roomUrl || conferenceLaunchUrl(meetingSelected.roomProvider)} target="_blank" rel="noreferrer" onClick={() => setMeetingNotesOpen(true)}>{meetingSelected.roomUrl ? "Join meeting" : `Open ${meetingSelected.roomProvider === "google-meet" ? "Google Meet" : meetingSelected.roomProvider === "zoom" ? "Zoom" : "Teams"}`}</a>}
                           {meetingSelected.roomProvider === "jitsi" && <a className="btn alt" href={meetingSelected.roomUrl} target="_blank" rel="noreferrer">Open in new tab</a>}
                         </div>
                         {conferenceJoined && meetingSelected.roomProvider === "jitsi" && <JitsiMeetingEmbed roomUrl={meetingSelected.roomUrl} title={meetingSelected.title} />}
@@ -1339,11 +1316,7 @@ export default function Page() {
           </tbody></table></div>
           <p className="note">Roles and team membership apply only to {activeProject?.name} in {activeOrganization?.name}. Admin and Collaborator: full access to tickets (create, edit, assign, change status, delete). Developer: create tickets, and edit or change the status of tickets assigned to them or raised by them; cannot reassign or delete. Assignees are emailed the full task when they are assigned. For meeting cards, saved meeting notes, and task details, only Admins and Collaborators can edit; other team members can change status on tasks assigned to them or request one-hour admin-approved edit access. Client: sees only tickets they raised in this project; can create, update, reopen and delete them.</p></section>
         </>) : (<>
-          {view === "all" && (<>
-            <section className="cards">{stats.map(([l, n, c]) => (<div key={l} className={"card " + c}><span>{l}</span><b>{n}</b></div>))}</section>
-            <div className="tools"><b className="note">Analytics for:</b><select value={aa} onChange={(e) => setAa(e.target.value)}><option value="">All team members</option>{members.filter((x) => x.role !== "Client").map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}</select></div>
-            <section className="charts"><Chart title={"Issues analytics" + aN} list={base.filter((t) => t.type === "issue" && (!aa || (t.assignees || []).includes(aa)))} /><Chart title={"Features analytics" + aN} list={base.filter((t) => t.type === "feature" && (!aa || (t.assignees || []).includes(aa)))} /></section>
-          </>)}
+          {view === "all" ? <Dashboard key={projectId} apiGet={(path) => api(path, null, key, projectId)} members={members} projectName={activeProject?.name || ""} onOpenTicket={openTicket} /> : (
           <section className="panel">
             <div className="tools">
               <input placeholder="Search by ID, title, details..." value={q} onChange={(e) => setQ(e.target.value)} />
@@ -1356,11 +1329,7 @@ export default function Page() {
             <div className="wrap"><table>
               <thead><tr><th>ID</th><th>Ticket</th><th>Raised</th><th>Priority</th><th>Assignee</th><th>Release</th><th>Status</th><th>Completed</th><th>Actions</th></tr></thead>
               <tbody>
-                {rows.flatMap((t) => {
-                  const m = (t.date || "").slice(0, 7), out = [];
-                  const groupedByMonth = view === "all";
-                  if (groupedByMonth && m !== last) { last = m; out.push(<tr key={"m" + m} className="mh" onClick={() => setCol({ ...col, [m]: !col[m] })}><td colSpan="9">{m ? ml(m) : "No date"} <em>{counts[m]} tickets</em><span>{col[m] ? "Show" : "Hide"}</span></td></tr>); }
-                  if (!groupedByMonth || !col[m]) out.push(<tr key={t.id}>
+                {rows.map((t) => (<tr key={t.id}>
                     <td><b className={"id " + t.type}>{t.id}</b></td>
                     <td><div className="tt">{t.title}</div></td>
                     <td className="nw">{fmt(t.date)}<div className="dd">{t.by}</div></td>
@@ -1373,9 +1342,7 @@ export default function Page() {
                       <button className="ic" title="View details and attachments" onClick={() => setDetail(t.id)}><Ic d={EYE} /></button>
                       {canEditTicket(t) && <button className="ic" title="Edit" onClick={() => setModal({ ...t })}><Ic d={PEN} /></button>}
                       <button className="ic dl" disabled={!canDel(t)} title={canDel(t) ? "Delete" : "Only admins and collaborators can delete tickets"} onClick={() => del(t)}><Ic d={TRASH} /></button>
-                    </td></tr>);
-                  return out;
-                })}
+                    </td></tr>))}
                 {!rows.length && <tr><td colSpan="9" className="empty">No tickets found.</td></tr>}
               </tbody>
             </table></div>
@@ -1383,7 +1350,7 @@ export default function Page() {
               <button className="btn alt" disabled={ticketOffset === 0 || ticketPageLoading} onClick={() => loadTicketPage(Math.max(0, ticketOffset - 100))}>Previous</button>
               <button className="btn alt" disabled={!ticketHasMore || ticketPageLoading} onClick={() => loadTicketPage(ticketOffset + 100)}>{ticketPageLoading ? "Loading…" : "Next"}</button>
             </div>
-          </section>
+          </section>)}
         </>)}
       </main>
 

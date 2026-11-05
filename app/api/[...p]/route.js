@@ -2,7 +2,7 @@ import path from "path";
 import crypto from "crypto";
 import { SEED } from "../../../lib/seed";
 import { sendEmail, emailStatus } from "../../../lib/email";
-import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, loadProjectTicketIds, loadClientTickets, deleteTicketFiles, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
+import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, loadProjectTicketIds, loadClientTickets, deleteTicketFiles, loadTicketSummaries, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
 import { check } from "../../../lib/reminders";
 
 export const dynamic = "force-dynamic";
@@ -766,6 +766,15 @@ async function h(req, p, m) {
       const audio = await getFile(clip.id);
       if (!audio) return J({ error: "Recording file is missing" }, 404);
       return new Response(audio, { headers: { "Content-Type": clip.type || "audio/webm", "Content-Disposition": `inline; filename="${clip.name}"`, "Cache-Control": "private, no-store" } });
+    }
+    if (r === "analytics" && m === "GET") {
+      // Dashboard analytics cover every ticket in the project, not just the page the table loaded.
+      if (!me || me.role === "Client") return J({ error: "Team access required" }, 403);
+      const rows = (await loadTicketSummaries(project.id)) || project.tickets.map((t) => ({
+        id: t.id, type: t.type, status: t.status, title: t.title, date: t.date, deadline: t.deadline,
+        priority: t.priority, closed: t.closed, assignees: t.assignees || [],
+      }));
+      return J({ tickets: rows, generatedAt: new Date().toISOString() });
     }
     if (r === "tickets" && m === "GET") {
       return J({
