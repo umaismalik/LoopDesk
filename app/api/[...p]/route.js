@@ -456,22 +456,27 @@ async function h(req, p, m) {
   if (!d.v5) { d.v5 = true; await save(d); }
   let project = d.projects.find((x) => x.id === requestedProject) || d.projects[0];
   if (requestedProject && !d.projects.some((x) => x.id === requestedProject)) return J({ error: "Project not found" }, 404);
+  // Public flows (forgot password, reset, invite) load only the rows they need, so they may have no project.
+  if (!project) project = { id: "", name: "", members: [], tickets: [], files: [], audit: [] };
   d.resets = d.resets || [];
-  if (!d.members.length && process.env.ADMIN_EMAIL && pwOk(process.env.ADMIN_PASSWORD)) {
+  // Bootstrap the first admin only from a full, unscoped workspace load. A scoped public-flow load (for
+  // example "forgot password" for an unknown email) also has zero members but the workspace is not empty.
+  if (!d._publicFlow && !key && !d.members.length && process.env.ADMIN_EMAIL && pwOk(process.env.ADMIN_PASSWORD)) {
     const m = { id: uid().slice(0, 8), name: process.env.ADMIN_NAME || "Admin", email: process.env.ADMIN_EMAIL.trim().toLowerCase(), phone: "", pw: hash(process.env.ADMIN_PASSWORD), role: "Admin", sessions: [] };
     d.members.push(m);
     d.projects.forEach((x) => { x.members.push({ memberId: m.id, role: "Admin", status: "active" }); });
     d.organizations.forEach((organization) => { organization.adminIds = [...new Set([...(organization.adminIds || []), m.id])]; });
     claim(d, m); await save(d);
   }
-  const account = key && d.members.find((x) => x.status !== "disabled" && (x.key === key || (x.sessions || []).some((v) => v === key && live(v))));
+  // `key` is "" when the browser sends an empty x-key header; keep account strictly an object or null.
+  const account = (key && d.members.find((x) => x.status !== "disabled" && (x.key === key || (x.sessions || []).some((v) => v === key && live(v))))) || null;
   if (!requestedProject && account) project = d.projects.find((x) => x.members.some((entry) => entry.memberId === account.id && entry.status !== "disabled")) || project;
   d._activeProject = project; d._activeProjectId = project.id;
   d.tickets = project.tickets; d.files = project.files; d.audit = project.audit;
   const membership = account && project.members.find((x) => x.memberId === account.id && x.status !== "disabled");
   const me = membership ? { ...account, role: membership.role } : null;
-  const meetingMemberships = account && project.members
-    .filter((entry) => entry.memberId === account.id && entry.status !== "disabled");
+  const meetingMemberships = account ? project.members
+    .filter((entry) => entry.memberId === account.id && entry.status !== "disabled") : [];
   const canUseMeetings = !!meetingMemberships?.some((entry) => entry.role !== "Client");
   const canManageMeetings = !!meetingMemberships?.some((entry) => entry.role === "Admin");
   try {
