@@ -142,3 +142,47 @@ h4{margin:14px 0 6px}.desc{white-space:pre-wrap;background:#f8fafc;border:1px so
 @media(max-width:650px){.meeting-access-banner,.meeting-access-requests article{align-items:stretch;flex-direction:column}.meeting-access-banner .btn{width:100%}.meeting-access-requests article>div:last-child{width:100%}.meeting-access-requests article>div:last-child .btn{flex:1}.managed-member-note-fields{grid-template-columns:1fr}.managed-task-member-group>div{grid-template-columns:1fr}.managed-task-member-group>summary{align-items:flex-start;flex-wrap:wrap}}
 .dashboard-access-notifications{display:grid;gap:10px;margin-bottom:16px;border-color:#fed7aa;background:linear-gradient(130deg,#fff7ed,#fff)}.dashboard-access-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.dashboard-access-heading h2{font-size:16px}.dashboard-access-heading p{margin-top:4px;color:#64748b;font-size:11px}.dashboard-access-heading>span{padding:5px 9px;border-radius:20px;background:#ffedd5;color:#9a3412;font-size:11px;font-weight:700}.dashboard-access-notifications article{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-top:1px solid #fed7aa}.dashboard-access-notifications article>div:first-child{display:grid;gap:4px}.dashboard-access-notifications article>div:first-child span{color:#64748b;font-size:11px}.dashboard-access-notifications article>div:last-child{display:flex;gap:7px}.dashboard-access-notifications .meeting-empty{padding:8px 0}
 @media(max-width:650px){.dashboard-access-heading,.dashboard-access-notifications article{align-items:stretch;flex-direction:column}.dashboard-access-notifications article>div:last-child{width:100%}.dashboard-access-notifications article>div:last-child .btn{flex:1}}
+/* Meeting workspace: opened from the calendar, replaces it until the user goes back. */
+.meeting-workspace{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;min-width:0}
+.meeting-workspace .panel{margin:0}
+.meeting-workspace-head{position:sticky;top:max(10px,env(safe-area-inset-top,0px));z-index:6;display:flex;align-items:center;gap:14px;padding:12px 16px;border-color:#dfe5f1;box-shadow:0 10px 28px rgba(15,23,42,.07)}
+.meeting-back{flex:none;white-space:nowrap}
+.meeting-workspace-title{flex:1;min-width:0}
+.meeting-workspace-title h2{font-size:clamp(17px,1.6vw,21px);letter-spacing:-.02em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.meeting-workspace-title p{margin-top:3px;color:var(--mut);font-size:12px}
+.meeting-workspace-head .ic.dl{flex:none;padding:8px 12px;border-radius:8px;background:#fff7f7}
+.meeting-workspace-head .ic.dl:hover:not(:disabled){background:#fee2e2}
+.meeting-workspace-head button:disabled{opacity:.55;cursor:not-allowed}
+.meeting-workspace .meeting-alert,.meeting-workspace .meeting-success,.meeting-workspace .meeting-access-banner{margin:0}
+.meeting-workspace-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(300px,360px);gap:16px;align-items:start}
+.meeting-workspace-main{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;min-width:0}
+.meeting-workspace-main .meeting-summary-cards,.meeting-workspace-main .meeting-transcript-review{margin:0}
+.meeting-workspace-side{position:sticky;top:96px;display:grid;gap:16px;min-width:0}
+.meeting-side-card{display:grid;gap:12px;padding:16px}
+.meeting-side-card>h3{color:var(--mut);font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}
+.meeting-side-card .meeting-room{margin:0;padding:12px}
+.meeting-side-card .meeting-room-toolbar{flex-direction:column;align-items:stretch}
+.meeting-side-card .meeting-room-toolbar a:not(.btn){overflow-wrap:anywhere;font-size:12px}
+.meeting-side-card .meeting-room-toolbar>div{flex:none}
+.meeting-side-card .meeting-room-toolbar .btn{text-align:center;text-decoration:none}
+.meeting-side-card .meeting-agenda-read,.meeting-side-card .meeting-attendee-list,.meeting-side-card .meeting-invite-hint{margin:0}
+.meeting-agenda-read p{white-space:pre-wrap}
+.meeting-recorder .meeting-note-tools{display:grid;grid-template-columns:1fr;gap:10px;margin:0}
+.meeting-recorder .meeting-record-button{width:100%;min-width:0}
+.meeting-recorder .meeting-record-status{min-width:0}
+.meeting-recorder .meeting-audio-preview{grid-template-columns:1fr;margin:0}
+.meeting-recorder .meeting-record-save{margin:0}
+.meeting-notes-panel{display:grid;gap:12px}
+.meeting-notes-actions{display:flex;justify-content:flex-end}
+.meeting-notes-actions:empty{display:none}
+@media(max-width:1100px){
+  .meeting-workspace-grid{grid-template-columns:minmax(0,1fr)}
+  .meeting-workspace-side{position:static;order:-1;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));align-items:start}
+}
+@media(max-width:560px){
+  .meeting-workspace-head{flex-wrap:wrap;gap:10px;padding:10px 12px}
+  .meeting-workspace-title{order:3;flex-basis:100%}
+  .meeting-workspace-title h2{white-space:normal}
+  .meeting-workspace-head .ic.dl{margin-left:auto}
+  .meeting-notes-actions .btn{width:100%}
+}

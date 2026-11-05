@@ -611,6 +611,27 @@ export default function Page() {
     } catch (error) { setMeetingError(error.message || "Could not save meeting notes"); }
     finally { setMeetingBusy(false); }
   };
+  // Recording or unsaved clips pin the user to the open meeting so captured audio is not lost.
+  const meetingLocked = recordingState !== "idle" || (!!recordingClips.length && !recordingSaved);
+  const resetMeetingSession = () => {
+    setRecordingTranscript(""); recordingClips.forEach((clip) => URL.revokeObjectURL(clip.url)); setRecordingClips([]);
+    setRecordingSaved(false); setRecordingNoteId(""); setRecordingCards([]); setConferenceJoined(false);
+    setMeetingError(""); setMeetingNotice(""); setMeetingVoiceError(""); setHasRecordedVoiceNote(false);
+    setRecordingSeconds(0); setFailedRecording(null);
+  };
+  const openMeeting = (meeting) => {
+    if (meetingLocked) return;
+    resetMeetingSession();
+    const cards = meetingCards(meeting, members);
+    setMeetingSelected(meeting); setMeetingDraft(meeting.notes || ""); setParticipantSummaries(cards);
+    setSelectedMeetingMemberId(cards[0]?.memberId || ""); setMeetingCardView("selected");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+  const closeMeeting = () => {
+    if (meetingLocked) return;
+    resetMeetingSession();
+    setMeetingSelected(null); setMeetingDraft(""); setParticipantSummaries([]); setSelectedMeetingMemberId("");
+  };
   const deleteMeeting = async (meeting) => {
     if (!confirm("Delete this meeting" + (meeting.weekly ? " series" : "") + "?")) return;
     const r = await api("meetings", { action: "delete", id: meeting.id }, key, projectId);
@@ -1043,6 +1064,7 @@ export default function Page() {
         </section>}
 
         {view === "meetings" ? (<section className="meeting-page">
+          {!meetingSelected && <>
           <div className="meeting-hero">
             <div><span className="meeting-eyebrow">TEAM WORKSPACE</span><h2>One place for every team meeting</h2><p>Plan shared meetings, capture decisions, and keep follow-ups in one place across all projects.</p></div>
             <div className="meeting-hero-badge"><b>{meetings.length}</b><span>{meetings.length === 1 ? "meeting this month" : "meetings this month"}</span></div>
@@ -1102,7 +1124,7 @@ export default function Page() {
                 const dateKey = localDateKey(date), inMonth = date.getMonth() === meetingMonth.getMonth();
                 return <div className={"meeting-day" + (inMonth ? "" : " outside") + (dateKey === localDateKey(new Date()) ? " today" : "")} key={dateKey}>
                   <span className="meeting-day-number">{date.getDate()}</span>
-                  {meetings.filter((meeting) => meeting.date === dateKey).map((meeting) => <button disabled={recordingState !== "idle" || (!!recordingClips.length && !recordingSaved)} className={"meeting-event" + (meetingSelected?.id === meeting.id && meetingSelected?.occurrenceDate === meeting.occurrenceDate ? " selected" : "")} key={meeting.id + dateKey} onClick={() => { setMeetingSelected(meeting); setMeetingDraft(meeting.notes || ""); const cards = meetingCards(meeting, members); setParticipantSummaries(cards); setSelectedMeetingMemberId(cards[0]?.memberId || ""); setMeetingCardView("selected"); setRecordingTranscript(""); recordingClips.forEach((clip) => URL.revokeObjectURL(clip.url)); setRecordingClips([]); setRecordingSaved(false); setRecordingNoteId(""); setRecordingCards([]); setConferenceJoined(false); setMeetingError(""); setMeetingNotice(""); setMeetingVoiceError(""); setHasRecordedVoiceNote(false); setRecordingSeconds(0); setFailedRecording(null); }}>
+                  {meetings.filter((meeting) => meeting.date === dateKey).map((meeting) => <button disabled={meetingLocked} className="meeting-event" key={meeting.id + dateKey} onClick={() => openMeeting(meeting)}>
                     <b>{meeting.time}</b> {meeting.title}{meeting.online && <small>Online</small>}
                   </button>)}
                 </div>;
@@ -1112,111 +1134,134 @@ export default function Page() {
             {!meetingsLoading && !meetings.length && <p className="meeting-empty">No meetings scheduled for this month. Schedule a meeting on any date to get started.</p>}
             <div className="tools"><span className="note">Showing {meetings.length ? meetingOffset + 1 : 0}–{meetingOffset + meetings.length} of {meetingTotal} meetings</span><button className="btn alt" disabled={!meetingOffset || meetingPageLoading} onClick={() => loadMeetingPage(monthKey(meetingMonth), Math.max(0, meetingOffset - 100))}>Previous</button><button className="btn alt" disabled={!meetingHasMore || meetingPageLoading} onClick={() => loadMeetingPage(monthKey(meetingMonth), meetingOffset + 100)}>{meetingPageLoading ? "Loading…" : "Next"}</button></div>
           </div>
-          {meetingSelected && <div className="panel meeting-detail">
+          </>}
+          {meetingSelected && <div className="meeting-workspace">
             {pendingRecording && <LocalTranscriber audio={pendingRecording} language={transcriptionLanguage} onProgress={setTranscriptionProgress} onComplete={onTranscriptionComplete} onError={onTranscriptionError} />}
-            <div className="meeting-detail-head"><div><h2>{meetingSelected.title}</h2><p>{fmt(meetingSelected.occurrenceDate)} · {meetingSelected.time} · {meetingSelected.duration} minutes · {activeProject?.name}</p></div>
-              {(meetingSelected.createdBy === me.id || canManageMeetings) && <button className="ic dl" onClick={() => deleteMeeting(meetingSelected)}>Delete meeting</button>}
-            </div>
+            <header className="panel meeting-workspace-head">
+              <button type="button" className="btn alt meeting-back" disabled={meetingLocked} title={meetingLocked ? "Finish or save the recording first" : undefined} onClick={closeMeeting}>← Calendar</button>
+              <div className="meeting-workspace-title">
+                <h2>{meetingSelected.title}</h2>
+                <p>{fmt(meetingSelected.occurrenceDate)} · {meetingSelected.time} · {meetingSelected.duration} min{activeProject?.name ? ` · ${activeProject.name}` : ""}{meetingSelected.online ? " · Online" : " · In person"}</p>
+              </div>
+              {(meetingSelected.createdBy === me.id || canManageMeetings) && <button type="button" className="ic dl" disabled={meetingLocked} onClick={() => deleteMeeting(meetingSelected)}>Delete</button>}
+            </header>
+            {meetingError && <div className="meeting-alert" role="alert"><b>Action needed</b><span>{meetingError}</span></div>}
+            {meetingNotice && <div className="meeting-success" role="status">{meetingNotice}</div>}
             {!canEditMeetingContent && <div className="meeting-access-banner"><div><b>View-only meeting cards</b><span>Only Admins and Collaborators can edit meeting cards and notes. Request a one-hour approval from a project admin; you can still change status on tasks assigned to you in Meeting Notes.</span></div><button type="button" className="btn" disabled={meetingBusy || meetingEditRequests.some((item) => item.projectId === projectId && item.memberId === me.id && item.status === "pending")} onClick={requestMeetingEditAccess}>{meetingEditRequests.some((item) => item.projectId === projectId && item.memberId === me.id && item.status === "pending") ? "Request pending" : "Request 1-hour edit access"}</button></div>}
             {!["Admin", "Collaborator"].includes(me.role) && meetingEditAccess && meetingEditAccessExpiresAt && <div className="meeting-access-banner active"><div><b>Temporary edit access is active</b><span>Expires {new Date(meetingEditAccessExpiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.</span></div></div>}
-              {meetingSelected.online && <section className="meeting-room">
-                <div className="meeting-room-toolbar"><div><h3>{meetingSelected.roomProvider === "jitsi" ? "Jitsi conference room" : `${meetingSelected.roomProvider === "google-meet" ? "Google Meet" : meetingSelected.roomProvider === "zoom" ? "Zoom" : "Microsoft Teams"} conference`}</h3>{meetingSelected.roomUrl ? <a href={meetingSelected.roomUrl} target="_blank" rel="noreferrer">{meetingSelected.roomUrl}</a> : <span className="meeting-invite-hint">No shared invite link is saved.</span>}</div>
-                  {meetingSelected.roomProvider === "jitsi" ? <button className="btn" onClick={() => setConferenceJoined((joined) => !joined)}>{conferenceJoined ? "Close room" : "Join in dashboard"}</button> : <a className="btn" href={meetingSelected.roomUrl || conferenceLaunchUrl(meetingSelected.roomProvider)} target="_blank" rel="noreferrer">{meetingSelected.roomUrl ? "Join meeting" : `Open ${meetingSelected.roomProvider === "google-meet" ? "Google Meet" : meetingSelected.roomProvider === "zoom" ? "Zoom" : "Teams"}`}</a>}
-                  {meetingSelected.roomProvider === "jitsi" && <a className="btn alt" href={meetingSelected.roomUrl} target="_blank" rel="noreferrer">Open in new tab</a>}
-                </div>
-                {conferenceJoined && meetingSelected.roomProvider === "jitsi" && <JitsiMeetingEmbed roomUrl={meetingSelected.roomUrl} title={meetingSelected.title} />}
-                <p className="meeting-invite-hint">{meetingSelected.roomProvider === "jitsi" ? "Public Jitsi room: anyone with the link may join, and duration/availability is not guaranteed." : meetingSelected.roomUrl ? "The conference opens in a new tab; meeting duration and recording depend on that provider's account." : "The button opens the conference service, but does not create a shared room or send an invite link. Create the room there and share its join link with invitees."}</p>
-              </section>}
-            {meetingSelected.agenda && <div className="meeting-agenda-read"><b>Agenda</b><p>{meetingSelected.agenda}</p></div>}
-            <div className="meeting-attendee-list"><b>Meeting invitees</b><span>{(meetingSelected.attendees || []).length ? meetingSelected.attendees.map((attendee) => attendee.name).join(", ") : "No invitees selected"} Voice routing recognizes all active team members, including the admin.</span></div>
-            {!!recordingClips.length && <div className="meeting-audio-preview"><span>Recording clips ({recordingClips.length})</span><div>{recordingClips.map((clip, index) => <div key={clip.id}><label>Clip {index + 1}</label><audio controls preload="metadata" src={clip.url}>Audio preview unavailable in this browser.</audio></div>)}</div></div>}
-            {!!recordingTranscript && <label className="meeting-transcript-review">English transcript (AI-generated; review and correct before sharing)<textarea disabled={!canEditMeetingContent} rows="6" value={recordingTranscript} onChange={(event) => {
-              const transcript = event.target.value;
-              setRecordingTranscript(transcript);
-              const keyPoints = generateEnglishKeyPoints(transcript);
-              const baseNotes = recordingNotesStartRef.current || "";
-              setMeetingDraft(keyPoints ? (baseNotes.trim() ? `${baseNotes.trimEnd()}\n\n` : "") + keyPoints : baseNotes);
-              const suggestions = generateMeetingParticipantCards(transcript, meetingVoiceAttendees(members, me), selectedMeetingMemberId);
-              setRecordingCards((previous) => suggestions.map((card) => ({ ...card, priority: previous.find((item) => item.memberId === card.memberId)?.priority || "Medium" })));
-              if (suggestions.length) {
-                setParticipantSummaries((previous) => mergeVoiceCards(previous, suggestions));
-                setSelectedMeetingMemberId(suggestions[0].memberId);
-                setMeetingCardView("selected");
-              }
-            }} /></label>}
-            {!!recordingCards.length && <section className="meeting-summary-cards" aria-label="Recording participant notes">
-              <h3>Member notes from this recording <small>Check the speaker and correct these AI-generated notes before sharing. Only the card you choose is emailed to that member.</small></h3>
-              <div className="meeting-summary-grid">{recordingCards.map((card) => <article className="meeting-summary-card" key={card.memberId}>
-                <h4>{card.name}</h4>
-                <label>Key points (one per line)<textarea disabled={!canEditMeetingContent} rows="4" value={card.points.join("\n")} onChange={(event) => updateRecordingCard(card, { points: event.target.value.split("\n") })} /></label>
-                <label>Priority<select disabled={!canEditMeetingContent} value={card.priority || "Medium"} onChange={(event) => updateRecordingCard(card, { priority: event.target.value })}><option>High</option><option>Medium</option><option>Low</option></select></label>
-                <label>Action items (one per line)<textarea disabled={!canEditMeetingContent} rows="3" value={card.tasks.join("\n")} onChange={(event) => updateRecordingCard(card, { tasks: event.target.value.split("\n") })} /></label>
-                <button className="btn" disabled={!canEditMeetingContent || meetingBusy || recordingState !== "idle" || sharingParticipantIds.includes(card.memberId) || (!card.points.length && !card.tasks.length)} onClick={() => shareParticipantSummary(card)}>
-                  {sharingParticipantIds.includes(card.memberId) ? "Sharing…" : `Share ${card.name}'s notes by email`}
-                </button>
-              </article>)}</div>
-            </section>}
-            <section className="meeting-summary-cards" aria-label="Team member updates and upcoming tasks">
-              <div className="meeting-cards-heading"><h3>Team task cards <small>Say a member's name to route their update automatically, or click a card before recording to use it as the default. Clicking alone does not add or change any notes.</small></h3>
-                <div className="meeting-member-controls">
-                  <label>Select team member<select aria-label="Select team member card" value={selectedMeetingMemberId} onChange={(event) => selectMeetingMember(event.target.value)}><option value="">Choose a member…</option>{members.filter((member) => member.status === "active" && member.role !== "Client").map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>
-                  <button type="button" className="btn alt" onClick={() => moveMeetingMember(-1)} disabled={!members.some((member) => member.status === "active" && member.role !== "Client")}>‹ Previous</button>
-                  <button type="button" className="btn alt" onClick={() => moveMeetingMember(1)} disabled={!members.some((member) => member.status === "active" && member.role !== "Client")}>Next member ›</button>
-                  <button type="button" className={"btn " + (meetingCardView === "all" ? "" : "alt")} aria-pressed={meetingCardView === "all"} onClick={() => setMeetingCardView((mode) => mode === "all" ? "selected" : "all")}>{meetingCardView === "all" ? "Show selected" : "Show all members"}</button>
-                </div>
-              </div>
-              <div className="meeting-member-picker" aria-label="Choose a member card">{members.filter((member) => member.status === "active" && member.role !== "Client").map((member, index) => {
-                const hasCard = participantSummaries.some((card) => card.memberId === member.id);
-                return <button type="button" key={member.id} className={"meeting-member-chip" + (selectedMeetingMemberId === member.id ? " selected" : "")} style={{ "--member-accent": MEMBER_CARD_COLORS[index % MEMBER_CARD_COLORS.length] }} aria-pressed={selectedMeetingMemberId === member.id} onClick={() => { selectMeetingMember(member.id); setMeetingCardView("selected"); }}>
-                  <span>{member.name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase()}</span><b>{member.name}</b>{hasCard && <small>Notes</small>}
-                </button>;
-              })}</div>
-              <div className={"meeting-summary-grid " + (meetingCardView === "all" ? "all-member-cards" : "single-member-card")}>{participantSummaries.filter((card) => meetingCardView === "all" || card.memberId === selectedMeetingMemberId).map((card) => {
-                const memberIndex = members.filter((member) => member.status === "active" && member.role !== "Client").findIndex((member) => member.id === card.memberId);
-                const recentWork = tickets.filter((ticket) => (ticket.assignees || []).includes(card.memberId)).sort((a, b) => (b.closed || b.date || "").localeCompare(a.closed || a.date || "")).slice(0, 3);
-                return <article className={"meeting-summary-card" + (selectedMeetingMemberId === card.memberId ? " selected-member-card" : "")} key={card.memberId} style={{ "--member-accent": MEMBER_CARD_COLORS[(memberIndex < 0 ? 0 : memberIndex) % MEMBER_CARD_COLORS.length] }} onClick={(event) => {
-                  if (meetingCardView === "all" && !event.target.closest("input,textarea,select,button,label")) {
-                    setSelectedMeetingMemberId(card.memberId);
+            <div className="meeting-workspace-grid">
+              <div className="meeting-workspace-main">
+                {!!recordingTranscript && <label className="meeting-transcript-review">English transcript (AI-generated; review and correct before sharing)<textarea disabled={!canEditMeetingContent} rows="6" value={recordingTranscript} onChange={(event) => {
+                  const transcript = event.target.value;
+                  setRecordingTranscript(transcript);
+                  const keyPoints = generateEnglishKeyPoints(transcript);
+                  const baseNotes = recordingNotesStartRef.current || "";
+                  setMeetingDraft(keyPoints ? (baseNotes.trim() ? `${baseNotes.trimEnd()}\n\n` : "") + keyPoints : baseNotes);
+                  const suggestions = generateMeetingParticipantCards(transcript, meetingVoiceAttendees(members, me), selectedMeetingMemberId);
+                  setRecordingCards((previous) => suggestions.map((card) => ({ ...card, priority: previous.find((item) => item.memberId === card.memberId)?.priority || "Medium" })));
+                  if (suggestions.length) {
+                    setParticipantSummaries((previous) => mergeVoiceCards(previous, suggestions));
+                    setSelectedMeetingMemberId(suggestions[0].memberId);
                     setMeetingCardView("selected");
                   }
-                }}>
-                  <h4>{card.name}<span>{members.find((member) => member.id === card.memberId)?.role || "Team member"}</span></h4>
-                  <div className="meeting-recent-work"><b>Recent task updates</b>{recentWork.length ? recentWork.map((ticket) => <p key={ticket.id}><span>{ticket.title}</span><em>{ticket.status} · {ticket.closed || ticket.date}</em></p>) : <small>No recent ticket updates.</small>}</div>
-                  <label>Previous task update (one per line)<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="3" value={(card.points || []).join("\n")} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, points: event.target.value.split("\n") } : item))} placeholder="Summarize progress or blockers from the last task" /></label>
-                  <label>Task description / context<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="3" value={card.description || ""} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, description: event.target.value } : item))} placeholder="Add notes or context for the assigned task" /></label>
-                  <label>Priority for upcoming tasks<select disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} value={card.priority || "Medium"} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, priority: event.target.value } : item))}><option>High</option><option>Medium</option><option>Low</option></select></label>
-                  <label>Next tasks (one per line)<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="3" value={(card.tasks || []).join("\n")} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, tasks: event.target.value.split("\n") } : item))} placeholder="Write the next action; details and deadline can be managed in Meeting Notes" /></label>
-                </article>;
-              })}
-                {!selectedMeetingMemberId && <div className="meeting-member-empty"><b>Ready for the next update?</b><span>Select a team member above, or start recording and their turn will be selected when their name is recognized.</span></div>}
+                }} /></label>}
+                {!!recordingCards.length && <section className="meeting-summary-cards" aria-label="Recording participant notes">
+                  <h3>Member notes from this recording <small>Check the speaker and correct these AI-generated notes before sharing. Only the card you choose is emailed to that member.</small></h3>
+                  <div className="meeting-summary-grid">{recordingCards.map((card) => <article className="meeting-summary-card" key={card.memberId}>
+                    <h4>{card.name}</h4>
+                    <label>Key points (one per line)<textarea disabled={!canEditMeetingContent} rows="4" value={card.points.join("\n")} onChange={(event) => updateRecordingCard(card, { points: event.target.value.split("\n") })} /></label>
+                    <label>Priority<select disabled={!canEditMeetingContent} value={card.priority || "Medium"} onChange={(event) => updateRecordingCard(card, { priority: event.target.value })}><option>High</option><option>Medium</option><option>Low</option></select></label>
+                    <label>Action items (one per line)<textarea disabled={!canEditMeetingContent} rows="3" value={card.tasks.join("\n")} onChange={(event) => updateRecordingCard(card, { tasks: event.target.value.split("\n") })} /></label>
+                    <button className="btn" disabled={!canEditMeetingContent || meetingBusy || recordingState !== "idle" || sharingParticipantIds.includes(card.memberId) || (!card.points.length && !card.tasks.length)} onClick={() => shareParticipantSummary(card)}>
+                      {sharingParticipantIds.includes(card.memberId) ? "Sharing…" : `Share ${card.name}'s notes by email`}
+                    </button>
+                  </article>)}</div>
+                </section>}
+                <section className="meeting-summary-cards" aria-label="Team member updates and upcoming tasks">
+                  <div className="meeting-cards-heading"><h3>Team task cards <small>Say a member's name to route their update automatically, or click a card before recording to use it as the default. Clicking alone does not add or change any notes.</small></h3>
+                    <div className="meeting-member-controls">
+                      <label>Select team member<select aria-label="Select team member card" value={selectedMeetingMemberId} onChange={(event) => selectMeetingMember(event.target.value)}><option value="">Choose a member…</option>{members.filter((member) => member.status === "active" && member.role !== "Client").map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>
+                      <button type="button" className="btn alt" onClick={() => moveMeetingMember(-1)} disabled={!members.some((member) => member.status === "active" && member.role !== "Client")}>‹ Previous</button>
+                      <button type="button" className="btn alt" onClick={() => moveMeetingMember(1)} disabled={!members.some((member) => member.status === "active" && member.role !== "Client")}>Next member ›</button>
+                      <button type="button" className={"btn " + (meetingCardView === "all" ? "" : "alt")} aria-pressed={meetingCardView === "all"} onClick={() => setMeetingCardView((mode) => mode === "all" ? "selected" : "all")}>{meetingCardView === "all" ? "Show selected" : "Show all members"}</button>
+                    </div>
+                  </div>
+                  <div className="meeting-member-picker" aria-label="Choose a member card">{members.filter((member) => member.status === "active" && member.role !== "Client").map((member, index) => {
+                    const hasCard = participantSummaries.some((card) => card.memberId === member.id);
+                    return <button type="button" key={member.id} className={"meeting-member-chip" + (selectedMeetingMemberId === member.id ? " selected" : "")} style={{ "--member-accent": MEMBER_CARD_COLORS[index % MEMBER_CARD_COLORS.length] }} aria-pressed={selectedMeetingMemberId === member.id} onClick={() => { selectMeetingMember(member.id); setMeetingCardView("selected"); }}>
+                      <span>{member.name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase()}</span><b>{member.name}</b>{hasCard && <small>Notes</small>}
+                    </button>;
+                  })}</div>
+                  <div className={"meeting-summary-grid " + (meetingCardView === "all" ? "all-member-cards" : "single-member-card")}>{participantSummaries.filter((card) => meetingCardView === "all" || card.memberId === selectedMeetingMemberId).map((card) => {
+                    const memberIndex = members.filter((member) => member.status === "active" && member.role !== "Client").findIndex((member) => member.id === card.memberId);
+                    const recentWork = tickets.filter((ticket) => (ticket.assignees || []).includes(card.memberId)).sort((a, b) => (b.closed || b.date || "").localeCompare(a.closed || a.date || "")).slice(0, 3);
+                    return <article className={"meeting-summary-card" + (selectedMeetingMemberId === card.memberId ? " selected-member-card" : "")} key={card.memberId} style={{ "--member-accent": MEMBER_CARD_COLORS[(memberIndex < 0 ? 0 : memberIndex) % MEMBER_CARD_COLORS.length] }} onClick={(event) => {
+                      if (meetingCardView === "all" && !event.target.closest("input,textarea,select,button,label")) {
+                        setSelectedMeetingMemberId(card.memberId);
+                        setMeetingCardView("selected");
+                      }
+                    }}>
+                      <h4>{card.name}<span>{members.find((member) => member.id === card.memberId)?.role || "Team member"}</span></h4>
+                      <div className="meeting-recent-work"><b>Recent task updates</b>{recentWork.length ? recentWork.map((ticket) => <p key={ticket.id}><span>{ticket.title}</span><em>{ticket.status} · {ticket.closed || ticket.date}</em></p>) : <small>No recent ticket updates.</small>}</div>
+                      <label>Previous task update (one per line)<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="3" value={(card.points || []).join("\n")} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, points: event.target.value.split("\n") } : item))} placeholder="Summarize progress or blockers from the last task" /></label>
+                      <label>Task description / context<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="3" value={card.description || ""} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, description: event.target.value } : item))} placeholder="Add notes or context for the assigned task" /></label>
+                      <label>Priority for upcoming tasks<select disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} value={card.priority || "Medium"} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, priority: event.target.value } : item))}><option>High</option><option>Medium</option><option>Low</option></select></label>
+                      <label>Next tasks (one per line)<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="3" value={(card.tasks || []).join("\n")} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, tasks: event.target.value.split("\n") } : item))} placeholder="Write the next action; details and deadline can be managed in Meeting Notes" /></label>
+                    </article>;
+                  })}
+                    {!selectedMeetingMemberId && <div className="meeting-member-empty"><b>Ready for the next update?</b><span>Select a team member above, or start recording and their turn will be selected when their name is recognized.</span></div>}
+                  </div>
+                </section>
+                <section className="panel meeting-notes-panel">
+                  <label className="meeting-notes-label">Shared meeting notes<textarea disabled={!["Admin", "Collaborator"].includes(me.role)} rows="10" maxLength="20000" value={meetingDraft} onChange={(e) => setMeetingDraft(e.target.value)} placeholder="Capture decisions, action items, and follow-ups here." /></label>
+                  <div className="meeting-notes-actions">
+                      {canEditMeetingContent && (!recordingClips.length || recordingSaved) && <button className="btn" disabled={meetingBusy || recordingState !== "idle"} onClick={saveMeetingNotes}>{meetingBusy ? "Saving…" : "Save notes"}</button>}
+                  </div>
+                </section>
               </div>
-            </section>
-            <label className="meeting-notes-label">Shared meeting notes<textarea disabled={!["Admin", "Collaborator"].includes(me.role)} rows="10" maxLength="20000" value={meetingDraft} onChange={(e) => setMeetingDraft(e.target.value)} placeholder="Capture decisions, action items, and follow-ups here." /></label>
-            <div className="meeting-note-tools">
-              <label className="meeting-language-setting">Spoken language
-                <select value={transcriptionLanguage} onChange={(event) => setTranscriptionLanguage(event.target.value)} disabled={recordingState !== "idle"}>
-                  <option value="auto">Auto-detect</option>
-                  <option value="english">English</option>
-                  <option value="urdu">Urdu / Urdu-English</option>
-                </select>
-              </label>
-              {recordingState === "idle" && !failedRecording && (!recordingNoteId || recordingSaved) && <button className="btn meeting-record-button" disabled={!["Admin", "Collaborator"].includes(me.role)} onClick={startMeetingRecording}>{hasRecordedVoiceNote ? "Record another clip" : "Start microphone recording"}</button>}
-              {recordingState === "recording" && <>
-                <button className="btn alt meeting-record-button" onClick={pauseMeetingRecording}>Pause</button>
-                <button className="btn meeting-record-button recording" onClick={stopMeetingRecording}>Finish & transcribe</button>
-              </>}
-              {recordingState === "paused" && <>
-                <button className="btn meeting-record-button" onClick={resumeMeetingRecording}>Resume recording</button>
-                <button className="btn alt meeting-record-button" onClick={stopMeetingRecording}>Finish & transcribe</button>
-              </>}
-              {recordingState === "transcribing" && <button className="btn meeting-record-button" disabled>Transcribing…</button>}
-              {recordingState === "idle" && failedRecording && <button className="btn alt meeting-record-button" disabled={!["Admin", "Collaborator"].includes(me.role)} onClick={retryLastTranscription}>Retry last clip</button>}
-              <span className={"meeting-record-status " + recordingState} aria-live="polite">{recordingState === "recording" ? `Recording · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")} · max 60 minutes` : recordingState === "paused" ? `Recording paused · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")}` : recordingState === "transcribing" ? transcriptionProgress || "Translating and preparing English key points…" : "For Urdu-English speech, select Urdu / Urdu-English. Repeated output is retried with a more accurate model. Review the transcript and speaker suggestions before saving."}</span>
-              {canEditMeetingContent && (!recordingClips.length || recordingSaved) && <button className="btn" disabled={meetingBusy || recordingState !== "idle"} onClick={saveMeetingNotes}>{meetingBusy ? "Saving…" : "Save notes"}</button>}
+              <aside className="meeting-workspace-side">
+                <section className="panel meeting-side-card" aria-label="Meeting details">
+                  <h3>Details</h3>
+                      {meetingSelected.online && <section className="meeting-room">
+                        <div className="meeting-room-toolbar"><div><h3>{meetingSelected.roomProvider === "jitsi" ? "Jitsi conference room" : `${meetingSelected.roomProvider === "google-meet" ? "Google Meet" : meetingSelected.roomProvider === "zoom" ? "Zoom" : "Microsoft Teams"} conference`}</h3>{meetingSelected.roomUrl ? <a href={meetingSelected.roomUrl} target="_blank" rel="noreferrer">{meetingSelected.roomUrl}</a> : <span className="meeting-invite-hint">No shared invite link is saved.</span>}</div>
+                          {meetingSelected.roomProvider === "jitsi" ? <button className="btn" onClick={() => setConferenceJoined((joined) => !joined)}>{conferenceJoined ? "Close room" : "Join in dashboard"}</button> : <a className="btn" href={meetingSelected.roomUrl || conferenceLaunchUrl(meetingSelected.roomProvider)} target="_blank" rel="noreferrer">{meetingSelected.roomUrl ? "Join meeting" : `Open ${meetingSelected.roomProvider === "google-meet" ? "Google Meet" : meetingSelected.roomProvider === "zoom" ? "Zoom" : "Teams"}`}</a>}
+                          {meetingSelected.roomProvider === "jitsi" && <a className="btn alt" href={meetingSelected.roomUrl} target="_blank" rel="noreferrer">Open in new tab</a>}
+                        </div>
+                        {conferenceJoined && meetingSelected.roomProvider === "jitsi" && <JitsiMeetingEmbed roomUrl={meetingSelected.roomUrl} title={meetingSelected.title} />}
+                        <p className="meeting-invite-hint">{meetingSelected.roomProvider === "jitsi" ? "Public Jitsi room: anyone with the link may join, and duration/availability is not guaranteed." : meetingSelected.roomUrl ? "The conference opens in a new tab; meeting duration and recording depend on that provider's account." : "The button opens the conference service, but does not create a shared room or send an invite link. Create the room there and share its join link with invitees."}</p>
+                      </section>}
+                  {meetingSelected.agenda && <div className="meeting-agenda-read"><b>Agenda</b><p>{meetingSelected.agenda}</p></div>}
+                  <div className="meeting-attendee-list"><b>Meeting invitees</b><span>{(meetingSelected.attendees || []).length ? meetingSelected.attendees.map((attendee) => attendee.name).join(", ") : "No invitees selected"}</span></div>
+                </section>
+                <section className="panel meeting-side-card meeting-recorder" aria-label="Recording">
+                  <h3>Recording</h3>
+                  <div className="meeting-note-tools">
+                    <label className="meeting-language-setting">Spoken language
+                      <select value={transcriptionLanguage} onChange={(event) => setTranscriptionLanguage(event.target.value)} disabled={recordingState !== "idle"}>
+                        <option value="auto">Auto-detect</option>
+                        <option value="english">English</option>
+                        <option value="urdu">Urdu / Urdu-English</option>
+                      </select>
+                    </label>
+                    {recordingState === "idle" && !failedRecording && (!recordingNoteId || recordingSaved) && <button className="btn meeting-record-button" disabled={!["Admin", "Collaborator"].includes(me.role)} onClick={startMeetingRecording}>{hasRecordedVoiceNote ? "Record another clip" : "Start microphone recording"}</button>}
+                    {recordingState === "recording" && <>
+                      <button className="btn alt meeting-record-button" onClick={pauseMeetingRecording}>Pause</button>
+                      <button className="btn meeting-record-button recording" onClick={stopMeetingRecording}>Finish & transcribe</button>
+                    </>}
+                    {recordingState === "paused" && <>
+                      <button className="btn meeting-record-button" onClick={resumeMeetingRecording}>Resume recording</button>
+                      <button className="btn alt meeting-record-button" onClick={stopMeetingRecording}>Finish & transcribe</button>
+                    </>}
+                    {recordingState === "transcribing" && <button className="btn meeting-record-button" disabled>Transcribing…</button>}
+                    {recordingState === "idle" && failedRecording && <button className="btn alt meeting-record-button" disabled={!["Admin", "Collaborator"].includes(me.role)} onClick={retryLastTranscription}>Retry last clip</button>}
+                    <span className={"meeting-record-status " + recordingState} aria-live="polite">{recordingState === "recording" ? `Recording · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")} · max 60 minutes` : recordingState === "paused" ? `Recording paused · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")}` : recordingState === "transcribing" ? transcriptionProgress || "Translating and preparing English key points…" : "For Urdu-English speech, select Urdu / Urdu-English. Repeated output is retried with a more accurate model. Review the transcript and speaker suggestions before saving."}</span>
+                  </div>
+                  {!!recordingClips.length && <div className="meeting-audio-preview"><span>Recording clips ({recordingClips.length})</span><div>{recordingClips.map((clip, index) => <div key={clip.id}><label>Clip {index + 1}</label><audio controls preload="metadata" src={clip.url}>Audio preview unavailable in this browser.</audio></div>)}</div></div>}
+                  {!!recordingClips.length && !recordingSaved && <div className="meeting-record-save"><span>{recordingNoteId ? "The note is saved. Retry to finish uploading its clips." : `${recordingClips.filter((clip) => clip.transcript).length} of ${recordingClips.length} clip(s) transcribed. Add more clips, then save them together as one monthly note. Cancel removes this set's generated text from Shared meeting notes.`}</span><div>{!recordingNoteId && <button className="btn alt" disabled={meetingBusy || recordingState !== "idle"} onClick={cancelRecordingNotes}>Cancel recording notes</button>}{recordingNoteId || (recordingClips.every((clip) => clip.transcript) && recordingTranscript) ? <button className="btn" disabled={!["Admin", "Collaborator"].includes(me.role) || meetingBusy || recordingState !== "idle"} onClick={saveRecordingAsNote}>{meetingBusy ? "Saving…" : "Save recording as note"}</button> : null}</div></div>}
+                  {meetingVoiceError && <div className="meeting-alert meeting-voice-alert" role="alert"><b>Voice note unavailable</b><span>{meetingVoiceError}</span></div>}
+                </section>
+              </aside>
             </div>
-            {!!recordingClips.length && !recordingSaved && <div className="meeting-record-save"><span>{recordingNoteId ? "The note is saved. Retry to finish uploading its clips." : `${recordingClips.filter((clip) => clip.transcript).length} of ${recordingClips.length} clip(s) transcribed. Add more clips, then save them together as one monthly note. Cancel removes this set's generated text from Shared meeting notes.`}</span><div>{!recordingNoteId && <button className="btn alt" disabled={meetingBusy || recordingState !== "idle"} onClick={cancelRecordingNotes}>Cancel recording notes</button>}{recordingNoteId || (recordingClips.every((clip) => clip.transcript) && recordingTranscript) ? <button className="btn" disabled={!["Admin", "Collaborator"].includes(me.role) || meetingBusy || recordingState !== "idle"} onClick={saveRecordingAsNote}>{meetingBusy ? "Saving…" : "Save recording as note"}</button> : null}</div></div>}
-            {meetingVoiceError && <div className="meeting-alert meeting-voice-alert" role="alert"><b>Voice note unavailable</b><span>{meetingVoiceError}</span></div>}
-            <p className="meeting-privacy">Whisper Base handles English; Urdu / Urdu-English uses Whisper Small. Unclear or placeholder output is retried with a more careful decode and rejected rather than shown as a confident transcript if still unusable. Edit the transcript and review the individual member cards before sharing. No email is sent automatically from an unreviewed transcript; use the Share button on a member's card to email only that member. Audio remains on this device unless you explicitly save the recording as a monthly note; saved audio is uploaded to the app's configured storage.</p>
           </div>}
         </section>) : view === "meeting-notes" ? <MeetingNotes projectId={projectId} keyValue={key} members={members} canDelete={admin} canManageContent={!!me && ["Admin", "Collaborator"].includes(me.role)} me={me} onAccessChange={handleMeetingAccessChange} /> : view === "portal" ? (<section className="panel"><div className="wrap"><table className="tm"><thead><tr><th>ID</th><th>Ticket</th><th>Type</th><th>Raised</th><th>Status</th><th>Completed</th><th>Actions</th></tr></thead><tbody>
           {[...tickets].sort((a, b) => (b.date || "").localeCompare(a.date || "")).map((t) => (<tr key={t.id}>
