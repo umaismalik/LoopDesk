@@ -286,8 +286,13 @@ export default function Page() {
     localStorage.setItem("rw-ticket-offset", "0");
     setMeetingOffset(0);
     const r = await api("db", null, k, selectedProject);
+    if (r.loginRequired) return setScreen("login");
     if (r.setup) return setScreen("setup");
-    if (r.status === 401) return setScreen("login");
+    if (r.status === 401) {
+      localStorage.removeItem("rw-key");
+      setKey("");
+      return setScreen("login");
+    }
     if (!r.ok && r.status === 403 && selectedProject) {
       const fallback = await api("db", null, k);
       if (fallback.ok) return applyDb(fallback);

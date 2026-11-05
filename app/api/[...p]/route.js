@@ -239,7 +239,7 @@ async function h(req, p, m) {
   }
   if (remote && !key && r === "db" && m === "GET") {
     const memberCount = await getWorkspaceMemberCount();
-    if (memberCount > 0) return J({ error: "denied" }, 401);
+    if (memberCount > 0) return J({ loginRequired: true });
     if (!process.env.ADMIN_EMAIL || !pwOk(process.env.ADMIN_PASSWORD)) return J({ setup: true });
   }
   let publicFlow = "";
