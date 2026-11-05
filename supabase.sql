@@ -1252,12 +1252,49 @@ declare
   expected_rows jsonb;
   absent_rows jsonb;
   matched_rows integer;
+  key_rows jsonb;
+  lock_ids bigint[];
+  lock_id bigint;
 begin
-  if not pg_try_advisory_xact_lock(hashtext('loopdesk_workspace_write')) then
-    raise exception using
-      errcode = '55P03',
-      message = 'Workspace write is busy; retry shortly.';
-  end if;
+  foreach table_name in array array[
+    'organizations', 'members', 'member_credentials', 'member_sessions',
+    'organization_admins', 'projects', 'project_members',
+    'tickets', 'ticket_assignees', 'project_files', 'project_audit', 'meetings',
+    'meeting_people', 'meeting_occurrences', 'meeting_notes',
+    'meeting_note_participants', 'meeting_note_tasks', 'invites',
+    'meeting_edit_requests', 'password_resets', 'google_oauth_states',
+    'google_calendar_connections', 'workspace_meta'
+  ] loop
+    table_oid := format('public.%I', table_name)::regclass;
+    select array_agg(attribute.attname order by key_column.ordinality)
+      into primary_keys
+      from pg_index index_data
+      cross join lateral unnest(index_data.indkey) with ordinality as key_column(attnum, ordinality)
+      join pg_attribute attribute on attribute.attrelid = index_data.indrelid and attribute.attnum = key_column.attnum
+     where index_data.indrelid = table_oid and index_data.indisprimary;
+    if primary_keys is null then
+      raise exception 'No primary key configured for table %', table_name;
+    end if;
+
+    key_rows :=
+      coalesce(changes #> array['upserts', table_name], '[]'::jsonb)
+      || coalesce(changes #> array['deletes', table_name], '[]'::jsonb)
+      || coalesce(changes #> array['expected', table_name], '[]'::jsonb)
+      || coalesce(changes #> array['absent', table_name], '[]'::jsonb);
+    execute format(
+      'select coalesce(array_agg(lock_id order by lock_id), array[]::bigint[]) from (
+         select distinct hashtextextended(%L || '':'' || (
+           select jsonb_agg(changed.row_value -> key_column.key_name order by key_column.ordinality)::text
+             from unnest($2) with ordinality as key_column(key_name, ordinality)
+         ), 0) as lock_id
+           from jsonb_array_elements($1) as changed(row_value)
+       ) row_locks',
+      table_name
+    ) into lock_ids using key_rows, primary_keys;
+    foreach lock_id in array lock_ids loop
+      perform pg_advisory_xact_lock(lock_id);
+    end loop;
+  end loop;
 
   foreach table_name in array array[
     'organizations', 'members', 'member_credentials', 'member_sessions',
