@@ -2,7 +2,7 @@ import path from "path";
 import crypto from "crypto";
 import { SEED } from "../../../lib/seed";
 import { sendEmail, emailStatus } from "../../../lib/email";
-import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, saveDb, putFile, getFile, delFile, remote } from "../../../lib/store";
+import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
 import { check } from "../../../lib/reminders";
 
 export const dynamic = "force-dynamic";
@@ -237,8 +237,7 @@ async function h(req, p, m) {
     if (member.status === "disabled") return J({ error: "This account is disabled. Please contact an admin." }, 403);
     fails.delete(id);
     const sessionToken = uid() + "." + Date.now();
-    member.sessions = [...(member.sessions || []), sessionToken].slice(-5);
-    await saveDb(d);
+    await createLoginSession(member.id, sessionToken);
     return J({ key: sessionToken });
   }
   if (remote && !key && r === "db" && m === "GET") {

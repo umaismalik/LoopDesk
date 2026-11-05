@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { diffTables, fromTables, hasNormalizedData, saveNormalizedState, toTables } = require("../lib/normalized-store.cjs");
+const { createMemberSession, diffTables, fromTables, hasNormalizedData, saveNormalizedState, toTables } = require("../lib/normalized-store.cjs");
 
 const sampleWorkspace = () => ({
   organizations: [{ id: "org-1", name: "Example", adminIds: ["member-1"] }],
@@ -119,6 +119,28 @@ test("workspace writes do not retry stale optimistic conflicts", async () => {
       /Concurrent update detected/,
     );
     assert.equal(attempts, 1);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("login session creation uses the targeted RPC and preserves the 30-day expiry", async () => {
+  const originalFetch = global.fetch;
+  let actualRequest;
+  global.fetch = async (url, options) => {
+    actualRequest = { url, options };
+    return new Response(null, { status: 204 });
+  };
+  const token = `session.${Date.now()}`;
+
+  try {
+    await createMemberSession("https://example.supabase.co", "service-key", "member-1", token);
+    assert.equal(actualRequest.url, "https://example.supabase.co/rest/v1/rpc/create_member_session");
+    assert.deepEqual(JSON.parse(actualRequest.options.body), {
+      target_member_id: "member-1",
+      session_token: token,
+      session_expires_at: Number(token.split(".")[1]) + 30 * 24 * 60 * 60 * 1000,
+    });
   } finally {
     global.fetch = originalFetch;
   }
