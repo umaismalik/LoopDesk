@@ -2,7 +2,7 @@ import path from "path";
 import crypto from "crypto";
 import { SEED } from "../../../lib/seed";
 import { sendEmail, emailStatus } from "../../../lib/email";
-import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, loadProjectTicketIds, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
+import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, loadProjectTicketIds, loadClientTickets, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
 import { check } from "../../../lib/reminders";
 
 export const dynamic = "force-dynamic";
@@ -149,6 +149,32 @@ const nextTicketId = (ids, type) => {
   const n = Math.max(0, ...ids.filter((id) => String(id).startsWith(prefix)).map((id) => parseInt(String(id).split("-").pop(), 10) || 0)) + 1;
   return prefix + String(n).padStart(2, "0");
 };
+// Clients see their own serial ("ISS-01", "ISS-02", …) instead of the project-wide ticket id, which
+// stays the database key. `clientRef` is stored on the ticket. This gives every loaded ticket of the
+// client that lacks one the next serial in its type, oldest first, and reports whether any changed.
+const ticketNumber = (id) => parseInt(String(id || "").split("-").pop(), 10) || 0;
+async function assignClientRefs(d, projectId, clientId) {
+  const loaded = d.tickets.filter((t) => t.createdBy === clientId);
+  const stored = (await loadClientTickets(projectId, clientId)) || loaded;
+  const byId = new Map(stored.map((t) => [t.id, { id: t.id, type: t.type, date: t.date, clientRef: t.clientRef }]));
+  loaded.forEach((t) => byId.set(t.id, { id: t.id, type: t.type, date: t.date, clientRef: t.clientRef || byId.get(t.id)?.clientRef }));
+  let changed = false;
+  for (const type of ["issue", "feature"]) {
+    const prefix = type === "feature" ? "FTR-" : "ISS-";
+    const ofType = [...byId.values()].filter((t) => (t.type === "feature" ? "feature" : "issue") === type);
+    let last = Math.max(0, ...ofType.map((t) => ticketNumber(t.clientRef)));
+    const missing = ofType.filter((t) => !t.clientRef)
+      .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")) || ticketNumber(a.id) - ticketNumber(b.id));
+    for (const entry of missing) {
+      const ticket = loaded.find((t) => t.id === entry.id);
+      if (!ticket) continue;
+      last += 1;
+      ticket.clientRef = prefix + String(last).padStart(2, "0");
+      changed = true;
+    }
+  }
+  return changed;
+}
 const siteUrl = (origin) => {
   if (!CONFIGURED_SITE || CONFIGURED_SITE.toLowerCase().includes("your-project.vercel.app")) return origin;
   try { return new URL(CONFIGURED_SITE).origin; } catch { return origin; }
@@ -574,8 +600,15 @@ async function h(req, p, m) {
       const meetingEditAccess = elevatedMeetingRole || !!editGrant;
       const meetingEditAccessExpiresAt = editGrant ? editGrant.expiresAt : null;
       if (me.role === "Client") {
+        // Give tickets raised before per-client numbering (or raised by staff on the client's behalf)
+        // their client serial once. A failed write only delays this to the next load.
+        try {
+          if (await assignClientRefs(d, project.id, me.id)) await save(d);
+        } catch (error) {
+          console.warn("Could not assign client ticket numbers:", error?.message || error);
+        }
         const mine = d.tickets.filter((t) => t.createdBy === me.id);
-        return J({ me: pub(me), projects, organizations, projectId: project.id, canUseMeetings, canManageMeetings, meetingEditAccess, meetingEditAccessExpiresAt, meetingEditRequests, tickets: mine.map((t) => ({ id: t.id, type: t.type, date: t.date, by: t.by, title: t.title, details: t.details, resolution: t.resolution, notes: t.notes, closed: t.closed, createdBy: t.createdBy, status: ["Completed", "Reopened"].includes(t.status) ? t.status : "In Progress" })), ticketPagination: { offset: d._scope?.ticket_offset || 0, limit: d._scope?.ticket_limit || d.tickets.length, total: d._scope?.ticket_total ?? d.tickets.length, hasMore: (d._scope?.ticket_offset || 0) + d.tickets.length < (d._scope?.ticket_total ?? d.tickets.length) }, members: [], invites: [], audit: [], files: d.files.filter((x) => mine.some((t) => t.id === x.ticket)) });
+        return J({ me: pub(me), projects, organizations, projectId: project.id, canUseMeetings, canManageMeetings, meetingEditAccess, meetingEditAccessExpiresAt, meetingEditRequests, tickets: mine.map((t) => ({ id: t.id, clientRef: t.clientRef, type: t.type, date: t.date, by: t.by, title: t.title, details: t.details, resolution: t.resolution, notes: t.notes, closed: t.closed, createdBy: t.createdBy, status: ["Completed", "Reopened"].includes(t.status) ? t.status : "In Progress" })), ticketPagination: { offset: d._scope?.ticket_offset || 0, limit: d._scope?.ticket_limit || d.tickets.length, total: d._scope?.ticket_total ?? d.tickets.length, hasMore: (d._scope?.ticket_offset || 0) + d.tickets.length < (d._scope?.ticket_total ?? d.tickets.length) }, members: [], invites: [], audit: [], files: d.files.filter((x) => mine.some((t) => t.id === x.ticket)) });
       }
       const members = project.members.map((entry) => {
         const member = d.members.find((x) => x.id === entry.memberId);
@@ -1366,6 +1399,16 @@ async function h(req, p, m) {
           used.add(t.id);
         }
       }
+      // Keep a client's own serial across staff edits; the browser may send a ticket without it.
+      b.tickets.forEach((t) => {
+        const o = old[t.id];
+        if (o?.clientRef && !t.clientRef && o.createdBy === t.createdBy) t.clientRef = o.clientRef;
+      });
+      // Tickets staff raise on a client's behalf join that client's own numbering.
+      const clientIds = new Set(project.members.filter((x) => x.role === "Client").map((x) => x.memberId));
+      for (const clientId of new Set(b.tickets.filter((t) => !t.clientRef && clientIds.has(t.createdBy)).map((t) => t.createdBy))) {
+        await assignClientRefs({ tickets: b.tickets }, project.id, clientId);
+      }
       const jobs = [];
       b.tickets.forEach((t) => {
         const o = old[t.id];
@@ -1375,8 +1418,8 @@ async function h(req, p, m) {
           const changes = ticketChanges(o, t, d.members);
           log(d, me.name, "Updated " + t.id, changes.length ? changes : t.title);
           const c = d.members.find((m) => m.id === t.createdBy);
-          if (c && o.status !== "Completed" && t.status === "Completed") jobs.push(send(c.email, "Your ticket " + t.id + " has been resolved",
-            `<p>Hello ${emailHtml(c.name)},</p><p>Your ticket <b>${emailHtml(t.id)}</b> - ${emailHtml(t.title)} has been marked as resolved.</p><p>Please <a href="${emailHtml(browserSiteUrl(u.origin))}">sign in to the portal</a> to review the solution and check the fix in your product. If you are not satisfied, you can reopen the ticket from the portal.</p>`));
+          if (c && o.status !== "Completed" && t.status === "Completed") jobs.push(send(c.email, "Your ticket " + (t.clientRef || t.id) + " has been resolved",
+            `<p>Hello ${emailHtml(c.name)},</p><p>Your ticket <b>${emailHtml(t.clientRef || t.id)}</b> - ${emailHtml(t.title)} has been marked as resolved.</p><p>Please <a href="${emailHtml(browserSiteUrl(u.origin))}">sign in to the portal</a> to review the solution and check the fix in your product. If you are not satisfied, you can reopen the ticket from the portal.</p>`));
         }
       });
       gone.forEach((t) => log(d, me.name, "Deleted " + t.id, t.title));
@@ -1415,7 +1458,9 @@ async function h(req, p, m) {
       // request takes the same number first, the save is rejected as a conflict; pick the next one.
       const projectTicketIds = async () => (await loadProjectTicketIds(project.id)) || d.tickets.map((y) => y.id);
       const t = { id: nextTicketId(await projectTicketIds(), type), type, date: td(), by: "Client", title, priority: "", assignees: [], details, version: "", deployed: "", status: "Open", closed: "", createdBy: me.id };
-      d.tickets.push(t); log(d, me.name, "Created " + t.id, title);
+      d.tickets.push(t);
+      await assignClientRefs(d, project.id, me.id);
+      log(d, me.name, "Created " + t.id + (t.clientRef ? " (client " + t.clientRef + ")" : ""), title);
       const createdEvent = d.audit[0];
       for (let attempt = 0; ; attempt += 1) {
         try {
@@ -1424,11 +1469,11 @@ async function h(req, p, m) {
         } catch (error) {
           if (attempt >= 2 || !String(error?.message || error).includes("A record was created by another request")) throw error;
           t.id = nextTicketId([...await projectTicketIds(), t.id], type);
-          createdEvent.act = "Created " + t.id;
+          createdEvent.act = "Created " + t.id + (t.clientRef ? " (client " + t.clientRef + ")" : "");
         }
       }
-      await Promise.all(d.members.filter((m) => m.role === "Admin").map((m) => send(m.email, "New client ticket " + t.id, `<p>${esc(me.name)} raised <b>${t.id}</b>: ${esc(title)}</p>`)));
-      return J({ id: t.id });
+      await Promise.all(d.members.filter((m) => m.role === "Admin").map((m) => send(m.email, "New client ticket " + t.id, `<p>${esc(me.name)} raised <b>${t.id}</b>${t.clientRef ? " (their " + esc(t.clientRef) + ")" : ""}: ${esc(title)}</p>`)));
+      return J({ id: t.id, clientRef: t.clientRef });
     }
     if (r === "addlink") {
       const b = await req.json(), tk = String(b.ticket || "");

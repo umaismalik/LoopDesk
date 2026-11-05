@@ -1220,7 +1220,7 @@ export default function Page() {
           </div>}
         </section>) : view === "meeting-notes" ? <MeetingNotes projectId={projectId} keyValue={key} members={members} canDelete={admin} canManageContent={!!me && ["Admin", "Collaborator"].includes(me.role)} me={me} onAccessChange={handleMeetingAccessChange} /> : view === "portal" ? (<section className="panel"><div className="wrap"><table className="tm"><thead><tr><th>ID</th><th>Ticket</th><th>Type</th><th>Raised</th><th>Status</th><th>Completed</th><th>Actions</th></tr></thead><tbody>
           {[...tickets].sort((a, b) => (b.date || "").localeCompare(a.date || "")).map((t) => (<tr key={t.id}>
-            <td><b className={"id " + t.type}>{t.id}</b></td><td className="tt">{t.title}</td><td>{t.type === "issue" ? "Issue" : "Feature"}</td><td className="nw">{fmt(t.date)}</td>
+            <td><b className={"id " + t.type}>{t.clientRef || t.id}</b></td><td className="tt">{t.title}</td><td>{t.type === "issue" ? "Issue" : "Feature"}</td><td className="nw">{fmt(t.date)}</td>
             <td><span className={"pill st " + t.status.replace(" ", "")}>{t.status}</span></td><td className="nw">{fmt(t.closed)}</td>
             <td className="ra"><button className="ic" title="View details, solution and attachments" onClick={() => setDetail(t.id)}><Ic d={EYE} /></button>
               {t.status !== "Completed" && <button className="ic" title="Edit" onClick={() => setModal({ ...t })}><Ic d={PEN} /></button>}
@@ -1371,7 +1371,7 @@ export default function Page() {
       </form></div>)}
 
       {dt && (<div className="ov" onClick={() => setDetail(null)}><div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h2><b className={"id " + dt.type}>{dt.id}</b> {dt.title}</h2>
+        <h2><b className={"id " + dt.type}>{client ? dt.clientRef || dt.id : dt.id}</b> {dt.title}{!client && dt.clientRef && <small className="muted"> (client's {dt.clientRef})</small>}</h2>
         <div className="meta">{!client && <span className={"pill " + dt.priority}>{dt.priority}</span>}<span className={"pill st " + dt.status.replace(" ", "")}>{dt.status}</span>
           <span>Raised {fmt(dt.date)} by {dt.by}</span>{!client && <span>Assignees: {anames(dt.assignees)}</span>}{dt.deadline && <span>Deadline: {fmt(dt.deadline)}</span>}{dt.owner && !client && <span>Worked by: {dt.owner}</span>}</div>
         <h4>Description</h4><p className="desc">{dt.details || "No description."}</p>
