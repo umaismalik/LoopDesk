@@ -115,6 +115,16 @@ test("a scoped login lookup hydrates only the selected account and writes only i
   assert.deepEqual(changes.upserts.tickets, []);
 });
 
+test("login sessions expire 30 days after issuance, not immediately", () => {
+  const issuedAt = Date.now();
+  const workspace = sampleWorkspace();
+  workspace.members[0].sessions = [`session.${issuedAt}`];
+  const session = toTables(workspace).member_sessions[0];
+
+  assert.equal(session.expires_at, issuedAt + 30 * 24 * 60 * 60 * 1000);
+  assert.ok(session.expires_at > Date.now());
+});
+
 test("adding an audit event does not rewrite existing audit rows", () => {
   const before = toTables(sampleWorkspace());
   const next = sampleWorkspace();
