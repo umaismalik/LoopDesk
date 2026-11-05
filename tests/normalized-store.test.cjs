@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { diffTables, fromTables, hasNormalizedData, toTables } = require("../lib/normalized-store.cjs");
+const { diffTables, fromTables, hasNormalizedData, saveNormalizedState, toTables } = require("../lib/normalized-store.cjs");
 
 const sampleWorkspace = () => ({
   organizations: [{ id: "org-1", name: "Example", adminIds: ["member-1"] }],
@@ -85,6 +85,43 @@ test("a task edit only writes the changed task row", () => {
   assert.deepEqual(changes.upserts.tickets, []);
   assert.deepEqual(changes.upserts.meeting_notes, []);
   assert.deepEqual(changes.deletes.meeting_note_tasks, []);
+});
+
+test("workspace writes retry briefly when the transaction lock is busy", async () => {
+  const originalFetch = global.fetch;
+  let attempts = 0;
+  global.fetch = async () => {
+    attempts += 1;
+    return attempts < 3
+      ? new Response(JSON.stringify({ code: "55P03", message: "Workspace write is busy; retry shortly." }), { status: 500 })
+      : new Response(null, { status: 204 });
+  };
+
+  try {
+    await saveNormalizedState("https://example.supabase.co", "service-key", sampleWorkspace(), null, true);
+    assert.equal(attempts, 3);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("workspace writes do not retry stale optimistic conflicts", async () => {
+  const originalFetch = global.fetch;
+  let attempts = 0;
+  global.fetch = async () => {
+    attempts += 1;
+    return new Response(JSON.stringify({ code: "40001", message: "Concurrent update detected." }), { status: 409 });
+  };
+
+  try {
+    await assert.rejects(
+      saveNormalizedState("https://example.supabase.co", "service-key", sampleWorkspace(), null, true),
+      /Concurrent update detected/,
+    );
+    assert.equal(attempts, 1);
+  } finally {
+    global.fetch = originalFetch;
+  }
 });
 
 test("a scoped login lookup hydrates only the selected account and writes only its session", () => {

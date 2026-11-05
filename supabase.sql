@@ -1253,7 +1253,11 @@ declare
   absent_rows jsonb;
   matched_rows integer;
 begin
-  perform pg_advisory_xact_lock(hashtext('loopdesk_workspace_write'));
+  if not pg_try_advisory_xact_lock(hashtext('loopdesk_workspace_write')) then
+    raise exception using
+      errcode = '55P03',
+      message = 'Workspace write is busy; retry shortly.';
+  end if;
 
   foreach table_name in array array[
     'organizations', 'members', 'member_credentials', 'member_sessions',

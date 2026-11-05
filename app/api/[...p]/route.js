@@ -19,7 +19,11 @@ const save = async (d) => {
   await saveDb(data, d);
 };
 const uid = () => crypto.randomBytes(16).toString("hex");
-const J = (o, s = 200) => Response.json(o, { status: s });
+const J = (o, s = 200, headers = {}) => Response.json(o, { status: s, headers });
+const isWorkspaceWriteBusy = (error) => {
+  const message = String(error?.message || error);
+  return /"code"\s*:\s*"55P03"/.test(message) || message.includes("Workspace write is busy; retry shortly.");
+};
 const googleOAuthConfigured = () => !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
 const googleRedirectUri = (origin) => new URL("/api/google-meet?action=callback", siteUrl(origin)).toString();
 const sealGoogleToken = (token) => {
@@ -1453,6 +1457,9 @@ async function h(req, p, m) {
     }
   } catch (e) {
     const message = String(e);
+    if (isWorkspaceWriteBusy(e)) {
+      return J({ error: "Another workspace update is being processed. Please retry shortly." }, 503, { "Retry-After": "1" });
+    }
     const conflict = message.includes("Concurrent update detected") || message.includes("A record was created by another request");
     return J({ error: conflict ? "This record changed in another request. Reload the page and retry." : message }, conflict ? 409 : 500);
   }
@@ -1463,6 +1470,9 @@ const handle = async (req, { params }, method) => {
     return await h(req, params.p, method);
   } catch (error) {
     console.error("API request failed:", error);
+    if (isWorkspaceWriteBusy(error)) {
+      return J({ error: "Another workspace update is being processed. Please retry shortly." }, 503, { "Retry-After": "1" });
+    }
     const conflict = String(error.message).includes("Concurrent update detected") || String(error.message).includes("A record was created by another request");
     return J({ error: conflict ? "This record changed in another request. Reload the page and retry." : `API request failed: ${error.message}` }, conflict ? 409 : 500);
   }
