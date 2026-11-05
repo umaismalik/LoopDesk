@@ -1366,7 +1366,7 @@ begin
         table_name
       ) into matched_rows using expected_rows;
       if matched_rows <> jsonb_array_length(expected_rows) then
-        raise exception using errcode = '40001', message = 'Concurrent update detected. Reload the page and retry.';
+        raise exception using errcode = 'PT409', message = 'Concurrent update detected. Reload the page and retry.';
       end if;
     end if;
 
@@ -1377,7 +1377,7 @@ begin
         table_name
       ) into matched_rows using absent_rows;
       if matched_rows > 0 then
-        raise exception using errcode = '40001', message = 'A record was created by another request. Reload the page and retry.';
+        raise exception using errcode = 'PT409', message = 'A record was created by another request. Reload the page and retry.';
       end if;
     end if;
   end loop;

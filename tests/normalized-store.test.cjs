@@ -110,7 +110,7 @@ test("workspace writes do not retry stale optimistic conflicts", async () => {
   let attempts = 0;
   global.fetch = async () => {
     attempts += 1;
-    return new Response(JSON.stringify({ code: "40001", message: "Concurrent update detected." }), { status: 409 });
+    return new Response(JSON.stringify({ code: "PT409", message: "Concurrent update detected." }), { status: 409 });
   };
 
   try {
@@ -278,4 +278,10 @@ test("workspace write locks build text keys without jsonb operator precedence bu
   assert.doesNotMatch(sql, /'[^']*'\s*\|\|\s*[\w.]+->>/);
   // A subquery column named like the plpgsql variable `lock_id` is ambiguous at runtime.
   assert.doesNotMatch(sql, /array_agg\(lock_id order by lock_id\)\s*,\s*array\[\]::bigint\[\]\)\s*into lock_ids/);
+});
+
+test("database functions never raise SQLSTATEs that PostgREST retries forever", () => {
+  const sql = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "supabase.sql"), "utf8");
+  // PostgREST transparently re-runs transactions failing with 40001/40P01; a deterministic raise loops until the pool is exhausted.
+  assert.doesNotMatch(sql, /errcode\s*=\s*'40(001|P01)'/);
 });
