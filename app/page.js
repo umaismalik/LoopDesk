@@ -202,7 +202,15 @@ export default function Page() {
   const [members, setMembers] = useState([]);
   const [invites, setInvites] = useState([]);
   const [audit, setAudit] = useState([]);
+  const [auditOffset, setAuditOffset] = useState(0);
+  const [auditTotal, setAuditTotal] = useState(0);
+  const [auditHasMore, setAuditHasMore] = useState(false);
+  const [auditLoading, setAuditLoading] = useState(false);
   const [files, setFiles] = useState([]);
+  const [fileOffset, setFileOffset] = useState(0);
+  const [fileTotal, setFileTotal] = useState(0);
+  const [fileHasMore, setFileHasMore] = useState(false);
+  const [fileLoading, setFileLoading] = useState(false);
   const [fc, setFc] = useState(0);
   const [lk, setLk] = useState({ url: "", name: "" });
   const [fa, setFa] = useState(""), [aa, setAa] = useState("");
@@ -221,6 +229,10 @@ export default function Page() {
   const [acct, setAcct] = useState(null);
   const [meetingMonth, setMeetingMonth] = useState(() => new Date(new Date().getFullYear(), new Date().getMonth(), 1));
   const [meetings, setMeetings] = useState([]);
+  const [meetingOffset, setMeetingOffset] = useState(0);
+  const [meetingTotal, setMeetingTotal] = useState(0);
+  const [meetingHasMore, setMeetingHasMore] = useState(false);
+  const [meetingPageLoading, setMeetingPageLoading] = useState(false);
   const [meetingsLoading, setMeetingsLoading] = useState(false);
   const [meetingSelected, setMeetingSelected] = useState(null);
   const [meetingDraft, setMeetingDraft] = useState("");
@@ -272,6 +284,7 @@ export default function Page() {
   const load = useCallback(async (k, requestedProject) => {
     const selectedProject = requestedProject || localStorage.getItem("rw-project") || "";
     localStorage.setItem("rw-ticket-offset", "0");
+    setMeetingOffset(0);
     const r = await api("db", null, k, selectedProject);
     if (r.setup) return setScreen("setup");
     if (r.status === 401) return setScreen("login");
@@ -283,7 +296,7 @@ export default function Page() {
     applyDb(r);
     function applyDb(data) {
       setMe(data.me); setCanUseMeetings(data.canUseMeetings === undefined ? data.me.role !== "Client" : data.canUseMeetings); setCanManageMeetings(!!data.canManageMeetings); setMeetingEditAccess(!!data.meetingEditAccess); setMeetingEditAccessExpiresAt(data.meetingEditAccessExpiresAt || null); setMeetingEditRequests(data.meetingEditRequests || []); setGoogleCalendarConfigured(!!data.googleCalendarConfigured); setGoogleCalendarConnected(!!data.googleCalendarConnected); setGoogleCalendarEmail(data.googleCalendarEmail || ""); setProjects(data.projects || []); setOrganizations(data.organizations || []); setProjectId(data.projectId); localStorage.setItem("rw-project", data.projectId);
-      setView((v) => data.me.role === "Client" && v !== "account" ? "portal" : v); setAcct({ name: data.me.name, phone: data.me.phone || "", current: "", password: "", confirm: "" }); setTickets(data.tickets); setTicketOffset(data.ticketPagination?.offset || 0); setTicketTotal(data.ticketPagination?.total ?? data.tickets.length); setTicketHasMore(!!data.ticketPagination?.hasMore); setMembers(data.members); setInvites(data.invites || []); setAudit(data.audit || []); setFiles(data.files || []); setScreen("app");
+      setView((v) => data.me.role === "Client" && v !== "account" ? "portal" : v); setAcct({ name: data.me.name, phone: data.me.phone || "", current: "", password: "", confirm: "" }); setTickets(data.tickets); setTicketOffset(data.ticketPagination?.offset || 0); setTicketTotal(data.ticketPagination?.total ?? data.tickets.length); setTicketHasMore(!!data.ticketPagination?.hasMore); setMembers(data.members); setInvites(data.invites || []); setAudit(data.audit || []); setAuditOffset(0); setAuditTotal(data.audit.length); setAuditHasMore(false); setFiles(data.files || []); setFileOffset(0); setFileTotal(data.files.length); setFileHasMore(false); setScreen("app");
     }
   }, []);
   useEffect(() => {
@@ -343,10 +356,13 @@ export default function Page() {
     if (view !== "meetings" || !key || !projectId) return;
     let cancelled = false;
     setMeetingsLoading(true);
-    api("meetings?month=" + monthKey(meetingMonth), null, key, projectId).then((r) => {
+    api(`meetings?month=${monthKey(meetingMonth)}&offset=${meetingOffset}&limit=100`, null, key, projectId).then((r) => {
       if (cancelled) return;
       if (!r.ok) { setMeetingError(r.error || "Unable to load meetings"); return; }
       setMeetings(r.meetings || []);
+      setMeetingOffset(r.pagination?.offset || 0);
+      setMeetingTotal(r.pagination?.total ?? r.meetings.length);
+      setMeetingHasMore(!!r.pagination?.hasMore);
       setMeetingSelected((selected) => selected && (r.meetings || []).some((item) => item.id === selected.id && item.occurrenceDate === selected.occurrenceDate)
         ? (r.meetings || []).find((item) => item.id === selected.id && item.occurrenceDate === selected.occurrenceDate)
         : null);
@@ -380,6 +396,44 @@ export default function Page() {
     setTicketTotal(result.pagination?.total ?? result.tickets.length);
     setTicketHasMore(!!result.pagination?.hasMore);
   };
+  const loadFilePage = async (offset) => {
+    setFileLoading(true);
+    const result = await api(`files?offset=${offset}&limit=100`, null, key, projectId);
+    setFileLoading(false);
+    if (!result.ok) { alert(result.error || "Unable to load files"); return; }
+    setFiles(result.files || []);
+    setFileOffset(result.pagination?.offset || 0);
+    setFileTotal(result.pagination?.total ?? result.files.length);
+    setFileHasMore(!!result.pagination?.hasMore);
+  };
+  const loadAuditPage = async (offset) => {
+    setAuditLoading(true);
+    const result = await api(`activity?offset=${offset}&limit=100`, null, key, projectId);
+    setAuditLoading(false);
+    if (!result.ok) { alert(result.error || "Unable to load activity"); return; }
+    setAudit(result.audit || []);
+    setAuditOffset(result.pagination?.offset || 0);
+    setAuditTotal(result.pagination?.total ?? result.audit.length);
+    setAuditHasMore(!!result.pagination?.hasMore);
+  };
+  const loadMeetingPage = async (month, offset) => {
+    setMeetingPageLoading(true);
+    const result = await api(`meetings?month=${month}&offset=${offset}&limit=100`, null, key, projectId);
+    setMeetingPageLoading(false);
+    if (!result.ok) { setMeetingError(result.error || "Unable to load meetings"); return; }
+    setMeetings(result.meetings || []);
+    setMeetingOffset(result.pagination?.offset || 0);
+    setMeetingTotal(result.pagination?.total ?? result.meetings.length);
+    setMeetingHasMore(!!result.pagination?.hasMore);
+    setMeetingSelected((selected) => selected && (result.meetings || []).some((item) => item.id === selected.id && item.occurrenceDate === selected.occurrenceDate)
+      ? (result.meetings || []).find((item) => item.id === selected.id && item.occurrenceDate === selected.occurrenceDate)
+      : null);
+  };
+  useEffect(() => {
+    if (!key || !projectId) return;
+    if (view === "files") loadFilePage(0);
+    if (view === "activity" && admin) loadAuditPage(0);
+  }, [view, projectId, key]);
   const commit = async (next) => {
     const previousCount = tickets.length;
     setTickets(next);
@@ -440,7 +494,7 @@ export default function Page() {
   const addLink = async () => {
     const r = await api("addlink", { url: lk.url, name: lk.name || lk.url, cat: CATS[fc] }, key, projectId);
     if (!r.ok) return alert(r.error || "Failed");
-    setLk({ url: "", name: "" }); load(key);
+    setLk({ url: "", name: "" }); await load(key); await loadFilePage(fileOffset);
   };
   const exportCsv = () => {
     const cols = ["id", "type", "date", "by", "title", "priority", "assignee", "details", "version", "deployed", "status", "closed"];
@@ -454,7 +508,7 @@ export default function Page() {
     const fd = new FormData(); fd.append("file", f); fd.append("cat", CATS[fc]);
     const r = await api("upload", fd, key, projectId);
     if (!r.ok) alert(r.error || "Upload failed");
-    e.target.value = ""; load(key);
+    e.target.value = ""; await load(key); await loadFilePage(fileOffset);
   };
   const saveAcct = async (e, pw) => {
     e.preventDefault(); setAmsg("");
@@ -463,11 +517,19 @@ export default function Page() {
     if (!r.ok) return setAmsg(r.error || "Failed");
     setAmsg(pw ? "Password changed" : "Profile saved"); load(key);
   };
-  const adm = async (p, body) => { const r = await api(p, body, key, projectId); if (!r.ok) return alert(r.error || "Action failed"); load(key); };
+  const adm = async (p, body) => {
+    const r = await api(p, body, key, projectId);
+    if (!r.ok) return alert(r.error || "Action failed");
+    if (p === "filedel") { await loadFilePage(fileOffset); return; }
+    load(key);
+  };
   const refreshMeetings = async (month = monthKey(meetingMonth)) => {
-    const r = await api("meetings?month=" + month, null, key, projectId);
+    setMeetingOffset(0);
+    const r = await api("meetings?month=" + month + "&offset=0&limit=100", null, key, projectId);
     if (!r.ok) { setMeetingError(r.error || "Unable to load meetings"); return; }
     setMeetings(r.meetings || []);
+    setMeetingTotal(r.pagination?.total ?? r.meetings.length);
+    setMeetingHasMore(!!r.pagination?.hasMore);
   };
   const createMeeting = async (e) => {
     e.preventDefault(); setMeetingError(""); setMeetingNotice(""); setMeetingBusy(true);
@@ -822,7 +884,27 @@ export default function Page() {
   const anames = (ids) => members.filter((m) => (ids || []).includes(m.id)).map((m) => m.name).join(", ") || "Unassigned";
   const aN = aa ? " - " + ((members.find((m) => m.id === aa) || {}).name || "") : "";
   const fh = (a) => a.url || fl(a);
-  const fl = (a) => "/api/file?f=" + a.id + "&n=" + encodeURIComponent(a.name) + "&key=" + key + "&project=" + encodeURIComponent(projectId) + "&ticketOffset=" + encodeURIComponent(localStorage.getItem("rw-ticket-offset") || "0");
+  const fl = (a) => "/api/file?f=" + encodeURIComponent(a.id) + "&n=" + encodeURIComponent(a.name) + "&project=" + encodeURIComponent(projectId);
+  const openFile = async (file) => {
+    if (file.url) {
+      window.open(file.url, "_blank", "noopener,noreferrer");
+      return;
+    }
+    try {
+      const response = await fetch(fl(file), { headers: { "x-key": key }, cache: "no-store" });
+      if (!response.ok) throw new Error((await response.text()) || response.statusText);
+      const blobUrl = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = file.name || "download";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+    } catch (error) {
+      setMsg("Could not download file: " + (error.message || "request failed"));
+    }
+  };
   const selectMeetingMember = (memberId) => {
     const member = members.find((item) => item.id === memberId && item.status === "active" && item.role !== "Client");
     if (!member) return;
@@ -911,7 +993,7 @@ export default function Page() {
             setRecordingTranscript(""); setRecordingCards([]); setRecordingNoteId(""); setRecordingSaved(false); setMeetingError(""); setMeetingNotice("");
           }
           setView(k);
-        }}>{l}{k !== "meeting-notes" && <em>{k === "files" ? files.length : k === "activity" ? audit.length : k === "team" ? members.length : k === "meetings" ? meetings.length : tickets.filter((t) => k === "all" || k === "portal" || t.type === k).length}</em>}</button>))}
+        }}>{l}{k !== "meeting-notes" && <em>{k === "files" ? fileTotal : k === "activity" ? auditTotal : k === "team" ? members.length : k === "meetings" ? meetingTotal : tickets.filter((t) => k === "all" || k === "portal" || t.type === k).length}</em>}</button>))}
         {!client && <button className="nav ghost" onClick={exportCsv}>Export CSV</button>}
         <button className={"nav ghost " + (view === "account" ? "on" : "")} onClick={() => { setAmsg(""); setView("account"); }}>My account</button>
         <button className="nav ghost" onClick={async () => { await api("logout", {}, key); localStorage.removeItem("rw-key"); location.reload(); }}>Sign out</button>
@@ -940,7 +1022,7 @@ export default function Page() {
           </div>
           <div className="panel">
             <div className="meeting-toolbar">
-              <div className="meeting-month"><button className="btn alt" aria-label="Previous month" onClick={() => setMeetingMonth(new Date(meetingMonth.getFullYear(), meetingMonth.getMonth() - 1, 1))}>‹</button><h2>{meetingMonth.toLocaleDateString("en-GB", { month: "long", year: "numeric" })}</h2><button className="btn alt" aria-label="Next month" onClick={() => setMeetingMonth(new Date(meetingMonth.getFullYear(), meetingMonth.getMonth() + 1, 1))}>›</button><button className="btn alt meeting-today" onClick={() => setMeetingMonth(new Date(new Date().getFullYear(), new Date().getMonth(), 1))}>Today</button></div>
+              <div className="meeting-month"><button className="btn alt" aria-label="Previous month" onClick={() => { setMeetingOffset(0); setMeetingMonth(new Date(meetingMonth.getFullYear(), meetingMonth.getMonth() - 1, 1)); }}>‹</button><h2>{meetingMonth.toLocaleDateString("en-GB", { month: "long", year: "numeric" })}</h2><button className="btn alt" aria-label="Next month" onClick={() => { setMeetingOffset(0); setMeetingMonth(new Date(meetingMonth.getFullYear(), meetingMonth.getMonth() + 1, 1)); }}>›</button><button className="btn alt meeting-today" onClick={() => { setMeetingOffset(0); setMeetingMonth(new Date(new Date().getFullYear(), new Date().getMonth(), 1)); }}>Today</button></div>
               <button className="btn" onClick={() => { setMeetingError(""); setMeetingForm({ title: "Team meeting", date: today(), time: "10:00", duration: "60", agenda: "", online: true, roomProvider: "google-meet", roomUrl: "", attendeeIds: [] }); setMeetingFormOpen((open) => !open); }}>+ Schedule meeting</button>
             </div>
             {meetingError && <div className="meeting-alert" role="alert"><b>Action needed</b><span>{meetingError}</span></div>}
@@ -1001,6 +1083,7 @@ export default function Page() {
             </div>
             {meetingsLoading && <p className="meeting-empty">Loading calendar…</p>}
             {!meetingsLoading && !meetings.length && <p className="meeting-empty">No meetings scheduled for this month. Schedule a meeting on any date to get started.</p>}
+            <div className="tools"><span className="note">Showing {meetings.length ? meetingOffset + 1 : 0}–{meetingOffset + meetings.length} of {meetingTotal} meetings</span><button className="btn alt" disabled={!meetingOffset || meetingPageLoading} onClick={() => loadMeetingPage(monthKey(meetingMonth), Math.max(0, meetingOffset - 100))}>Previous</button><button className="btn alt" disabled={!meetingHasMore || meetingPageLoading} onClick={() => loadMeetingPage(monthKey(meetingMonth), meetingOffset + 100)}>{meetingPageLoading ? "Loading…" : "Next"}</button></div>
           </div>
           {meetingSelected && <div className="panel meeting-detail">
             {pendingRecording && <LocalTranscriber audio={pendingRecording} language={transcriptionLanguage} onProgress={setTranscriptionProgress} onComplete={onTranscriptionComplete} onError={onTranscriptionError} />}
@@ -1137,16 +1220,17 @@ export default function Page() {
           <div className="tools up"><input type="file" onChange={uploadFile} /><span className="note">Uploads go to: <b>{CATS[fc]}</b></span></div>
           <div className="tools up"><input placeholder="Or add a document link (Google Drive, Docs...)" value={lk.url} onChange={(e) => setLk({ ...lk, url: e.target.value })} /><input placeholder="Name (optional)" value={lk.name} onChange={(e) => setLk({ ...lk, name: e.target.value })} /><button className="btn alt" onClick={addLink}>Add link</button></div>
           <div className="wrap"><table className="tm"><thead><tr><th>File</th><th>Size</th><th>Uploaded by</th><th>Date</th><th>Ticket</th><th></th></tr></thead><tbody>
-            {files.filter((x) => x.cat === CATS[fc]).map((a) => (<tr key={a.id}><td className="tt"><a className="fl" href={fh(a)} target="_blank" rel="noreferrer"><Ic d={CLIP} /> {a.name}</a></td><td className="nw">{a.url ? "Link" : Math.ceil(a.size / 1024) + " KB"}</td><td>{a.by}</td><td className="nw">{fmt(a.at)}</td><td className="nw">{a.ticket || "-"}</td>
-              <td className="ra"><a className="ic" href={fh(a)} target="_blank" rel="noreferrer">{a.url ? "Open link" : "Download"}</a>{canEdit && <button className="ic dl" onClick={() => confirm("Delete " + a.name + "?") && adm("filedel", { id: a.id })}><Ic d={TRASH} /></button>}</td></tr>))}
+            {files.filter((x) => x.cat === CATS[fc]).map((a) => (<tr key={a.id}><td className="tt">{a.url ? <a className="fl" href={fh(a)} target="_blank" rel="noreferrer"><Ic d={CLIP} /> {a.name}</a> : <button type="button" className="fl" onClick={() => openFile(a)}><Ic d={CLIP} /> {a.name}</button>}</td><td className="nw">{a.url ? "Link" : Math.ceil(a.size / 1024) + " KB"}</td><td>{a.by}</td><td className="nw">{fmt(a.at)}</td><td className="nw">{a.ticket || "-"}</td>
+              <td className="ra">{a.url ? <a className="ic" href={fh(a)} target="_blank" rel="noreferrer">Open link</a> : <button type="button" className="ic" onClick={() => openFile(a)}>Download</button>}{canEdit && <button type="button" className="ic dl" onClick={() => confirm("Delete " + a.name + "?") && adm("filedel", { id: a.id })}><Ic d={TRASH} /></button>}</td></tr>))}
             {!files.some((x) => x.cat === CATS[fc]) && <tr><td colSpan="6" className="empty">No files in this category yet.</td></tr>}</tbody></table></div>
+          <div className="tools"><span className="note">Showing {files.length ? fileOffset + 1 : 0}–{fileOffset + files.length} of {fileTotal} files</span><button className="btn alt" disabled={!fileOffset || fileLoading} onClick={() => loadFilePage(Math.max(0, fileOffset - 100))}>Previous</button><button className="btn alt" disabled={!fileHasMore || fileLoading} onClick={() => loadFilePage(fileOffset + 100)}>{fileLoading ? "Loading…" : "Next"}</button></div>
         </section>) : view === "activity" ? (<section className="panel"><div className="wrap"><table className="tm"><thead><tr><th>Time</th><th>User</th><th>Action</th><th>Details</th></tr></thead><tbody>
           {audit.map((a, i) => (<tr key={i}><td className="nw">{new Date(a.at).toLocaleString("en-GB")}</td><td>{a.who}</td><td className="tt">{a.act}</td><td>
             {Array.isArray(a.detail) ? <div className="audit-diff">{a.detail.map((change, j) => <div className="audit-change" key={j}>
               <b>{change.field}</b><span className="audit-value old"><small>Old</small>{change.old}</span><span className="audit-value new"><small>New</small>{change.new}</span>
             </div>)}</div> : a.detail}
           </td></tr>))}
-          {!audit.length && <tr><td colSpan="4" className="empty">No activity yet.</td></tr>}</tbody></table></div></section>) : view === "team" ? (<>
+          {!audit.length && <tr><td colSpan="4" className="empty">No activity yet.</td></tr>}</tbody></table></div><div className="tools"><span className="note">Showing {audit.length ? auditOffset + 1 : 0}–{auditOffset + audit.length} of {auditTotal} events</span><button className="btn alt" disabled={!auditOffset || auditLoading} onClick={() => loadAuditPage(Math.max(0, auditOffset - 100))}>Previous</button><button className="btn alt" disabled={!auditHasMore || auditLoading} onClick={() => loadAuditPage(auditOffset + 100)}>{auditLoading ? "Loading…" : "Next"}</button></div></section>) : view === "team" ? (<>
           {admin && (<section className="panel"><h3>Invite a member to {activeProject?.name}</h3>
             <p className="note">This invitation is for <b>{activeProject?.name}</b> only. Members can have different roles in other projects.</p>
             <form className="tools" onSubmit={sendInvite}>
@@ -1267,7 +1351,7 @@ export default function Page() {
         {dt.resolution && <><h4>Resolution</h4><p className="desc">{dt.resolution}</p></>}
         {(dt.notes || []).length > 0 && <><h4>History</h4>{dt.notes.map((n, i) => <p key={i} className="dd">{fmt(n.at)} - {n.by}: {n.text}</p>)}</>}
         <h4>Attachments</h4>
-        {files.filter((x) => x.ticket === dt.id).map((a) => (<div className="att" key={a.id}><a href={fh(a)} target="_blank" rel="noreferrer"><Ic d={CLIP} /> {a.name}</a><small>{a.cat}{a.url ? ", link" : ""}</small></div>))}
+        {files.filter((x) => x.ticket === dt.id).map((a) => (<div className="att" key={a.id}>{a.url ? <a href={fh(a)} target="_blank" rel="noreferrer"><Ic d={CLIP} /> {a.name}</a> : <button type="button" className="att-link" onClick={() => openFile(a)}><Ic d={CLIP} /> {a.name}</button>}<small>{a.cat}{a.url ? ", link" : ""}</small></div>))}
         {!files.some((x) => x.ticket === dt.id) && <small>No attachments</small>}
         <div className="acts end">{client && dt.status === "Completed" && <button className="btn" onClick={() => reopen(dt)}>Not satisfied? Reopen</button>}<button className="btn alt" onClick={() => setDetail(null)}>Close</button></div>
       </div></div>)}

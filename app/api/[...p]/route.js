@@ -2,7 +2,7 @@ import path from "path";
 import crypto from "crypto";
 import { SEED } from "../../../lib/seed";
 import { sendEmail, emailStatus } from "../../../lib/email";
-import { getWorkspaceMemberCount, loadDb, loadLoginDb, saveDb, putFile, getFile, delFile, remote } from "../../../lib/store";
+import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, saveDb, putFile, getFile, delFile, remote } from "../../../lib/store";
 import { check } from "../../../lib/reminders";
 
 export const dynamic = "force-dynamic";
@@ -217,7 +217,7 @@ async function h(req, p, m) {
     if (!process.env.CRON_SECRET || req.headers.get("authorization") !== "Bearer " + process.env.CRON_SECRET) return J({ error: "denied" }, 401);
     await check(); return J({ ok: true });
   }
-  const key = req.headers.get("x-key") || u.searchParams.get("key");
+  const key = req.headers.get("x-key");
   if (remote && r === "login" && m === "POST") {
     const body = await req.json();
     const id = String(body.id || "").trim().toLowerCase();
@@ -242,18 +242,132 @@ async function h(req, p, m) {
     if (memberCount > 0) return J({ error: "denied" }, 401);
     if (!process.env.ADMIN_EMAIL || !pwOk(process.env.ADMIN_PASSWORD)) return J({ setup: true });
   }
+  let publicFlow = "";
+  let publicBody = {};
+  let publicToken = "";
+  if (remote && !key) {
+    if (r === "invite" && m === "GET") {
+      publicFlow = "invite";
+      publicToken = u.searchParams.get("t") || "";
+    } else if (r === "accept" && m === "POST") {
+      publicFlow = "accept";
+      publicBody = await req.clone().json();
+      publicToken = String(publicBody.token || "");
+    } else if (r === "forgot" && m === "POST") {
+      publicFlow = "forgot";
+      publicBody = await req.clone().json();
+    } else if (r === "reset" && m === "POST") {
+      publicFlow = "reset";
+      publicBody = await req.clone().json();
+      publicToken = String(publicBody.token || "");
+    } else if (r === "google-meet" && m === "GET" && u.searchParams.get("action") === "callback") {
+      publicFlow = "oauth";
+      publicToken = u.searchParams.get("state") || "";
+    } else if (r !== "db" || m !== "GET") {
+      return J({ error: "denied" }, 401);
+    }
+  }
   const requestedProject = u.searchParams.get("project");
   const pageSize = Math.min(200, Math.max(1, Number.parseInt(u.searchParams.get("limit") || "100", 10) || 100));
-  const pageOffset = Math.max(0, Number.parseInt(
+  const boundedOffset = (value) => Math.min(2147483647, Math.max(0, Number.parseInt(value || "0", 10) || 0));
+  const safePageOffset = boundedOffset(
     (r === "tickets" ? u.searchParams.get("offset") : u.searchParams.get("ticketOffset")) || "0",
-    10,
-  ) || 0);
-  const d = await load(key ? {
-    sessionToken: key,
-    projectId: requestedProject,
-    ticketOffset: pageOffset,
-    ticketLimit: pageSize,
-  } : undefined);
+  );
+  const collectionLimit = Math.min(200, Math.max(1, Number.parseInt(u.searchParams.get("limit") || "100", 10) || 100));
+  const collectionOffset = boundedOffset(u.searchParams.get("offset"));
+  let scopedBody = publicBody;
+  if (remote && key && m === "POST" && !["upload", "meeting-recording"].includes(r)) {
+    scopedBody = await req.clone().json();
+  }
+  let collection = "";
+  let rangeStart = "";
+  let rangeEnd = "";
+  let recordId = "";
+  if (r === "db" && m === "GET") collection = "overview";
+  if (r === "files" && m === "GET") collection = "files";
+  if (r === "activity" && m === "GET") collection = "audit";
+  if (r === "meetings") {
+    collection = "meetings";
+    if (m === "GET") {
+      const month = u.searchParams.get("month") || "";
+      if (/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
+        const [year, monthNumber] = month.split("-").map(Number);
+        rangeStart = `${month}-01`;
+        rangeEnd = `${month}-${String(new Date(Date.UTC(year, monthNumber, 0)).getUTCDate()).padStart(2, "0")}`;
+      }
+    } else {
+      recordId = String(scopedBody.id || "");
+      if (scopedBody.action === "notes") rangeStart = String(scopedBody.occurrenceDate || "");
+    }
+  }
+  if (r === "meeting-notes") {
+    collection = "meeting-notes";
+    if (m === "GET") {
+      rangeStart = u.searchParams.get("from") || "";
+      rangeEnd = u.searchParams.get("to") || "";
+      if (!rangeStart && !rangeEnd) {
+        const month = u.searchParams.get("month") || "";
+        if (/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
+          const [year, monthNumber] = month.split("-").map(Number);
+          rangeStart = `${month}-01`;
+          rangeEnd = `${month}-${String(new Date(Date.UTC(year, monthNumber, 0)).getUTCDate()).padStart(2, "0")}`;
+        }
+      } else {
+        const validDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(new Date(`${value}T00:00:00Z`).getTime()) && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
+        if (!validDate(rangeStart) || !validDate(rangeEnd) || rangeStart > rangeEnd || (new Date(`${rangeEnd}T00:00:00Z`) - new Date(`${rangeStart}T00:00:00Z`)) / 864e5 > 366) {
+          return J({ error: "Enter a valid report range of no more than one year" }, 400);
+        }
+      }
+    } else recordId = String(scopedBody.noteId || scopedBody.id || scopedBody.meetingId || "");
+  }
+  if (r === "meeting-recording") {
+    collection = "meeting-notes";
+    if (m === "GET") recordId = u.searchParams.get("id") || "";
+    else if (m === "POST") {
+      const formData = await req.clone().formData();
+      recordId = String(formData.get("noteId") || "");
+    }
+  }
+  if (r === "file" && m === "GET") {
+    collection = "files";
+    recordId = path.basename(u.searchParams.get("f") || "");
+  }
+  if (r === "filedel" && m === "POST") {
+    collection = "files";
+    recordId = String(scopedBody.id || "");
+  }
+  if (["upload", "addlink"].includes(r) && m === "POST") collection = "files";
+  let d;
+  if (publicFlow) {
+    const id = String(publicBody.id || "").trim().toLowerCase();
+    const phone = id.includes("@") ? "" : np(id);
+    d = await loadPublicFlowDb(publicFlow, publicToken, id.includes("@") ? id : "", phone);
+    d._publicFlow = publicFlow;
+    if (!d._publicFlowFound) {
+      if (publicFlow === "forgot") return J({ ok: true });
+      if (publicFlow === "reset") return J({ error: "This reset link is invalid or has expired." }, 400);
+      if (publicFlow === "oauth") {
+        const destination = new URL("/", siteUrl(u.origin));
+        destination.searchParams.set("google-meet", "error");
+        destination.searchParams.set("reason", "state");
+        return Response.redirect(destination);
+      }
+      return J({ error: "Invalid or expired invite" }, 404);
+    }
+  } else {
+    d = await load(key ? {
+      sessionToken: key,
+      projectId: requestedProject,
+      ticketOffset: safePageOffset,
+      ticketLimit: pageSize,
+      collection,
+      rangeStart,
+      rangeEnd,
+      collectionOffset,
+      collectionLimit: r === "meeting-notes" ? Math.min(collectionLimit, 50) : collectionLimit,
+      recordId,
+    } : undefined);
+  }
   if (d._scopeUnauthorized) return J({ error: "denied" }, 401);
   if (d._scopeForbidden) return J({ error: "You are not a member of this project" }, 403);
   d.audit = d.audit || []; d.resets = d.resets || []; d.files = d.files || []; d.meetings = d.meetings || []; d.meetingNotes = d.meetingNotes || [];
@@ -303,14 +417,15 @@ async function h(req, p, m) {
     }
   });
   d.organizations = d.organizations || [];
-  let defaultOrganization = d.organizations.find((item) => item.id === "solexes");
+  let defaultOrganization = d.organizations.find((item) => item.id === "solexes")
+    || (d._publicFlow ? d.organizations[0] : null);
   if (!defaultOrganization) {
     defaultOrganization = {
       id: "solexes",
       name: "My Company",
       adminIds: [...new Set(d.projects.flatMap((item) => item.members.filter((entry) => entry.role === "Admin" && entry.status !== "disabled").map((entry) => entry.memberId)))],
     };
-    d.organizations.push(defaultOrganization);
+    if (!d._publicFlow) d.organizations.push(defaultOrganization);
   }
   d.projects.forEach((item) => {
     if (!item.organizationId) item.organizationId = defaultOrganization.id;
@@ -447,7 +562,9 @@ async function h(req, p, m) {
       if (!me) return J({ error: account ? "You are not a member of this project" : "denied" }, account ? 403 : 401);
       const f = path.basename(u.searchParams.get("f") || "");
       if (!d.files.some((x) => x.id === f)) return J({ error: "missing" }, 404);
-      if (me.role === "Client" && !d.files.some((x) => x.id === f && d.tickets.some((t) => t.id === x.ticket && t.createdBy === me.id))) return J({ error: "denied" }, 403);
+      const ownsFileTicket = d._scope?.file_authorized ?? d.files.some((item) =>
+        item.id === f && d.tickets.some((ticket) => ticket.id === item.ticket && ticket.createdBy === me.id));
+      if (me.role === "Client" && !ownsFileTicket) return J({ error: "denied" }, 403);
       const buf = await getFile(f);
       if (!buf) return J({ error: "missing" }, 404);
       return new Response(buf, { headers: { "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(u.searchParams.get("n") || f)}` } });
@@ -469,7 +586,15 @@ async function h(req, p, m) {
           results.push({ ...base, weekly: false, occurrenceDate: meeting.date, notes: saved.notes || "", participantSummaries: saved.participantSummaries || [], notesUpdatedAt: saved.updatedAt || "" });
         }
       });
-      return J({ meetings: results.sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time)) });
+      return J({
+        meetings: results.sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time)),
+        pagination: {
+          offset: d._scope?.collection_offset || 0,
+          limit: d._scope?.collection_limit || results.length,
+          total: d._scope?.collection_total ?? results.length,
+          hasMore: (d._scope?.collection_offset || 0) + results.length < (d._scope?.collection_total ?? results.length),
+        },
+      });
     }
     if (r === "google-meet" && m === "GET" && u.searchParams.get("action") === "status") {
       if (!canManageMeetings) return J({ error: "Project admin access required" }, 403);
@@ -493,10 +618,51 @@ async function h(req, p, m) {
       if (from || to) {
         const validDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(new Date(`${value}T00:00:00Z`).getTime()) && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
         if (!validDate(from) || !validDate(to) || from > to || (new Date(`${to}T00:00:00Z`) - new Date(`${from}T00:00:00Z`)) / 864e5 > 366) return J({ error: "Enter a valid report range of no more than one year" }, 400);
-        return J({ ...access, notes: d.meetingNotes.filter((note) => note.projectId === project.id && note.date >= from && note.date <= to).sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)) });
+        return J({
+          ...access,
+          notes: d.meetingNotes.filter((note) => note.projectId === project.id && note.date >= from && note.date <= to).sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)),
+          pagination: {
+            offset: d._scope?.collection_offset || 0,
+            limit: d._scope?.collection_limit || d.meetingNotes.length,
+            total: d._scope?.collection_total ?? d.meetingNotes.length,
+            hasMore: (d._scope?.collection_offset || 0) + d.meetingNotes.length < (d._scope?.collection_total ?? d.meetingNotes.length),
+          },
+        });
       }
       if (!/^\d{4}-\d{2}$/.test(month) || Number(month.slice(5)) < 1 || Number(month.slice(5)) > 12) return J({ error: "Invalid notes month" }, 400);
-      return J({ ...access, notes: d.meetingNotes.filter((note) => note.projectId === project.id && note.date.startsWith(month)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)) });
+      return J({
+        ...access,
+        notes: d.meetingNotes.filter((note) => note.projectId === project.id && note.date.startsWith(month)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+        pagination: {
+          offset: d._scope?.collection_offset || 0,
+          limit: d._scope?.collection_limit || d.meetingNotes.length,
+          total: d._scope?.collection_total ?? d.meetingNotes.length,
+          hasMore: (d._scope?.collection_offset || 0) + d.meetingNotes.length < (d._scope?.collection_total ?? d.meetingNotes.length),
+        },
+      });
+    }
+    if (r === "files" && m === "GET") {
+      return J({
+        files: d.files,
+        pagination: {
+          offset: d._scope?.collection_offset || 0,
+          limit: d._scope?.collection_limit || d.files.length,
+          total: d._scope?.collection_total ?? d.files.length,
+          hasMore: (d._scope?.collection_offset || 0) + d.files.length < (d._scope?.collection_total ?? d.files.length),
+        },
+      });
+    }
+    if (r === "activity" && m === "GET") {
+      if (me.role !== "Admin") return J({ error: "Admin only" }, 403);
+      return J({
+        audit: d.audit,
+        pagination: {
+          offset: d._scope?.collection_offset || 0,
+          limit: d._scope?.collection_limit || d.audit.length,
+          total: d._scope?.collection_total ?? d.audit.length,
+          hasMore: (d._scope?.collection_offset || 0) + d.audit.length < (d._scope?.collection_total ?? d.audit.length),
+        },
+      });
     }
     if (r === "meeting-recording" && m === "GET") {
       if (!canUseMeetings || me.role === "Client") return J({ error: "Team access required" }, 403);
@@ -572,7 +738,7 @@ async function h(req, p, m) {
       }
       inviteProject.members.push({ memberId: member.id, role: i.role, status: "active" });
       const k = uid() + "." + Date.now(); member.sessions = [...(member.sessions || []), k].slice(-5);
-      if (inviteProject === project) claim(d, member);
+      if (inviteProject === project && !d._publicFlow) claim(d, member);
       d.invites = d.invites.filter((x) => x !== i); await save(d);
       return J({ key: k, projectId: inviteProject.id });
     }

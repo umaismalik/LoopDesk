@@ -25,6 +25,10 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
   const [reportWeek, setReportWeek] = useState(() => new Date().toISOString().slice(0, 10));
   const [reportMember, setReportMember] = useState("");
   const [notes, setNotes] = useState([]);
+  const [notesOffset, setNotesOffset] = useState(0);
+  const [notesTotal, setNotesTotal] = useState(0);
+  const [notesHasMore, setNotesHasMore] = useState(false);
+  const [notesLoading, setNotesLoading] = useState(false);
   const [selected, setSelected] = useState(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -39,9 +43,9 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
   const [editAccessExpiresAt, setEditAccessExpiresAt] = useState(null);
   const [accessRequests, setAccessRequests] = useState([]);
 
-  const request = useCallback(async (body) => {
+  const request = useCallback(async (body, offset = 0) => {
     try {
-      const response = await fetch("/api/meeting-notes?month=" + encodeURIComponent(month) + "&project=" + encodeURIComponent(projectId), {
+      const response = await fetch("/api/meeting-notes?month=" + encodeURIComponent(month) + "&offset=" + offset + "&limit=50&project=" + encodeURIComponent(projectId), {
         method: body ? "POST" : "GET",
         headers: { "x-key": keyValue, ...(body && !(body instanceof FormData) ? { "Content-Type": "application/json" } : {}) },
         body: body ? (body instanceof FormData ? body : JSON.stringify(body)) : undefined,
@@ -56,19 +60,23 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
   useEffect(() => {
     let active = true;
     setError("");
-    request().then((result) => {
+    setNotesLoading(true);
+    request(null, notesOffset).then((result) => {
       if (!active) return;
       if (!result.ok) { setError(result.error || "Could not load notes"); return; }
       setNotes(result.notes || []);
+      setNotesOffset(result.pagination?.offset || 0);
+      setNotesTotal(result.pagination?.total ?? result.notes.length);
+      setNotesHasMore(!!result.pagination?.hasMore);
       const canEdit = !!result.canEdit || !!canManageContent;
       setEditAccess(canEdit);
       setEditAccessExpiresAt(result.expiresAt || null);
       onAccessChange?.(canEdit, result.expiresAt || null, result.requests || []);
       setAccessRequests(result.requests || []);
       setSelected((previous) => previous ? (result.notes || []).find((note) => note.id === previous.id) || null : null);
-    });
+    }).finally(() => { if (active) setNotesLoading(false); });
     return () => { active = false; };
-  }, [request, canManageContent, onAccessChange]);
+  }, [request, canManageContent, onAccessChange, notesOffset]);
   const refreshAccessState = async () => {
     const result = await request();
     if (!result.ok) { setError(result.error || "Could not refresh meeting access"); return; }
@@ -188,10 +196,16 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
       to = [end.getFullYear(), String(end.getMonth() + 1).padStart(2, "0"), String(end.getDate()).padStart(2, "0")].join("-");
     }
     try {
-      const response = await fetch(`/api/meeting-notes?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&project=${encodeURIComponent(projectId)}`, { headers: { "x-key": keyValue } });
-      const result = await response.json();
-      if (!response.ok) { setError(result.error || "Could not create report"); return; }
-      const reportNotes = result.notes || [];
+      const reportNotes = [];
+      let offset = 0, hasMore = true;
+      while (hasMore) {
+        const response = await fetch(`/api/meeting-notes?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&offset=${offset}&limit=50&project=${encodeURIComponent(projectId)}`, { headers: { "x-key": keyValue } });
+        const result = await response.json();
+        if (!response.ok) { setError(result.error || "Could not create report"); return; }
+        reportNotes.push(...(result.notes || []));
+        hasMore = !!result.pagination?.hasMore;
+        offset += result.pagination?.limit || 50;
+      }
       const rows = [];
       reportNotes.forEach((note) => {
         const noteTasks = note.tasks || [];
@@ -254,7 +268,7 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
   return <section className="panel managed-notes">
     <div className="managed-notes-toolbar">
       <div><h2>Meeting notes & action items</h2><p>Meeting decisions become assigned tasks; set deadlines here.</p></div>
-      <label>Month<input type="month" value={month} onChange={(event) => { setMonth(event.target.value); setSelected(null); }} /></label>
+      <label>Month<input type="month" value={month} onChange={(event) => { setMonth(event.target.value); setNotesOffset(0); setSelected(null); }} /></label>
     </div>
     <div className="meeting-report-toolbar">
       <div><b>Team meeting report</b><span>Export assigned work by team member and week or month.</span></div>
@@ -273,10 +287,12 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
     {canDelete && !!pendingAccessRequests.length && <section className="meeting-access-requests"><h3>Temporary edit requests</h3>{pendingAccessRequests.map((item) => <article key={item.id}><div><b>{item.memberName}</b><span>Requested {new Date(item.requestedAt).toLocaleString()}</span></div><div><button type="button" className="btn" disabled={busy} onClick={() => reviewEditAccess(item.id, "approve")}>Approve for 1 hour</button><button type="button" className="btn alt" disabled={busy} onClick={() => reviewEditAccess(item.id, "deny")}>Deny</button></div></article>)}</section>}
     <div className="managed-notes-layout">
       <div className="managed-notes-list">
+        <p className="meeting-empty">Showing {notes.length ? notesOffset + 1 : 0}–{notesOffset + notes.length} of {notesTotal} notes</p>
         {!notes.length && <p className="meeting-empty">No saved meeting notes for this month in this project.</p>}
         {notes.map((note) => <button type="button" className={"managed-note-item" + (selected?.id === note.id ? " selected" : "")} key={note.id} onClick={() => { setSelected(note); setNotice(""); }}>
           <b>{note.title}</b><span>{dateLabel(note.date)}</span><small>{note.tasks?.length || 0} action items · {note.createdByName}</small>
         </button>)}
+        <div className="tools"><button type="button" className="btn alt" disabled={!notesOffset || notesLoading} onClick={() => setNotesOffset(Math.max(0, notesOffset - 50))}>Previous</button><button type="button" className="btn alt" disabled={!notesHasMore || notesLoading} onClick={() => setNotesOffset(notesOffset + 50)}>{notesLoading ? "Loading…" : "Next"}</button></div>
       </div>
       {selected && <div className="managed-note-detail">
         <div className="managed-note-meta">{dateLabel(selected.date)} · Meeting notes by {selected.createdByName}{canDelete && <button type="button" className="ic dl" disabled={busy} onClick={deleteNote}>Delete note</button>}</div>

@@ -216,6 +216,12 @@ create table if not exists public.workspace_meta (
   value jsonb not null
 );
 
+create table if not exists public.worker_leases (
+  name text primary key,
+  owner_token text not null,
+  expires_at timestamptz not null
+);
+
 insert into public.google_calendar_connections (
   organization_id, connected_by, email, refresh_token, connected_at
 )
@@ -265,7 +271,7 @@ begin
     'meeting_people', 'meeting_occurrences', 'meeting_notes',
     'meeting_note_participants', 'meeting_note_tasks', 'invites',
     'meeting_edit_requests', 'password_resets', 'google_oauth_states',
-    'google_calendar_connections', 'workspace_meta'
+    'google_calendar_connections', 'workspace_meta', 'worker_leases'
   ] loop
     execute format('alter table public.%I enable row level security', table_name);
     execute format('revoke all on public.%I from anon, authenticated', table_name);
@@ -467,65 +473,25 @@ begin
            select 1 from public.tickets ticket
             where ticket.project_id = row.project_id
               and ticket.id = row.ticket_id
+              and ticket.id in (
+                select ticket_page.id
+                  from public.tickets ticket_page
+                 where ticket_page.project_id = active_project_id
+                   and (member_project_role <> 'Client' or ticket_page.created_by = current_member_id)
+                 order by ticket_page.date desc nulls last, ticket_page.id
+                 limit safe_page_size offset safe_page_offset
+              )
               and (member_project_role <> 'Client' or ticket.created_by = current_member_id)
          )
     ), '[]'::jsonb),
-    'project_files', coalesce((
-      select jsonb_agg(to_jsonb(row))
-        from public.project_files row
-       where row.project_id = active_project_id
-         and (
-           member_project_role <> 'Client'
-           or exists (
-             select 1 from public.tickets ticket
-              where ticket.project_id = row.project_id
-                and ticket.id = row.ticket_id
-                and ticket.created_by = current_member_id
-           )
-         )
-    ), '[]'::jsonb),
-    'project_audit', coalesce((
-      select jsonb_agg(to_jsonb(row) order by row.position desc)
-        from public.project_audit row
-       where row.project_id = active_project_id
-         and member_project_role = 'Admin'
-    ), '[]'::jsonb),
-    'meetings', coalesce((
-      select jsonb_agg(to_jsonb(row))
-        from public.meetings row
-       where row.project_id = active_project_id
-         and member_project_role <> 'Client'
-    ), '[]'::jsonb),
-    'meeting_people', coalesce((
-      select jsonb_agg(to_jsonb(row))
-        from public.meeting_people row
-       where member_project_role <> 'Client'
-         and row.meeting_id in (select meeting.id from public.meetings meeting where meeting.project_id = active_project_id)
-    ), '[]'::jsonb),
-    'meeting_occurrences', coalesce((
-      select jsonb_agg(to_jsonb(row))
-        from public.meeting_occurrences row
-       where member_project_role <> 'Client'
-         and row.meeting_id in (select meeting.id from public.meetings meeting where meeting.project_id = active_project_id)
-    ), '[]'::jsonb),
-    'meeting_notes', coalesce((
-      select jsonb_agg(to_jsonb(row))
-        from public.meeting_notes row
-       where row.project_id = active_project_id
-        and member_project_role <> 'Client'
-    ), '[]'::jsonb),
-    'meeting_note_participants', coalesce((
-      select jsonb_agg(to_jsonb(row))
-        from public.meeting_note_participants row
-       where member_project_role <> 'Client'
-         and row.note_id in (select note.id from public.meeting_notes note where note.project_id = active_project_id)
-    ), '[]'::jsonb),
-    'meeting_note_tasks', coalesce((
-      select jsonb_agg(to_jsonb(row))
-        from public.meeting_note_tasks row
-       where member_project_role <> 'Client'
-         and row.note_id in (select note.id from public.meeting_notes note where note.project_id = active_project_id)
-    ), '[]'::jsonb),
+    'project_files', '[]'::jsonb,
+    'project_audit', '[]'::jsonb,
+    'meetings', '[]'::jsonb,
+    'meeting_people', '[]'::jsonb,
+    'meeting_occurrences', '[]'::jsonb,
+    'meeting_notes', '[]'::jsonb,
+    'meeting_note_participants', '[]'::jsonb,
+    'meeting_note_tasks', '[]'::jsonb,
     'invites', coalesce((
       select jsonb_agg(to_jsonb(row))
         from public.invites row
@@ -559,6 +525,344 @@ begin
         from public.workspace_meta row
        where row.key in ('v2', 'v3', 'v4', 'v5', 'v6', 'schema_version')
     ), '[]'::jsonb)
+  );
+end
+$$;
+
+create or replace function public.load_authorized_collection(
+  session_token text,
+  requested_project_id text,
+  collection_name text,
+  range_start text default null,
+  range_end text default null,
+  page_offset integer default 0,
+  page_size integer default 100,
+  record_id text default null
+)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  current_member_id text;
+  member_project_role text;
+  active_project_id text;
+  safe_page_size integer := least(200, greatest(1, coalesce(page_size, 100)));
+  safe_page_offset integer := greatest(0, coalesce(page_offset, 0));
+  collection_total integer := 0;
+begin
+  if collection_name not in ('overview', 'files', 'audit', 'meetings', 'meeting-notes') then
+    return jsonb_build_object('scope', jsonb_build_object('authorized', false, 'invalid_collection', true));
+  end if;
+
+  select member.id
+    into current_member_id
+    from public.members member
+    left join public.member_credentials credential on credential.member_id = member.id
+   where member.status <> 'disabled'
+     and (
+       credential.legacy_key = session_token
+       or exists (
+         select 1
+           from public.member_sessions session
+          where session.member_id = member.id
+            and session.token = session_token
+            and session.expires_at > extract(epoch from clock_timestamp()) * 1000
+       )
+     )
+   limit 1;
+
+  if current_member_id is null then
+    return jsonb_build_object('scope', jsonb_build_object('authorized', false));
+  end if;
+
+  select membership.project_id, membership.role
+    into active_project_id, member_project_role
+    from public.project_members membership
+   where membership.project_id = requested_project_id
+     and membership.member_id = current_member_id
+     and membership.status <> 'disabled';
+
+  if active_project_id is null then
+    return jsonb_build_object('scope', jsonb_build_object('authorized', true, 'forbidden_project', true));
+  end if;
+
+  if collection_name in ('overview', 'files') then
+    select count(*)::integer into collection_total
+      from public.project_files file
+     where file.project_id = active_project_id
+       and (
+         member_project_role <> 'Client'
+         or exists (
+           select 1 from public.tickets ticket
+            where ticket.project_id = file.project_id
+              and ticket.id = file.ticket_id
+              and ticket.created_by = current_member_id
+         )
+       )
+       and (record_id is null or file.id = record_id);
+  elsif collection_name = 'audit' then
+    if member_project_role = 'Admin' then
+      select count(*)::integer into collection_total
+        from public.project_audit event
+       where event.project_id = active_project_id;
+    end if;
+  elsif collection_name = 'meetings' and member_project_role <> 'Client' then
+    select count(*)::integer into collection_total
+      from public.meetings meeting
+     where meeting.project_id = active_project_id
+       and (
+         (record_id is not null and meeting.id = record_id)
+         or (
+           record_id is null
+           and range_start is not null and range_end is not null
+           and (
+             meeting.date between range_start and range_end
+             or exists (
+               select 1 from public.meeting_occurrences occurrence
+                where occurrence.meeting_id = meeting.id
+                  and occurrence.occurrence_date between range_start and range_end
+             )
+           )
+         )
+       );
+  elsif collection_name = 'meeting-notes' and member_project_role <> 'Client' then
+    select count(*)::integer into collection_total
+      from public.meeting_notes note
+     where note.project_id = active_project_id
+       and (
+         (record_id is not null and note.id = record_id)
+         or (
+           record_id is null
+           and range_start is not null and range_end is not null
+           and note.date between range_start and range_end
+         )
+       );
+  end if;
+
+  return jsonb_build_object(
+    'scope', jsonb_build_object(
+      'authorized', true,
+      'project_id', active_project_id,
+      'collection', collection_name,
+      'collection_offset', safe_page_offset,
+      'collection_limit', safe_page_size,
+      'collection_total', collection_total,
+      'file_authorized', (
+        collection_name = 'files'
+        and record_id is not null
+        and member_project_role = 'Client'
+        and exists (
+          select 1
+            from public.project_files file
+            join public.tickets ticket
+              on ticket.project_id = file.project_id
+             and ticket.id = file.ticket_id
+           where file.project_id = active_project_id
+             and file.id = record_id
+             and ticket.created_by = current_member_id
+        )
+      )
+    ),
+    'project_files', case when collection_name in ('overview', 'files') then coalesce((
+      select jsonb_agg(to_jsonb(page) order by page.file_date desc nulls last, page.id)
+        from (
+          select file.*, file.payload->>'at' as file_date
+            from public.project_files file
+           where file.project_id = active_project_id
+             and (
+               member_project_role <> 'Client'
+               or exists (
+                 select 1 from public.tickets ticket
+                  where ticket.project_id = file.project_id
+                    and ticket.id = file.ticket_id
+                    and ticket.created_by = current_member_id
+               )
+             )
+             and (record_id is null or file.id = record_id)
+           order by file.payload->>'at' desc nulls last, file.id
+           limit safe_page_size offset safe_page_offset
+        ) page
+    ), '[]'::jsonb) else '[]'::jsonb end,
+    'project_audit', case when collection_name in ('overview', 'audit') and member_project_role = 'Admin' then coalesce((
+      select jsonb_agg(to_jsonb(page) order by page.position desc, page.event_id)
+        from (
+          select event.*
+            from public.project_audit event
+           where event.project_id = active_project_id
+           order by event.position desc, event.event_id
+           limit safe_page_size offset safe_page_offset
+        ) page
+    ), '[]'::jsonb) else '[]'::jsonb end,
+    'meetings', case when collection_name in ('meetings', 'meeting-notes') and member_project_role <> 'Client' then coalesce((
+      select jsonb_agg(to_jsonb(page) order by page.date, page.id)
+        from (
+          select meeting.*
+            from public.meetings meeting
+           where meeting.project_id = active_project_id
+             and (
+               (record_id is not null and meeting.id = record_id)
+               or (
+                 record_id is null
+                 and range_start is not null and range_end is not null
+                 and (
+                   meeting.date between range_start and range_end
+                   or exists (
+                     select 1 from public.meeting_occurrences occurrence
+                      where occurrence.meeting_id = meeting.id
+                        and occurrence.occurrence_date between range_start and range_end
+                   )
+                 )
+               )
+             )
+           order by meeting.date, meeting.id
+           limit safe_page_size offset safe_page_offset
+        ) page
+    ), '[]'::jsonb) else '[]'::jsonb end,
+    'meeting_people', case when collection_name in ('meetings', 'meeting-notes') and member_project_role <> 'Client' then coalesce((
+      select jsonb_agg(to_jsonb(person))
+        from public.meeting_people person
+       where person.meeting_id in (
+         select meeting.id
+           from public.meetings meeting
+          where meeting.project_id = active_project_id
+            and (
+              (record_id is not null and meeting.id = record_id)
+              or (
+                record_id is null
+                and range_start is not null and range_end is not null
+                and (
+                  meeting.date between range_start and range_end
+                  or exists (
+                    select 1 from public.meeting_occurrences occurrence
+                     where occurrence.meeting_id = meeting.id
+                       and occurrence.occurrence_date between range_start and range_end
+                  )
+                )
+              )
+            )
+          order by meeting.date, meeting.id
+          limit safe_page_size offset safe_page_offset
+       )
+    ), '[]'::jsonb) else '[]'::jsonb end,
+    'meeting_occurrences', case when collection_name in ('meetings', 'meeting-notes') and member_project_role <> 'Client' then coalesce((
+      select jsonb_agg(to_jsonb(occurrence))
+        from public.meeting_occurrences occurrence
+       where occurrence.meeting_id in (
+         select meeting.id
+           from public.meetings meeting
+          where meeting.project_id = active_project_id
+            and (
+              (record_id is not null and meeting.id = record_id)
+              or (
+                record_id is null
+                and range_start is not null and range_end is not null
+                and (
+                  meeting.date between range_start and range_end
+                  or exists (
+                    select 1 from public.meeting_occurrences relevant
+                     where relevant.meeting_id = meeting.id
+                       and relevant.occurrence_date between range_start and range_end
+                  )
+                )
+              )
+            )
+          order by meeting.date, meeting.id
+          limit safe_page_size offset safe_page_offset
+       )
+         and (record_id is not null or occurrence.occurrence_date between range_start and range_end)
+    ), '[]'::jsonb) else '[]'::jsonb end,
+    'meeting_notes', case when collection_name in ('meetings', 'meeting-notes') and member_project_role <> 'Client' then coalesce((
+      select jsonb_agg(to_jsonb(page) order by page.date desc nulls last, page.created_at desc, page.id)
+        from (
+          select note.*
+            from public.meeting_notes note
+           where note.project_id = active_project_id
+             and (
+               (
+                 collection_name = 'meeting-notes'
+                 and (
+                   (record_id is not null and note.id = record_id)
+                   or (
+                     record_id is null
+                     and range_start is not null and range_end is not null
+                     and note.date between range_start and range_end
+                   )
+                 )
+               )
+               or (
+                 collection_name = 'meetings'
+                 and record_id is not null
+                 and note.meeting_id = record_id
+                 and (range_start is null or note.date = range_start)
+               )
+             )
+           order by note.date desc nulls last, note.created_at desc, note.id
+           limit safe_page_size offset safe_page_offset
+        ) page
+    ), '[]'::jsonb) else '[]'::jsonb end,
+    'meeting_note_participants', case when collection_name in ('meetings', 'meeting-notes') and member_project_role <> 'Client' then coalesce((
+      select jsonb_agg(to_jsonb(participant))
+        from public.meeting_note_participants participant
+       where participant.note_id in (
+         select note.id
+           from public.meeting_notes note
+          where note.project_id = active_project_id
+            and (
+              (
+                collection_name = 'meeting-notes'
+                and (
+                  (record_id is not null and note.id = record_id)
+                  or (
+                    record_id is null
+                    and range_start is not null and range_end is not null
+                    and note.date between range_start and range_end
+                  )
+                )
+              )
+              or (
+                collection_name = 'meetings'
+                and record_id is not null
+                and note.meeting_id = record_id
+                and (range_start is null or note.date = range_start)
+              )
+            )
+          order by note.date desc nulls last, note.created_at desc, note.id
+          limit safe_page_size offset safe_page_offset
+       )
+    ), '[]'::jsonb) else '[]'::jsonb end,
+    'meeting_note_tasks', case when collection_name in ('meetings', 'meeting-notes') and member_project_role <> 'Client' then coalesce((
+      select jsonb_agg(to_jsonb(task))
+        from public.meeting_note_tasks task
+       where task.note_id in (
+         select note.id
+           from public.meeting_notes note
+          where note.project_id = active_project_id
+            and (
+              (
+                collection_name = 'meeting-notes'
+                and (
+                  (record_id is not null and note.id = record_id)
+                  or (
+                    record_id is null
+                    and range_start is not null and range_end is not null
+                    and note.date between range_start and range_end
+                  )
+                )
+              )
+              or (
+                collection_name = 'meetings'
+                and record_id is not null
+                and note.meeting_id = record_id
+                and (range_start is null or note.date = range_start)
+              )
+            )
+          order by note.date desc nulls last, note.created_at desc, note.id
+          limit safe_page_size offset safe_page_offset
+       )
+    ), '[]'::jsonb) else '[]'::jsonb end
   );
 end
 $$;
@@ -638,6 +942,297 @@ security definer
 set search_path = pg_catalog, public
 as $$
   select count(*)::integer from public.members
+$$;
+
+create or replace function public.load_public_flow_state(
+  flow_name text,
+  flow_token text default null,
+  login_identifier text default null,
+  login_phone text default ''
+)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = pg_catalog, public
+as $$
+  with selected_invite as (
+    select invite.*
+      from public.invites invite
+     where flow_name in ('invite', 'accept')
+       and invite.token = flow_token
+  ),
+  selected_reset as (
+    select reset.*
+      from public.password_resets reset
+     where flow_name = 'reset'
+       and reset.payload->>'token' = flow_token
+       and coalesce((reset.payload->>'at')::numeric, 0) > extract(epoch from clock_timestamp()) * 1000 - 3600000
+  ),
+  selected_oauth_state as (
+    select oauth.*
+      from public.google_oauth_states oauth
+     where flow_name = 'oauth'
+       and oauth.payload->>'state' = flow_token
+       and coalesce((oauth.payload->>'expiresAt')::numeric, 0) > extract(epoch from clock_timestamp()) * 1000
+  ),
+  target_member_ids as (
+    select member.id
+      from public.members member
+     where (
+       flow_name in ('invite', 'accept')
+       and lower(member.email) = (select lower(invite.email) from selected_invite invite)
+     )
+        or (
+          flow_name = 'forgot'
+          and (
+            (coalesce(login_identifier, '') <> '' and lower(member.email) = lower(login_identifier))
+            or (coalesce(login_phone, '') <> '' and regexp_replace(member.phone, '[^0-9+]', '', 'g') = login_phone)
+          )
+        )
+        or member.id in (select reset.member_id from selected_reset reset)
+        or member.id in (select oauth.payload->>'memberId' from selected_oauth_state oauth)
+  ),
+  target_project_ids as (
+    select invite.project_id as id from selected_invite invite
+    union
+    select oauth.payload->>'projectId' as id from selected_oauth_state oauth
+  ),
+  target_projects as (
+    select project.*
+      from public.projects project
+      join target_project_ids target on target.id = project.id
+  ),
+  related_member_ids as (
+    select id from target_member_ids
+    union
+    select membership.member_id
+      from public.project_members membership
+      join target_projects project on project.id = membership.project_id
+  ),
+  flow_found as (
+    select case flow_name
+      when 'invite' then exists(select 1 from selected_invite)
+      when 'accept' then exists(select 1 from selected_invite)
+      when 'reset' then exists(select 1 from selected_reset)
+      when 'oauth' then exists(select 1 from selected_oauth_state)
+      when 'forgot' then true
+      else false
+    end as found
+  )
+  select jsonb_build_object(
+    'flow_found', (select found from flow_found),
+    'organizations', coalesce((
+      select jsonb_agg(to_jsonb(organization))
+        from public.organizations organization
+        join target_projects project on project.organization_id = organization.id
+    ), '[]'::jsonb),
+    'organization_admins', coalesce((
+      select jsonb_agg(to_jsonb(administrator))
+        from public.organization_admins administrator
+        join target_projects project on project.organization_id = administrator.organization_id
+    ), '[]'::jsonb),
+    'projects', coalesce((select jsonb_agg(to_jsonb(project)) from target_projects project), '[]'::jsonb),
+    'members', coalesce((
+      select jsonb_agg(to_jsonb(member))
+        from public.members member
+       where member.id in (select id from related_member_ids)
+    ), '[]'::jsonb),
+    'member_credentials', coalesce((
+      select jsonb_agg(to_jsonb(credential))
+        from public.member_credentials credential
+       where credential.member_id in (select id from target_member_ids)
+    ), '[]'::jsonb),
+    'member_sessions', coalesce((
+      select jsonb_agg(to_jsonb(session))
+        from public.member_sessions session
+       where session.member_id in (select id from target_member_ids)
+    ), '[]'::jsonb),
+    'project_members', coalesce((
+      select jsonb_agg(to_jsonb(membership))
+        from public.project_members membership
+        join target_projects project on project.id = membership.project_id
+    ), '[]'::jsonb),
+    'invites', coalesce((select jsonb_agg(to_jsonb(invite)) from selected_invite invite), '[]'::jsonb),
+    'password_resets', coalesce((
+      select jsonb_agg(to_jsonb(reset))
+        from public.password_resets reset
+       where reset.member_id in (select id from target_member_ids)
+    ), '[]'::jsonb),
+    'google_oauth_states', coalesce((
+      select jsonb_agg(to_jsonb(oauth))
+        from selected_oauth_state oauth
+    ), '[]'::jsonb),
+    'google_calendar_connections', coalesce((
+      select jsonb_agg(to_jsonb(connection))
+        from public.google_calendar_connections connection
+        join target_projects project on project.organization_id = connection.organization_id
+    ), '[]'::jsonb),
+    'workspace_meta', coalesce((
+      select jsonb_agg(to_jsonb(meta))
+        from public.workspace_meta meta
+       where meta.key in ('v2', 'v3', 'v4', 'v5', 'v6', 'schema_version')
+    ), '[]'::jsonb)
+  )
+$$;
+
+create or replace function public.load_reminder_state()
+returns jsonb
+language sql
+stable
+security definer
+set search_path = pg_catalog, public
+as $$
+  with due_tickets as (
+    select ticket.*
+      from public.tickets ticket
+     where ticket.due_date ~ '^\d{4}-\d{2}-\d{2}$'
+       and (
+         (
+           ticket.due_date::date <= current_date
+           and not coalesce(ticket.payload->'rem', '[]'::jsonb) @> '"overdue"'::jsonb
+         )
+         or (
+           ticket.due_date::date = current_date + 1
+           and not coalesce(ticket.payload->'rem', '[]'::jsonb) @> '"1"'::jsonb
+         )
+         or (
+           ticket.due_date::date = current_date + 3
+           and not coalesce(ticket.payload->'rem', '[]'::jsonb) @> '"3"'::jsonb
+         )
+       )
+       and ticket.status <> 'Completed'
+       and exists (
+         select 1
+           from public.ticket_assignees assignment
+          where assignment.project_id = ticket.project_id
+            and assignment.ticket_id = ticket.id
+       )
+  ),
+  task_due_times as (
+    select task.*,
+           case
+             when task.due_at ~ '^\d{4}-\d{2}-\d{2}$'
+               then (task.due_at::date + time '23:59:59') at time zone 'UTC'
+             when task.due_at ~ '^\d{4}-\d{2}-\d{2}[T ]'
+               then task.due_at::timestamptz
+             else null
+           end as due_time
+      from public.meeting_note_tasks task
+     where task.assignee_id <> ''
+       and task.status <> 'Completed'
+  ),
+  due_tasks as (
+    select task.*
+      from task_due_times task
+     where task.due_time is not null
+       and (
+         (task.due_time > now() + interval '23 hours' and task.due_time <= now() + interval '24 hours' and not coalesce(task.payload->'remindersSent', '[]'::jsonb) @> '"24h"'::jsonb)
+         or (task.due_time > now() + interval '11 hours' and task.due_time <= now() + interval '12 hours' and not coalesce(task.payload->'remindersSent', '[]'::jsonb) @> '"12h"'::jsonb)
+         or (task.due_time > now() + interval '1 hour' and task.due_time <= now() + interval '2 hours' and not coalesce(task.payload->'remindersSent', '[]'::jsonb) @> '"2h"'::jsonb)
+         or (task.due_time > now() + interval '4 minutes' and task.due_time <= now() + interval '5 minutes' and not coalesce(task.payload->'remindersSent', '[]'::jsonb) @> '"5m"'::jsonb)
+       )
+  ),
+  target_note_ids as (
+    select distinct task.note_id from due_tasks task
+  ),
+  target_project_ids as (
+    select distinct ticket.project_id from due_tickets ticket
+    union
+    select distinct note.project_id
+      from public.meeting_notes note
+      join target_note_ids target on target.note_id = note.id
+  ),
+  target_member_ids as (
+    select assignment.member_id
+      from public.ticket_assignees assignment
+      join due_tickets ticket on ticket.project_id = assignment.project_id and ticket.id = assignment.ticket_id
+    union
+    select task.assignee_id from due_tasks task
+  )
+  select jsonb_build_object(
+    'organizations', coalesce((
+      select jsonb_agg(to_jsonb(organization))
+        from public.organizations organization
+        join public.projects project on project.organization_id = organization.id
+       where project.id in (select project_id from target_project_ids)
+    ), '[]'::jsonb),
+    'organization_admins', coalesce((
+      select jsonb_agg(to_jsonb(administrator))
+        from public.organization_admins administrator
+        join public.projects project on project.organization_id = administrator.organization_id
+       where project.id in (select project_id from target_project_ids)
+    ), '[]'::jsonb),
+    'projects', coalesce((
+      select jsonb_agg(to_jsonb(project))
+        from public.projects project
+       where project.id in (select project_id from target_project_ids)
+    ), '[]'::jsonb),
+    'members', coalesce((
+      select jsonb_agg(to_jsonb(member))
+        from public.members member
+       where member.id in (select member_id from target_member_ids)
+    ), '[]'::jsonb),
+    'project_members', coalesce((
+      select jsonb_agg(to_jsonb(membership))
+        from public.project_members membership
+       where membership.project_id in (select project_id from target_project_ids)
+         and membership.member_id in (select member_id from target_member_ids)
+    ), '[]'::jsonb),
+    'tickets', coalesce((select jsonb_agg(to_jsonb(ticket)) from due_tickets ticket), '[]'::jsonb),
+    'ticket_assignees', coalesce((
+      select jsonb_agg(to_jsonb(assignment))
+        from public.ticket_assignees assignment
+        join due_tickets ticket on ticket.project_id = assignment.project_id and ticket.id = assignment.ticket_id
+    ), '[]'::jsonb),
+    'meeting_notes', coalesce((
+      select jsonb_agg(to_jsonb(note))
+        from public.meeting_notes note
+       where note.id in (select note_id from target_note_ids)
+    ), '[]'::jsonb),
+    'meeting_note_participants', coalesce((
+      select jsonb_agg(to_jsonb(participant))
+        from public.meeting_note_participants participant
+       where participant.note_id in (select note_id from target_note_ids)
+    ), '[]'::jsonb),
+    'meeting_note_tasks', coalesce((select jsonb_agg(to_jsonb(task)) from due_tasks task), '[]'::jsonb)
+  )
+$$;
+
+create or replace function public.acquire_worker_lease(
+  lease_name text,
+  owner_token text,
+  lease_seconds integer default 900
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  claimed integer;
+begin
+  if coalesce(lease_name, '') = '' or coalesce(owner_token, '') = '' then
+    return false;
+  end if;
+  insert into public.worker_leases (name, owner_token, expires_at)
+  values (lease_name, owner_token, now() + make_interval(secs => least(1800, greatest(60, coalesce(lease_seconds, 900)))))
+  on conflict (name) do update
+    set owner_token = excluded.owner_token,
+        expires_at = excluded.expires_at
+    where public.worker_leases.expires_at <= now();
+  get diagnostics claimed = row_count;
+  return claimed = 1;
+end
+$$;
+
+create or replace function public.release_worker_lease(lease_name text, owner_token text)
+returns void
+language sql
+security definer
+set search_path = pg_catalog, public
+as $$
+  delete from public.worker_leases where name = $1 and owner_token = $2
 $$;
 
 create or replace function public.apply_workspace_changes(changes jsonb)
@@ -751,13 +1346,23 @@ $$;
 
 revoke all on function public.load_workspace_state() from public, anon, authenticated;
 revoke all on function public.load_authorized_workspace(text, text, integer, integer) from public, anon, authenticated;
+revoke all on function public.load_authorized_collection(text, text, text, text, text, integer, integer, text) from public, anon, authenticated;
 revoke all on function public.lookup_login_state(text, text) from public, anon, authenticated;
 revoke all on function public.workspace_member_count() from public, anon, authenticated;
+revoke all on function public.load_public_flow_state(text, text, text, text) from public, anon, authenticated;
+revoke all on function public.load_reminder_state() from public, anon, authenticated;
+revoke all on function public.acquire_worker_lease(text, text, integer) from public, anon, authenticated;
+revoke all on function public.release_worker_lease(text, text) from public, anon, authenticated;
 revoke all on function public.apply_workspace_changes(jsonb) from public, anon, authenticated;
 grant execute on function public.load_workspace_state() to service_role;
 grant execute on function public.load_authorized_workspace(text, text, integer, integer) to service_role;
+grant execute on function public.load_authorized_collection(text, text, text, text, text, integer, integer, text) to service_role;
 grant execute on function public.lookup_login_state(text, text) to service_role;
 grant execute on function public.workspace_member_count() to service_role;
+grant execute on function public.load_public_flow_state(text, text, text, text) to service_role;
+grant execute on function public.load_reminder_state() to service_role;
+grant execute on function public.acquire_worker_lease(text, text, integer) to service_role;
+grant execute on function public.release_worker_lease(text, text) to service_role;
 grant execute on function public.apply_workspace_changes(jsonb) to service_role;
 
 insert into storage.buckets (id, name, public)
