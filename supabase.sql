@@ -39,43 +39,8 @@ create table if not exists public.member_sessions (
   primary key (member_id, token)
 );
 create index if not exists member_sessions_expiry_idx on public.member_sessions (expires_at);
-
-create or replace function public.lock_member_session_writes()
-returns trigger
-language plpgsql
-security definer
-set search_path = pg_catalog, public
-as $$
-declare
-  lock_ids bigint[];
-  lock_id bigint;
-begin
-  select coalesce(array_agg(session_lock_id order by session_lock_id), array[]::bigint[])
-    into lock_ids
-    from (
-      select distinct hashtextextended('member_sessions_member:' || member_id, 0) as session_lock_id
-        from unnest(array[
-          case when tg_op <> 'INSERT' then old.member_id end,
-          case when tg_op <> 'DELETE' then new.member_id end
-        ]) as changed_members(member_id)
-       where member_id is not null
-    ) member_locks;
-
-  foreach lock_id in array lock_ids loop
-    perform pg_advisory_xact_lock(lock_id);
-  end loop;
-
-  if tg_op = 'DELETE' then
-    return old;
-  end if;
-  return new;
-end
-$$;
-
 drop trigger if exists member_sessions_member_lock on public.member_sessions;
-create trigger member_sessions_member_lock
-before insert or update or delete on public.member_sessions
-for each row execute function public.lock_member_session_writes();
+drop function if exists public.lock_member_session_writes();
 
 create table if not exists public.organization_admins (
   organization_id text not null references public.organizations(id) on delete cascade,
@@ -1285,7 +1250,9 @@ as $$
 declare
   next_position integer;
 begin
-  perform pg_advisory_xact_lock(hashtextextended('member_sessions_member:' || target_member_id, 0));
+  if not pg_try_advisory_xact_lock(hashtextextended('member_sessions_member:' || target_member_id, 0)) then
+    raise exception using errcode = '55P03', message = 'Member session update is busy; retry shortly.';
+  end if;
   if not exists (
     select 1 from public.members
      where id = target_member_id and status <> 'disabled'
@@ -1364,7 +1331,9 @@ begin
            where session_row.row_value->>'member_id' is not null
         ) member_locks;
       foreach lock_id in array lock_ids loop
-        perform pg_advisory_xact_lock(lock_id);
+        if not pg_try_advisory_xact_lock(lock_id) then
+          raise exception using errcode = '55P03', message = 'Member session update is busy; retry shortly.';
+        end if;
       end loop;
     end if;
     execute format(
@@ -1480,7 +1449,7 @@ revoke all on function public.load_public_flow_state(text, text, text, text) fro
 revoke all on function public.load_reminder_state() from public, anon, authenticated;
 revoke all on function public.acquire_worker_lease(text, text, integer) from public, anon, authenticated;
 revoke all on function public.release_worker_lease(text, text) from public, anon, authenticated;
-revoke all on function public.lock_member_session_writes() from public, anon, authenticated;
+drop function if exists public.lock_member_session_writes();
 revoke all on function public.create_member_session(text, text, numeric) from public, anon, authenticated;
 revoke all on function public.apply_workspace_changes(jsonb) from public, anon, authenticated;
 grant execute on function public.load_workspace_state() to service_role;
@@ -1492,7 +1461,6 @@ grant execute on function public.load_public_flow_state(text, text, text, text) 
 grant execute on function public.load_reminder_state() to service_role;
 grant execute on function public.acquire_worker_lease(text, text, integer) to service_role;
 grant execute on function public.release_worker_lease(text, text) to service_role;
-grant execute on function public.lock_member_session_writes() to service_role;
 grant execute on function public.create_member_session(text, text, numeric) to service_role;
 grant execute on function public.apply_workspace_changes(jsonb) to service_role;
 

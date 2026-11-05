@@ -241,7 +241,14 @@ async function h(req, p, m) {
     return J({ key: sessionToken });
   }
   if (remote && !key && r === "db" && m === "GET") {
-    const memberCount = await getWorkspaceMemberCount();
+    let memberCount;
+    try {
+      memberCount = await getWorkspaceMemberCount();
+    } catch (error) {
+      if (!/"code"\s*:\s*"PGRST002"/.test(String(error?.message || error))) throw error;
+      console.warn("Supabase schema cache is temporarily unavailable; showing sign-in while it recovers.");
+      return J({ loginRequired: true });
+    }
     if (memberCount > 0) return J({ loginRequired: true });
     if (!process.env.ADMIN_EMAIL || !pwOk(process.env.ADMIN_PASSWORD)) return J({ setup: true });
   }

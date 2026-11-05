@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { createMemberSession, diffTables, fromTables, hasNormalizedData, saveNormalizedState, toTables } = require("../lib/normalized-store.cjs");
+const { createMemberSession, diffTables, fromTables, hasNormalizedData, loadWorkspaceMemberCount, saveNormalizedState, toTables } = require("../lib/normalized-store.cjs");
 
 const sampleWorkspace = () => ({
   organizations: [{ id: "org-1", name: "Example", adminIds: ["member-1"] }],
@@ -141,6 +141,42 @@ test("login session creation uses the targeted RPC and preserves the 30-day expi
       session_token: token,
       session_expires_at: Number(token.split(".")[1]) + 30 * 24 * 60 * 60 * 1000,
     });
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("login session creation retries transient member lock contention", async () => {
+  const originalFetch = global.fetch;
+  let attempts = 0;
+  global.fetch = async () => {
+    attempts += 1;
+    return attempts < 3
+      ? new Response(JSON.stringify({ code: "55P03", message: "Member session update is busy; retry shortly." }), { status: 500 })
+      : new Response(null, { status: 204 });
+  };
+
+  try {
+    await createMemberSession("https://example.supabase.co", "service-key", "member-1", `session.${Date.now()}`);
+    assert.equal(attempts, 3);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("workspace member count retries only transient PostgREST schema cache errors", async () => {
+  const originalFetch = global.fetch;
+  let attempts = 0;
+  global.fetch = async () => {
+    attempts += 1;
+    return attempts < 3
+      ? new Response(JSON.stringify({ code: "PGRST002", message: "Could not query the database for the schema cache. Retrying." }), { status: 503 })
+      : new Response("2", { status: 200 });
+  };
+
+  try {
+    assert.equal(await loadWorkspaceMemberCount("https://example.supabase.co", "service-key"), 2);
+    assert.equal(attempts, 3);
   } finally {
     global.fetch = originalFetch;
   }
