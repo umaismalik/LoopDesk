@@ -271,3 +271,11 @@ test("legacy calendar connections migrate only when their admin has one organiza
   const ambiguous = fromTables(toTables(legacy));
   assert.deepEqual(ambiguous.googleCalendars, {});
 });
+
+test("workspace write locks build text keys without jsonb operator precedence bugs", () => {
+  const sql = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "supabase.sql"), "utf8");
+  // `'literal' || row->>'key'` parses as `('literal' || row)->>'key'`, casting the literal to jsonb.
+  assert.doesNotMatch(sql, /'[^']*'\s*\|\|\s*[\w.]+->>/);
+  // A subquery column named like the plpgsql variable `lock_id` is ambiguous at runtime.
+  assert.doesNotMatch(sql, /array_agg\(lock_id order by lock_id\)\s*,\s*array\[\]::bigint\[\]\)\s*into lock_ids/);
+});

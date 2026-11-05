@@ -1323,10 +1323,10 @@ begin
       || coalesce(changes #> array['expected', table_name], '[]'::jsonb)
       || coalesce(changes #> array['absent', table_name], '[]'::jsonb);
     if table_name = 'member_sessions' then
-      select coalesce(array_agg(lock_id order by lock_id), array[]::bigint[])
+      select coalesce(array_agg(member_locks.session_lock_id order by member_locks.session_lock_id), array[]::bigint[])
         into lock_ids
         from (
-          select distinct hashtextextended('member_sessions_member:' || session_row.row_value->>'member_id', 0) as lock_id
+          select distinct hashtextextended('member_sessions_member:' || (session_row.row_value->>'member_id'), 0) as session_lock_id
             from jsonb_array_elements(key_rows) as session_row(row_value)
            where session_row.row_value->>'member_id' is not null
         ) member_locks;
