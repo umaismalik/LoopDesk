@@ -98,16 +98,18 @@ function ThinMeter({ label, done, total }) {
 function TrendChart({ months, series }) {
   const [ref, width] = useElementWidth();
   const [hover, setHover] = useState(null);
-  const height = 220, left = 34, right = 92, top = 14, bottom = 28;
-  const plotW = Math.max(120, width - left - right), plotH = height - top - bottom;
+  // On narrow cards the end labels would squeeze the plot, so they move out (the legend still names both lines).
+  const roomy = width >= 440;
+  const height = width && width < 360 ? 190 : 220, left = 30, right = roomy ? 92 : 14, top = 14, bottom = 28;
+  const plotW = Math.max(60, width - left - right), plotH = height - top - bottom;
   const { max, ticks } = niceScale(Math.max(1, ...series.flatMap((s) => s.values)));
   const x = (i) => left + (months.length < 2 ? plotW / 2 : (i / (months.length - 1)) * plotW);
   const y = (v) => top + plotH - (v / max) * plotH;
   const ends = series.map((s) => ({ ...s, end: y(s.values[s.values.length - 1] || 0) }));
-  const endLabelsFit = ends.length < 2 || Math.abs(ends[0].end - ends[1].end) >= 16;
+  const endLabelsFit = roomy && (ends.length < 2 || Math.abs(ends[0].end - ends[1].end) >= 16);
   return (
     <div className="dash-trend" ref={ref}>
-      {width > 0 && <svg width={width} height={height} role="img" aria-label="Tickets raised and completed per month">
+      {width > 0 && <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Tickets raised and completed per month">
         {ticks.map((t) => <g key={t}>
           <line x1={left} x2={left + plotW} y1={y(t)} y2={y(t)} className="dash-grid" />
           <text x={left - 8} y={y(t) + 4} textAnchor="end" className="dash-axis">{t}</text>
@@ -122,7 +124,7 @@ function TrendChart({ months, series }) {
         {months.map((m, i) => <rect key={m} x={x(i) - plotW / Math.max(1, months.length - 1) / 2} y={top} width={plotW / Math.max(1, months.length - 1)} height={plotH}
           fill="transparent" onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)} />)}
       </svg>}
-      {hover !== null && <div className="dash-tip floating" style={{ left: Math.min(Math.max(x(hover), 70), width - 70), top: 6 }} role="tooltip">
+      {hover !== null && <div className="dash-tip floating" style={{ left: Math.max(76, Math.min(x(hover), width - 76)), top: 6 }} role="tooltip">
         <b>{new Date(`${months[hover]}-01T00:00:00`).toLocaleDateString("en-GB", { month: "long", year: "numeric" })}</b>
         {series.map((s) => <span key={s.key}><i style={{ background: s.color }} />{s.label}<em>{s.values[hover]}</em></span>)}
       </div>}

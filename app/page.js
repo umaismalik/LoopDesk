@@ -192,6 +192,7 @@ export default function Page() {
   const [inv, setInv] = useState(null);
   const [invPassword, setInvPassword] = useState("");
   const [view, setView] = useState("all");
+  const [navOpen, setNavOpen] = useState(false);
   const [q, setQ] = useState(""), [fs, setFs] = useState(""), [fp, setFp] = useState(""), [fm, setFm] = useState("");
   const [modal, setModal] = useState(null);
   const [detail, setDetail] = useState(null);
@@ -1001,8 +1002,9 @@ export default function Page() {
   const calendarStart = new Date(firstOfMonth); calendarStart.setDate(firstOfMonth.getDate() - ((firstOfMonth.getDay() + 6) % 7));
   const calendarDates = Array.from({ length: 42 }, (_, i) => { const date = new Date(calendarStart); date.setDate(calendarStart.getDate() + i); return date; });
   return (
-    <div className="app">
-      <aside className="side">
+    <div className={"app" + (navOpen ? " nav-open" : "")}>
+      <div className="side-scrim" onClick={() => setNavOpen(false)} aria-hidden="true" />
+      <aside className="side" onClick={(e) => { if (e.target.closest(".nav")) setNavOpen(false); }}>
         <div className="brand"><span className="brand-mark"><img src="/loopdesk-mark.svg" alt="" /></span><div><b>LoopDesk</b><small>Team &amp; project management</small></div></div>
         <div className="project-picker">
           <label htmlFor="organization-select">COMPANY</label>
@@ -1036,6 +1038,13 @@ export default function Page() {
         <button className="nav ghost" onClick={async () => { await api("logout", {}, key); localStorage.removeItem("rw-key"); location.reload(); }}>Sign out</button>
       </aside>
       <main className="main">
+        <div className="mobile-bar">
+          <button type="button" className="menu-btn" aria-label="Open menu" aria-expanded={navOpen} onClick={() => setNavOpen(true)}>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+          </button>
+          <span className="brand-mark"><img src="/loopdesk-mark.svg" alt="" /></span><b>LoopDesk</b>
+          <span className="mobile-view">{activeProject?.name}</span>
+        </div>
         <header className="top">
           <div><h1>{{ all: "Support Dashboard", issue: "Issues Log", feature: "Features Log", team: "Team & Roles", meetings: "Meeting Calendar", "meeting-notes": "Meeting Notes & Tasks", activity: "Activity Log", files: "Attachments", account: "My Account", portal: "My Tickets" }[view]}</h1><p><b>{activeOrganization?.name}</b> · <b>{activeProject?.name}</b> · Signed in as <b>{me.name}</b> <span className={"pill r" + me.role}>{me.role}</span></p></div>
           {!["team", "activity", "files", "account", "meetings", "meeting-notes"].includes(view) && <div className="acts"><button className="btn alt" onClick={() => setModal(blank("feature"))}>+ New Feature</button><button className="btn" onClick={() => setModal(blank("issue"))}>+ New Issue</button></div>}
