@@ -151,6 +151,92 @@ function Assign({ t, members, can, onChange }) {
   </div>);
 }
 
+const BELL = "M18 8a6 6 0 10-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 01-3.46 0";
+const UPLOAD = "M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12";
+const LINK = "M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71";
+const toMs = (v) => (typeof v === "number" ? v : Date.parse(v || "")) || 0;
+const timeAgo = (v) => {
+  const ms = toMs(v);
+  if (!ms) return "";
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + " min ago";
+  if (s < 86400) return Math.floor(s / 3600) + " h ago";
+  return new Date(ms).toLocaleDateString("en-GB", { day: "2-digit", month: "short" });
+};
+
+// Top-right notification bell. Admins see pending meeting-edit requests and approve/deny them here;
+// other members see the outcome of their own requests. The bell shakes whenever the unread count rises.
+function NotificationBell({ requests, isAdmin, meId, notice, onReview }) {
+  const [open, setOpen] = useState(false);
+  const [ring, setRing] = useState(false);
+  const [seen, setSeen] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("rw-seen-notifications") || "[]"); } catch { return []; }
+  });
+  const ref = useRef(null);
+  const items = useMemo(() => [...requests]
+    .filter((r) => isAdmin ? r.status === "pending" : r.memberId === meId)
+    .sort((a, b) => toMs(b.reviewedAt || b.requestedAt) - toMs(a.reviewedAt || a.requestedAt))
+    .slice(0, 20), [requests, isAdmin, meId]);
+  const tag = (r) => r.id + ":" + r.status;
+  const unread = isAdmin ? items.length : items.filter((r) => r.status !== "pending" && !seen.includes(tag(r))).length;
+  const previous = useRef(unread);
+  useEffect(() => {
+    if (unread > previous.current) {
+      setRing(true);
+      try { navigator.vibrate?.(180); } catch {}
+      const t = setTimeout(() => setRing(false), 1200);
+      previous.current = unread;
+      return () => clearTimeout(t);
+    }
+    previous.current = unread;
+  }, [unread]);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e) => { if (e.type === "keydown" ? e.key === "Escape" : !ref.current?.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", close);
+    return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", close); };
+  }, [open]);
+  const toggle = () => {
+    setOpen((o) => !o);
+    if (!isAdmin && unread) {
+      const next = [...new Set([...seen, ...items.map(tag)])].slice(-200);
+      setSeen(next);
+      try { localStorage.setItem("rw-seen-notifications", JSON.stringify(next)); } catch {}
+    }
+  };
+  const statusText = { pending: "Waiting for an admin", approved: "Approved · edit access for 1 hour", denied: "Denied by an admin" };
+  return (
+    <div className="bell" ref={ref}>
+      <button type="button" className={"bell-btn" + (ring ? " ring" : "") + (unread ? " has" : "")} aria-label={`Notifications${unread ? `, ${unread} new` : ""}`} aria-expanded={open} onClick={toggle}>
+        <Ic d={BELL} />
+        {unread > 0 && <span className="bell-count">{unread > 9 ? "9+" : unread}</span>}
+      </button>
+      {open && <div className="bell-panel" role="dialog" aria-label="Notifications">
+        <div className="bell-head"><b>Notifications</b><span>{isAdmin ? `${items.length} pending` : "Meeting edit access"}</span></div>
+        {notice && <div className="bell-notice" role="status">{notice}</div>}
+        <div className="bell-list">
+          {items.map((r) => (
+            <article key={r.id} className={"bell-item " + r.status}>
+              <span className="bell-avatar">{(r.memberName || "?").split(/\s+/).map((p) => p[0]).join("").slice(0, 2).toUpperCase()}</span>
+              <div className="bell-body">
+                <p>{isAdmin ? <><b>{r.memberName}</b> asked for one-hour edit access to meeting cards and notes.</> : <>Your request for meeting edit access: <b>{r.status}</b></>}</p>
+                <small>{isAdmin ? timeAgo(r.requestedAt) : `${statusText[r.status] || r.status} · ${timeAgo(r.reviewedAt || r.requestedAt)}`}</small>
+                {isAdmin && <div className="bell-actions">
+                  <button type="button" className="btn" onClick={() => onReview(r.id, "approve")}>Approve 1 hour</button>
+                  <button type="button" className="btn alt" onClick={() => onReview(r.id, "deny")}>Deny</button>
+                </div>}
+              </div>
+            </article>
+          ))}
+          {!items.length && <div className="bell-empty"><Ic d={BELL} /><b>You're all caught up</b><span>{isAdmin ? "No pending meeting edit requests." : "No notifications yet."}</span></div>}
+        </div>
+      </div>}
+    </div>
+  );
+}
+
 export default function Page() {
   const [screen, setScreen] = useState("loading");
   const [key, setKey] = useState("");
@@ -193,6 +279,8 @@ export default function Page() {
   const [invPassword, setInvPassword] = useState("");
   const [view, setView] = useState("all");
   const [navOpen, setNavOpen] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [q, setQ] = useState(""), [fs, setFs] = useState(""), [fp, setFp] = useState(""), [fm, setFm] = useState("");
   const [modal, setModal] = useState(null);
   const [detail, setDetail] = useState(null);
@@ -339,13 +427,15 @@ export default function Page() {
     return () => clearInterval(timer);
   }, [meetingEditRequests, me, key, projectId, meetingMonth]);
   useEffect(() => {
-    if (me?.role !== "Admin" || view !== "all" || !key || !projectId) return;
+    // Admins get new access requests in the header bell on every page, not only on the dashboard.
+    if (me?.role !== "Admin" || !key || !projectId) return;
     const timer = setInterval(async () => {
+      if (document.hidden) return;
       const result = await api("meeting-notes?month=" + monthKey(meetingMonth), null, key, projectId);
       if (result.ok) setMeetingEditRequests(result.requests || []);
-    }, 30000);
+    }, 20000);
     return () => clearInterval(timer);
-  }, [me, view, key, projectId, meetingMonth]);
+  }, [me, key, projectId, meetingMonth]);
   useEffect(() => {
     if (view !== "meetings" || !key || !projectId) return;
     let cancelled = false;
@@ -520,12 +610,20 @@ export default function Page() {
     const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" })); a.download = projectSlug + "-tickets.csv"; a.click();
   };
   const dt = tickets.find((t) => t.id === detail);
-  const uploadFile = async (e) => {
-    const f = e.target.files[0]; if (!f) return;
-    const fd = new FormData(); fd.append("file", f); fd.append("cat", CATS[fc]);
-    const r = await api("upload", fd, key, projectId);
-    if (!r.ok) alert(r.error || "Upload failed");
-    e.target.value = ""; await load(key); await loadFilePage(fileOffset);
+  // Used by both the file picker and drag-and-drop on the Attachments page.
+  const uploadOne = async (f) => {
+    setUploading(true);
+    try {
+      const fd = new FormData(); fd.append("file", f); fd.append("cat", CATS[fc]);
+      const r = await api("upload", fd, key, projectId);
+      if (!r.ok) alert(r.error || "Upload failed");
+      await load(key); await loadFilePage(fileOffset);
+    } finally { setUploading(false); }
+  };
+  const uploadFile = (e) => {
+    const f = e.target.files[0];
+    e.target.value = "";
+    if (f) uploadOne(f);
   };
   const saveAcct = async (e, pw) => {
     e.preventDefault(); setAmsg("");
@@ -1047,19 +1145,11 @@ export default function Page() {
         </div>
         <header className="top">
           <div><h1>{{ all: "Support Dashboard", issue: "Issues Log", feature: "Features Log", team: "Team & Roles", meetings: "Meeting Calendar", "meeting-notes": "Meeting Notes & Tasks", activity: "Activity Log", files: "Attachments", account: "My Account", portal: "My Tickets" }[view]}</h1><p><b>{activeOrganization?.name}</b> · <b>{activeProject?.name}</b> · Signed in as <b>{me.name}</b> <span className={"pill r" + me.role}>{me.role}</span></p></div>
-          {!["team", "activity", "files", "account", "meetings", "meeting-notes"].includes(view) && <div className="acts"><button className="btn alt" onClick={() => setModal(blank("feature"))}>+ New Feature</button><button className="btn" onClick={() => setModal(blank("issue"))}>+ New Issue</button></div>}
+          <div className="top-actions">
+            {!["team", "activity", "files", "account", "meetings", "meeting-notes"].includes(view) && <div className="acts"><button className="btn alt" onClick={() => setModal(blank("feature"))}>+ New Feature</button><button className="btn" onClick={() => setModal(blank("issue"))}>+ New Issue</button></div>}
+            {!client && <NotificationBell requests={meetingEditRequests.filter((item) => item.projectId === projectId)} isAdmin={!!admin} meId={me.id} notice={dashboardNotice} onReview={reviewMeetingEditRequest} />}
+          </div>
         </header>
-
-        {view === "all" && admin && <section className="panel dashboard-access-notifications">
-          <div className="dashboard-access-heading"><div><h2>Meeting edit approvals</h2><p>Temporary edit access requests for this project.</p></div><span>{meetingEditRequests.filter((item) => item.projectId === projectId && item.status === "pending").length} pending</span></div>
-          {dashboardNotice && <div className="meeting-success" role="status">{dashboardNotice}</div>}
-          {meetingEditRequests.filter((item) => item.projectId === projectId && item.status === "pending").length
-            ? meetingEditRequests.filter((item) => item.projectId === projectId && item.status === "pending").map((item) => <article key={item.id}>
-              <div><b>{item.memberName}</b><span>Requested {new Date(item.requestedAt).toLocaleString()} · meeting cards and notes · 1 hour</span></div>
-              <div><button type="button" className="btn" onClick={() => reviewMeetingEditRequest(item.id, "approve")}>Approve 1 hour</button><button type="button" className="btn alt" onClick={() => reviewMeetingEditRequest(item.id, "deny")}>Deny</button></div>
-            </article>)
-            : <p className="meeting-empty">No pending meeting edit requests.</p>}
-        </section>}
 
         {view === "meetings" ? (<section className="meeting-page">
           {!meetingSelected && <>
@@ -1286,14 +1376,29 @@ export default function Page() {
               <div className="acts end"><button className="btn">Change password</button></div></form>
             <div className="acts"><button className="btn alt" onClick={async () => { if (confirm("Sign out of all devices?")) { await api("logoutall", {}, key); localStorage.removeItem("rw-key"); location.reload(); } }}>Sign out of all devices</button></div>
             {amsg && <p className="err">{amsg}</p>}</div>
-        </section>) : view === "files" ? (<section className="panel">
-          <div className="subtabs">{CATS.map((c, i) => (<button key={c} className={"tab " + (fc === i ? "on" : "")} onClick={() => setFc(i)}>{c}<em>{files.filter((x) => x.cat === c).length}</em></button>))}</div>
-          <div className="tools up"><input type="file" onChange={uploadFile} /><span className="note">Uploads go to: <b>{CATS[fc]}</b></span></div>
-          <div className="tools up"><input placeholder="Or add a document link (Google Drive, Docs...)" value={lk.url} onChange={(e) => setLk({ ...lk, url: e.target.value })} /><input placeholder="Name (optional)" value={lk.name} onChange={(e) => setLk({ ...lk, name: e.target.value })} /><button className="btn alt" onClick={addLink}>Add link</button></div>
-          <div className="wrap"><table className="tm"><thead><tr><th>File</th><th>Size</th><th>Uploaded by</th><th>Date</th><th>Ticket</th><th></th></tr></thead><tbody>
-            {files.filter((x) => x.cat === CATS[fc]).map((a) => (<tr key={a.id}><td className="tt">{a.url ? <a className="fl" href={fh(a)} target="_blank" rel="noreferrer"><Ic d={CLIP} /> {a.name}</a> : <button type="button" className="fl" onClick={() => openFile(a)}><Ic d={CLIP} /> {a.name}</button>}</td><td className="nw">{a.url ? "Link" : Math.ceil(a.size / 1024) + " KB"}</td><td>{a.by}</td><td className="nw">{fmt(a.at)}</td><td className="nw">{a.ticket || "-"}</td>
-              <td className="ra">{a.url ? <a className="ic" href={fh(a)} target="_blank" rel="noreferrer">Open link</a> : <button type="button" className="ic" onClick={() => openFile(a)}>Download</button>}{canDeleteFiles && <button type="button" className="ic dl" onClick={() => confirm("Delete " + a.name + "?") && adm("filedel", { id: a.id })}><Ic d={TRASH} /></button>}</td></tr>))}
-            {!files.some((x) => x.cat === CATS[fc]) && <tr><td colSpan="6" className="empty">No files in this category yet.</td></tr>}</tbody></table></div>
+        </section>) : view === "files" ? (<section className="panel files-page">
+          <div className="subtabs" role="tablist">{CATS.map((c, i) => (<button key={c} role="tab" aria-selected={fc === i} className={"tab " + (fc === i ? "on" : "")} onClick={() => setFc(i)}>{c}<em>{files.filter((x) => x.cat === c).length}</em></button>))}</div>
+          <div className="files-add">
+            <label className={"files-drop" + (dragOver ? " over" : "") + (uploading ? " busy" : "")}
+              onDragOver={(e) => { e.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)}
+              onDrop={(e) => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files?.[0]; if (f) uploadOne(f); }}>
+              <input type="file" className="sr-only" disabled={uploading} onChange={uploadFile} />
+              <span className="files-drop-icon"><Ic d={UPLOAD} /></span>
+              <span className="files-drop-text"><b>{uploading ? "Uploading…" : <>Click to upload <span>or drag a file here</span></>}</b><small>Saved to <strong>{CATS[fc]}</strong></small></span>
+            </label>
+            <form className="files-link" onSubmit={(e) => { e.preventDefault(); addLink(); }}>
+              <div className="files-link-head"><span className="files-drop-icon small"><Ic d={LINK} /></span><div><b>Add a document link</b><small>Google Drive, Docs, Figma, Notion…</small></div></div>
+              <div className="files-link-fields">
+                <input type="url" required placeholder="https://…" aria-label="Document link" value={lk.url} onChange={(e) => setLk({ ...lk, url: e.target.value })} />
+                <input placeholder="Name (optional)" aria-label="Link name" value={lk.name} onChange={(e) => setLk({ ...lk, name: e.target.value })} />
+                <button className="btn">Add link</button>
+              </div>
+            </form>
+          </div>
+          {files.some((x) => x.cat === CATS[fc]) ? <div className="wrap files-wrap"><table className="tm files-table"><thead><tr><th>File</th><th>Size</th><th>Uploaded by</th><th>Date</th><th>Ticket</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>
+            {files.filter((x) => x.cat === CATS[fc]).map((a) => (<tr key={a.id}><td className="tt files-name">{a.url ? <a className="fl" href={fh(a)} target="_blank" rel="noreferrer"><Ic d={a.url ? LINK : CLIP} /> <span>{a.name}</span></a> : <button type="button" className="fl" onClick={() => openFile(a)}><Ic d={CLIP} /> <span>{a.name}</span></button>}</td><td className="nw" data-label="Size">{a.url ? "Link" : Math.ceil(a.size / 1024) + " KB"}</td><td data-label="Uploaded by">{a.by}</td><td className="nw" data-label="Date">{fmt(a.at)}</td><td className="nw" data-label="Ticket">{a.ticket || "-"}</td>
+              <td className="ra files-actions">{a.url ? <a className="ic" href={fh(a)} target="_blank" rel="noreferrer">Open link</a> : <button type="button" className="ic" onClick={() => openFile(a)}>Download</button>}{canDeleteFiles && <button type="button" className="ic dl" aria-label={"Delete " + a.name} onClick={() => confirm("Delete " + a.name + "?") && adm("filedel", { id: a.id })}><Ic d={TRASH} /></button>}</td></tr>))}
+            </tbody></table></div> : <div className="files-empty"><span className="files-drop-icon"><Ic d={CLIP} /></span><b>No files in {CATS[fc]} yet</b><span>Upload a file or add a link above. Ticket attachments appear here too.</span></div>}
           <div className="tools"><span className="note">Showing {files.length ? fileOffset + 1 : 0}–{fileOffset + files.length} of {fileTotal} files</span><button className="btn alt" disabled={!fileOffset || fileLoading} onClick={() => loadFilePage(Math.max(0, fileOffset - 100))}>Previous</button><button className="btn alt" disabled={!fileHasMore || fileLoading} onClick={() => loadFilePage(fileOffset + 100)}>{fileLoading ? "Loading…" : "Next"}</button></div>
         </section>) : view === "activity" ? (<section className="panel"><div className="wrap"><table className="tm"><thead><tr><th>Time</th><th>User</th><th>Action</th><th>Details</th></tr></thead><tbody>
           {audit.map((a, i) => (<tr key={i}><td className="nw">{new Date(a.at).toLocaleString("en-GB")}</td><td>{a.who}</td><td className="tt">{a.act}</td><td>

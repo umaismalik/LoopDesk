@@ -613,3 +613,141 @@ label .ms .msb{max-width:none;min-height:38px}
   .top .acts{flex-direction:column}
 }
 @media(min-width:901px){.menu-btn{display:none}}
+
+/* ==========================================================================
+   Header actions + notification bell
+   ========================================================================== */
+.top-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end;margin-left:auto}
+.bell{position:relative;flex:none}
+.bell-btn{position:relative;display:grid;place-items:center;width:42px;height:42px;border:1px solid var(--line-2);border-radius:12px;background:#fff;color:var(--ink-2);cursor:pointer;box-shadow:var(--shadow-sm);transition:background .15s,color .15s,border-color .15s,transform .15s}
+.bell-btn:hover{background:var(--pri-soft);color:var(--pri);border-color:#c7d2fe;transform:translateY(-1px)}
+.bell-btn svg{width:20px;height:20px}
+.bell-btn.has{color:var(--pri)}
+.bell-btn.ring svg{animation:bell-ring 1s ease-in-out;transform-origin:50% 2px}
+.bell-btn.ring{animation:bell-pulse 1s ease-out}
+.bell-count{position:absolute;top:-6px;right:-6px;min-width:20px;height:20px;padding:0 5px;border-radius:10px;background:linear-gradient(135deg,#ef4444,#f97316);color:#fff;font-size:11px;font-weight:700;line-height:16px;text-align:center;border:2px solid #fff;animation:pop-in .3s cubic-bezier(.34,1.56,.64,1)}
+@keyframes bell-ring{0%,100%{transform:rotate(0)}10%{transform:rotate(16deg)}20%{transform:rotate(-14deg)}30%{transform:rotate(12deg)}40%{transform:rotate(-10deg)}50%{transform:rotate(7deg)}60%{transform:rotate(-5deg)}70%{transform:rotate(3deg)}80%{transform:rotate(-1deg)}}
+@keyframes bell-pulse{0%{box-shadow:0 0 0 0 rgba(99,102,241,.45)}100%{box-shadow:0 0 0 14px rgba(99,102,241,0)}}
+.bell-panel{position:absolute;right:0;top:calc(100% + 10px);z-index:55;width:min(380px,calc(100vw - 24px));max-height:min(480px,70vh);display:flex;flex-direction:column;background:#fff;border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow-lg);overflow:hidden;transform-origin:top right;animation:drop-in .18s ease-out}
+.bell-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line);background:linear-gradient(120deg,#f5f6ff,#fff)}
+.bell-head b{font-family:var(--font-display);font-size:15px}
+.bell-head span{color:var(--mut);font-size:12px;font-weight:600}
+.bell-notice{margin:10px 12px 0;padding:8px 10px;border-radius:8px;background:var(--ok-soft);color:#065f46;font-size:12.5px;border:1px solid #a7f3d0}
+.bell-list{overflow:auto;padding:6px}
+.bell-item{display:flex;gap:10px;padding:10px;border-radius:12px;transition:background .15s;animation:fade-up .25s ease-out backwards}
+.bell-item:hover{background:var(--card-2)}
+.bell-item+.bell-item{border-top:1px solid #f0f2f7}
+.bell-avatar{flex:none;display:grid;place-items:center;width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,var(--pri),var(--pri-2));color:#fff;font-size:12px;font-weight:700}
+.bell-item.approved .bell-avatar{background:linear-gradient(135deg,#059669,#34d399)}
+.bell-item.denied .bell-avatar{background:linear-gradient(135deg,#dc2626,#f87171)}
+.bell-body{min-width:0;flex:1;display:grid;gap:4px}
+.bell-body p{font-size:13px;line-height:1.45;color:var(--ink-2);overflow-wrap:anywhere}
+.bell-body small{color:var(--mut);font-size:11.5px}
+.bell-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
+.bell-actions .btn{min-height:32px;padding:6px 12px;font-size:12.5px;flex:1 1 auto}
+.bell-empty{display:grid;justify-items:center;gap:4px;padding:28px 16px;text-align:center;color:var(--mut)}
+.bell-empty svg{width:28px;height:28px;color:#c7d2fe;margin-bottom:4px}
+.bell-empty b{color:var(--ink-2);font-size:14px}
+.bell-empty span{font-size:12.5px}
+
+/* ==========================================================================
+   Attachments
+   ========================================================================== */
+.files-page{display:grid;grid-template-columns:minmax(0,1fr);gap:16px}
+.files-page .subtabs{margin-bottom:0}
+.files-add{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.25fr);gap:14px}
+.files-drop{position:relative;display:flex;flex-direction:row;align-items:center;gap:14px;min-height:112px;padding:18px 20px;border:2px dashed #c7cff0;border-radius:14px;background:linear-gradient(135deg,#f7f8ff,#fff);color:var(--ink-2);cursor:pointer;transition:border-color .2s,background .2s,transform .2s,box-shadow .2s}
+.files-drop:hover,.files-drop:focus-within{border-color:var(--pri);background:var(--pri-soft);box-shadow:0 8px 22px -12px rgba(79,70,229,.5)}
+.files-drop.over{border-color:var(--pri);background:#e6e8ff;transform:scale(1.01)}
+.files-drop.busy{cursor:progress;opacity:.75}
+.files-drop.busy .files-drop-icon svg{animation:bob 1s ease-in-out infinite}
+.files-drop-icon{flex:none;display:grid;place-items:center;width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,var(--pri),var(--pri-2));color:#fff;box-shadow:0 8px 18px -8px rgba(79,70,229,.8)}
+.files-drop-icon svg{width:22px;height:22px}
+.files-drop-icon.small{width:38px;height:38px;border-radius:11px}
+.files-drop-icon.small svg{width:18px;height:18px}
+.files-drop-text{display:grid;gap:3px;min-width:0}
+.files-drop-text b{font-size:14px;color:var(--ink)}
+.files-drop-text b span{font-weight:500;color:var(--mut)}
+.files-drop-text small{font-size:12.5px;color:var(--mut);font-weight:500}
+.files-drop-text strong{color:var(--pri);font-weight:700}
+.files-link{display:grid;gap:12px;align-content:center;padding:16px 18px;border:1px solid var(--line);border-radius:14px;background:#fff}
+.files-link-head{display:flex;align-items:center;gap:12px;min-width:0}
+.files-link-head>div{display:grid;gap:2px;min-width:0}
+.files-link-head b{font-size:14px}
+.files-link-head small{color:var(--mut);font-size:12px}
+.files-link-fields{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr) auto;gap:8px}
+/* Fixed column widths: the file name takes the leftover space and truncates, so the table always fits. */
+.wrap.files-wrap>table.files-table{min-width:0;table-layout:fixed}
+.files-table th:nth-child(2){width:90px}.files-table th:nth-child(3){width:150px}.files-table th:nth-child(4){width:120px}.files-table th:nth-child(5){width:90px}.files-table th:nth-child(6){width:160px}
+.files-table td{overflow:hidden;text-overflow:ellipsis}
+.files-name .fl{max-width:100%;min-width:0}
+.files-name .fl span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.files-actions{text-align:right}
+.files-empty{display:grid;justify-items:center;gap:6px;padding:40px 16px;border:1px dashed var(--line-2);border-radius:14px;background:var(--card-2);text-align:center;color:var(--mut)}
+.files-empty .files-drop-icon{background:#fff;color:var(--pri);box-shadow:var(--shadow-sm);border:1px solid var(--line);margin-bottom:6px}
+.files-empty b{color:var(--ink);font-size:15px}
+.files-empty span{font-size:13px;max-width:380px}
+@media(max-width:1100px){
+  .files-add{grid-template-columns:minmax(0,1fr)}
+  /* Files list becomes a grid of cards below desktop width. */
+  .files-wrap{border:0;background:none;overflow:visible}
+  .wrap.files-wrap>table.files-table{table-layout:auto}
+  .files-table thead{display:none}
+  .files-table,.files-table tbody{display:block}
+  .files-table tbody{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,280px),1fr));gap:10px}
+  .files-table tr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 12px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:#fff;box-shadow:var(--shadow-sm);min-width:0;transition:box-shadow .2s,transform .2s}
+  .files-table tr:hover{box-shadow:var(--shadow-md);transform:translateY(-2px)}
+  .files-table td{display:grid;gap:2px;padding:0;border:0;white-space:normal;min-width:0;overflow-wrap:anywhere}
+  .files-table td[data-label]::before{content:attr(data-label);color:var(--mut);font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em}
+  .files-table td.files-name,.files-table td.files-actions{grid-column:1/-1}
+  .files-table td.files-actions{display:flex;justify-content:flex-end;gap:6px;padding-top:8px;border-top:1px solid #f0f2f7}
+  .files-table tbody tr:hover td{background:none}
+}
+@media(max-width:640px){
+  .files-link-fields{grid-template-columns:minmax(0,1fr)}
+  .files-drop{min-height:96px;padding:14px}
+}
+@media(max-width:560px){
+  .top-actions{width:100%;flex-wrap:nowrap}
+  .top-actions .acts{flex:1;min-width:0;width:auto;flex-direction:row}
+}
+
+/* ==========================================================================
+   Motion: subtle and fast; switched off by prefers-reduced-motion (see above)
+   ========================================================================== */
+@keyframes fade-up{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@keyframes fade-in{from{opacity:0}to{opacity:1}}
+@keyframes pop-in{from{opacity:0;transform:scale(.6)}to{opacity:1;transform:none}}
+@keyframes drop-in{from{opacity:0;transform:translateY(-6px) scale(.97)}to{opacity:1;transform:none}}
+@keyframes modal-in{from{opacity:0;transform:translateY(14px) scale(.97)}to{opacity:1;transform:none}}
+@keyframes grow-x{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+@keyframes bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
+@keyframes draw-line{from{stroke-dashoffset:2000}to{stroke-dashoffset:0}}
+/* Page content enters when a view opens (each view mounts fresh). */
+.main>.top{animation:fade-in .3s ease-out backwards}
+.main>section,.dash,.managed-notes{animation:fade-up .35s ease-out backwards}
+.dash-tile{animation:fade-up .4s ease-out backwards}
+.dash-tile:nth-child(2){animation-delay:.04s}.dash-tile:nth-child(3){animation-delay:.08s}.dash-tile:nth-child(4){animation-delay:.12s}.dash-tile:nth-child(5){animation-delay:.16s}.dash-tile:nth-child(6){animation-delay:.2s}
+.dash-body>.dash-card{animation:fade-up .45s ease-out backwards}
+.dash-body>.dash-card:nth-of-type(2){animation-delay:.06s}.dash-body>.dash-card:nth-of-type(3){animation-delay:.1s}.dash-body>.dash-card:nth-of-type(4){animation-delay:.14s}.dash-body>.dash-card:nth-of-type(5){animation-delay:.18s}.dash-body>.dash-card:nth-of-type(6){animation-delay:.22s}
+/* Charts draw in. */
+.dash-bar-fill,.dash-meter-track>div{transform-origin:left center;animation:grow-x .7s cubic-bezier(.22,1,.36,1) .15s backwards}
+.dash-seg-part{transform-origin:left center;animation:grow-x .6s cubic-bezier(.22,1,.36,1) backwards}
+.dash-trend polyline{stroke-dasharray:2000;animation:draw-line 1.1s ease-out backwards}
+/* Hover lift on cards. */
+.dash-tile,.dash-card,.meeting-summary-card,.managed-task,.managed-note-item,.files-link,.card{transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease}
+.dash-tile:hover,.managed-note-item:hover,.card:hover{transform:translateY(-2px);box-shadow:var(--shadow-md)}
+.dash-card:hover,.meeting-summary-card:hover,.managed-task:hover,.files-link:hover{box-shadow:var(--shadow-md)}
+/* Buttons and nav. */
+.btn:hover:not(:disabled){transform:translateY(-1px)}
+.btn:active:not(:disabled){transform:translateY(0) scale(.98)}
+.nav{transition:background-color .18s,color .18s,transform .18s}
+.nav:not(.on):hover{transform:translateX(3px)}
+.tab{transition:color .15s,border-color .2s}
+tbody tr td{transition:background-color .15s}
+/* Overlays and messages. */
+.ov{animation:fade-in .18s ease-out}
+.modal{animation:modal-in .24s cubic-bezier(.22,1,.36,1)}
+.msp{animation:drop-in .15s ease-out}
+.meeting-alert,.meeting-success,.meeting-access-banner{animation:fade-up .3s ease-out backwards}
+.meeting-event:hover:not(:disabled){box-shadow:0 4px 10px -4px rgba(79,70,229,.45)}
