@@ -751,3 +751,15 @@ tbody tr td{transition:background-color .15s}
 .msp{animation:drop-in .15s ease-out}
 .meeting-alert,.meeting-success,.meeting-access-banner{animation:fade-up .3s ease-out backwards}
 .meeting-event:hover:not(:disabled){box-shadow:0 4px 10px -4px rgba(79,70,229,.45)}
+
+/* Meetings: one-click Google Meet */
+.meeting-toolbar-actions{display:flex;gap:10px;flex-wrap:wrap}
+.meeting-instant svg{width:16px;height:16px}
+.meeting-instant{background:linear-gradient(135deg,#059669,#10b981);border-color:#059669;box-shadow:0 6px 16px -8px rgba(5,150,105,.8)}
+.meeting-instant:hover:not(:disabled){background:#047857;border-color:#047857;box-shadow:0 8px 18px -8px rgba(5,150,105,.9)}
+.meet-setup{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:0 0 16px;padding:14px 16px;border:1px solid #c7d2fe;border-radius:14px;background:linear-gradient(120deg,#eef0ff,#fff 70%);animation:fade-up .3s ease-out backwards}
+.meet-setup>div{display:grid;gap:3px;flex:1 1 300px;min-width:0}
+.meet-setup b{font-size:14px;color:var(--ink)}
+.meet-setup span:not(.files-drop-icon){font-size:12.5px;color:var(--ink-2);line-height:1.55}
+.meet-setup .btn{flex:none}
+@media(max-width:720px){.meeting-toolbar-actions{width:100%}.meeting-toolbar-actions .btn{flex:1 1 0}.meet-setup .btn{width:100%}}

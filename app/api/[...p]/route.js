@@ -77,6 +77,9 @@ async function createGoogleMeetEvent(d, meeting, timeZone, organizationId) {
       id: meeting.id,
       summary: meeting.title,
       description: meeting.agenda,
+      // Invitees are added as guests so they join the Meet room directly instead of waiting to be admitted.
+      // sendUpdates=none keeps Google from emailing them; the app sends its own invitation.
+      attendees: (meeting.attendees || []).filter((a) => a.email).map((a) => ({ email: a.email, displayName: a.name })),
       start: { dateTime: `${meeting.date}T${meeting.time}:00`, timeZone },
       end: { dateTime: endDateTime, timeZone },
       conferenceData: {
@@ -934,7 +937,7 @@ async function h(req, p, m) {
         const invitationResults = await Promise.all(attendees.map((member) => send(
           member.email,
           `Meeting invitation: ${title}`,
-          `<p>Hello ${emailHtml(member.name)},</p><p>${emailHtml(me.name)} invited you to the <b>${emailHtml(project.name)}</b> meeting <b>${emailHtml(title)}</b>.</p><p><b>Date:</b> ${emailHtml(date)}<br><b>Time:</b> ${emailHtml(time)}<br><b>Duration:</b> ${duration} minutes</p>${roomUrl ? `<p><b>Join the online meeting:</b> <a href="${emailHtml(roomUrl)}">${emailHtml(roomUrl)}</a></p>` : online ? "<p>The organizer has not added the online meeting link yet. Please contact them for the join link.</p>" : "<p>This meeting is in person.</p>"}${agenda ? `<p><b>Agenda:</b><br>${emailHtml(agenda).replace(/\n/g, "<br>")}</p>` : ""}`
+          `<p>Hello ${emailHtml(member.name)},</p><p>${emailHtml(me.name)} invited you to the <b>${emailHtml(project.name)}</b> meeting <b>${emailHtml(title)}</b>.</p><p><b>Date:</b> ${emailHtml(date)}<br><b>Time:</b> ${emailHtml(time)}<br><b>Duration:</b> ${duration} minutes</p>${meeting.roomUrl ? `<p><b>Join the online meeting:</b> <a href="${emailHtml(meeting.roomUrl)}">${emailHtml(meeting.roomUrl)}</a></p>` : online ? "<p>The organizer has not added the online meeting link yet. Please contact them for the join link.</p>" : "<p>This meeting is in person.</p>"}${agenda ? `<p><b>Agenda:</b><br>${emailHtml(agenda).replace(/\n/g, "<br>")}</p>` : ""}`
         )));
         const sent = invitationResults.filter((result) => result.sent).length;
         const emailErrors = [...new Set(invitationResults.filter((result) => !result.sent).map((result) => result.error))];

@@ -153,6 +153,7 @@ function Assign({ t, members, can, onChange }) {
 
 const BELL = "M18 8a6 6 0 10-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 01-3.46 0";
 const UPLOAD = "M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12";
+const VIDEO = "M23 7l-7 5 7 5V7zM14 5H3a2 2 0 00-2 2v10a2 2 0 002 2h11a2 2 0 002-2V7a2 2 0 00-2-2z";
 const LINK = "M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71";
 const toMs = (v) => (typeof v === "number" ? v : Date.parse(v || "")) || 0;
 const timeAgo = (v) => {
@@ -665,6 +666,29 @@ export default function Page() {
     } catch (error) { setMeetingError(error.message || "Could not create meeting"); }
     finally { setMeetingBusy(false); }
   };
+  // One click: create a Google Meet room for "now", open it in a new tab, and open the meeting workspace here.
+  // The tab is opened synchronously (before the API call) so browsers do not block it as a popup.
+  const startInstantMeeting = async () => {
+    setMeetingError(""); setMeetingNotice(""); setMeetingBusy(true);
+    const tab = window.open("", "_blank");
+    try {
+      tab?.document.write('<title>Starting meeting…</title><body style="font-family:system-ui;display:grid;place-items:center;height:100vh;margin:0;color:#334155"><p>Creating your Google Meet room…</p></body>');
+    } catch {}
+    try {
+      const now = new Date();
+      const date = localDateKey(now), time = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+      const team = members.filter((m) => m.status === "active" && m.role !== "Client" && m.id !== me.id).map((m) => m.id);
+      const r = await api("meetings", { action: "create", title: `${activeProject?.name || "Team"} meeting`, date, time, duration: 60, agenda: "", online: true, roomProvider: "google-meet", roomUrl: "", attendeeIds: team, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC" }, key, projectId);
+      if (!r.ok || !r.meeting?.roomUrl) { tab?.close(); setMeetingError(r.error || "Could not create the Google Meet room."); return; }
+      if (tab && !tab.closed) tab.location.href = r.meeting.roomUrl; else window.open(r.meeting.roomUrl, "_blank", "noopener");
+      setMeetingMonth(new Date(now.getFullYear(), now.getMonth(), 1));
+      await refreshMeetings(date.slice(0, 7));
+      openMeeting({ ...r.meeting, occurrenceDate: date });
+      setMeetingNotesOpen(true);
+      setMeetingNotice(`Google Meet started and opened in a new tab.${r.inviteEmailsTotal ? ` Invitations with the join link sent to ${r.inviteEmailsSent} of ${r.inviteEmailsTotal} team member(s).` : ""}`);
+    } catch (error) { tab?.close(); setMeetingError(error.message || "Could not start the meeting."); }
+    finally { setMeetingBusy(false); }
+  };
   const connectGoogleCalendar = async () => {
     setMeetingError("");
     const result = await api("google-meet", { action: "connect" }, key, projectId);
@@ -1160,8 +1184,23 @@ export default function Page() {
           <div className="panel">
             <div className="meeting-toolbar">
               <div className="meeting-month"><button className="btn alt" aria-label="Previous month" onClick={() => { setMeetingOffset(0); setMeetingMonth(new Date(meetingMonth.getFullYear(), meetingMonth.getMonth() - 1, 1)); }}>‹</button><h2>{meetingMonth.toLocaleDateString("en-GB", { month: "long", year: "numeric" })}</h2><button className="btn alt" aria-label="Next month" onClick={() => { setMeetingOffset(0); setMeetingMonth(new Date(meetingMonth.getFullYear(), meetingMonth.getMonth() + 1, 1)); }}>›</button><button className="btn alt meeting-today" onClick={() => { setMeetingOffset(0); setMeetingMonth(new Date(new Date().getFullYear(), new Date().getMonth(), 1)); }}>Today</button></div>
-              <button className="btn" onClick={() => { setMeetingError(""); setMeetingForm({ title: "Team meeting", date: today(), time: "10:00", duration: "60", agenda: "", online: true, roomProvider: "google-meet", roomUrl: "", attendeeIds: [] }); setMeetingFormOpen((open) => !open); }}>+ Schedule meeting</button>
+              <div className="meeting-toolbar-actions">
+                <button className="btn alt" onClick={() => { setMeetingError(""); setMeetingForm({ title: "Team meeting", date: localDateKey(new Date()), time: "10:00", duration: "60", agenda: "", online: true, roomProvider: "google-meet", roomUrl: "", attendeeIds: [] }); setMeetingFormOpen((open) => !open); }}>+ Schedule meeting</button>
+                {googleCalendarConnected && <button className="btn meeting-instant" disabled={meetingBusy || meetingLocked} onClick={startInstantMeeting}><Ic d={VIDEO} />{meetingBusy ? "Starting…" : "Start meeting now"}</button>}
+              </div>
             </div>
+            {!googleCalendarConnected && <div className="meet-setup">
+              <span className="files-drop-icon"><Ic d={VIDEO} /></span>
+              <div>
+                <b>Create Google Meet rooms right from here</b>
+                <span>{canManageMeetings
+                  ? googleCalendarConfigured
+                    ? "Connect your Google account once. After that, every online meeting gets its own Meet link automatically and \"Start meeting now\" opens a call in one click."
+                    : "One-time setup: add your Google OAuth keys (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET) in Vercel, then connect your Google account here. No more copying links from Google Meet."
+                  : "Ask a project admin to connect Google Meet. Until then, paste a Meet or Zoom link when scheduling."}</span>
+              </div>
+              {canManageMeetings && googleCalendarConfigured && <button className="btn" onClick={connectGoogleCalendar}>Connect Google Meet</button>}
+            </div>}
             {meetingError && <div className="meeting-alert" role="alert"><b>Action needed</b><span>{meetingError}</span></div>}
             {meetingNotice && <div className="meeting-success" role="status">{meetingNotice}</div>}
             {meetingFormOpen && <form className="meeting-create" onSubmit={createMeeting}>
@@ -1180,7 +1219,7 @@ export default function Page() {
                       : canManageMeetings && googleCalendarConfigured
                         ? <button type="button" className="btn alt" onClick={connectGoogleCalendar}>Connect Google Calendar</button>
                         : canManageMeetings
-                          ? <span className="meeting-invite-hint">Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET on the server to enable Meet room creation.</span>
+                          ? <span className="meeting-invite-hint">Automatic Meet links are not set up yet (see the Google Meet card above). For now, paste a Meet link below.</span>
                           : <span className="meeting-invite-hint">A project admin must connect Google Calendar to create Meet rooms automatically.</span>}
                     {canManageMeetings && googleCalendarConnected && <button type="button" className="btn alt" onClick={disconnectGoogleCalendar}>Disconnect</button>}
                     {!googleCalendarConnected && <label className="meeting-agenda">Existing Google Meet link (optional)<input type="url" placeholder="Paste an existing Meet link if not connecting Google Calendar" value={meetingForm.roomUrl} onChange={(e) => setMeetingForm({ ...meetingForm, roomUrl: e.target.value })} /></label>}
