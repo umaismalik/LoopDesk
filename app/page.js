@@ -321,7 +321,14 @@ export default function Page() {
   const [googleCalendarEmail, setGoogleCalendarEmail] = useState("");
   const [recordingState, setRecordingState] = useState("idle");
   const [recordingSeconds, setRecordingSeconds] = useState(0);
-  const [transcriptionLanguage, setTranscriptionLanguage] = useState("auto");
+  // Speech is always Urdu / Urdu-English, translated to English. "auto" picks Whisper Medium on a GPU.
+  const [transcriptionModel, setTranscriptionModel] = useState(() => {
+    try { return localStorage.getItem("rw-transcription-model") || "auto"; } catch { return "auto"; }
+  });
+  // Extra spellings of team members' names (per project), so a spoken name opens the right card.
+  const [nameAliases, setNameAliases] = useState({});
+  const [aliasDrafts, setAliasDrafts] = useState({});
+  const [aliasSaving, setAliasSaving] = useState(false);
   const [hasRecordedVoiceNote, setHasRecordedVoiceNote] = useState(false);
   const [transcriptionProgress, setTranscriptionProgress] = useState("");
   const [pendingRecording, setPendingRecording] = useState(null);
@@ -371,7 +378,7 @@ export default function Page() {
     if (!r.ok) { if (r.status === 401) setScreen("login"); else alert(r.error || "Unable to load project"); return; }
     applyDb(r);
     function applyDb(data) {
-      setMe(data.me); setCanUseMeetings(data.canUseMeetings === undefined ? data.me.role !== "Client" : data.canUseMeetings); setCanManageMeetings(!!data.canManageMeetings); setMeetingEditAccess(!!data.meetingEditAccess); setMeetingEditAccessExpiresAt(data.meetingEditAccessExpiresAt || null); setMeetingEditRequests(data.meetingEditRequests || []); setGoogleCalendarConfigured(!!data.googleCalendarConfigured); setGoogleCalendarConnected(!!data.googleCalendarConnected); setGoogleCalendarEmail(data.googleCalendarEmail || ""); setProjects(data.projects || []); setOrganizations(data.organizations || []); setProjectId(data.projectId); localStorage.setItem("rw-project", data.projectId);
+      setMe(data.me); setCanUseMeetings(data.canUseMeetings === undefined ? data.me.role !== "Client" : data.canUseMeetings); setCanManageMeetings(!!data.canManageMeetings); setMeetingEditAccess(!!data.meetingEditAccess); setMeetingEditAccessExpiresAt(data.meetingEditAccessExpiresAt || null); setMeetingEditRequests(data.meetingEditRequests || []); setGoogleCalendarConfigured(!!data.googleCalendarConfigured); setGoogleCalendarConnected(!!data.googleCalendarConnected); setGoogleCalendarEmail(data.googleCalendarEmail || ""); setNameAliases(data.nameAliases || {}); setProjects(data.projects || []); setOrganizations(data.organizations || []); setProjectId(data.projectId); localStorage.setItem("rw-project", data.projectId);
       setView((v) => data.me.role === "Client" && v !== "account" ? "portal" : v); setAcct({ name: data.me.name, phone: data.me.phone || "", current: "", password: "", confirm: "" }); setTickets(data.tickets); setTicketOffset(data.ticketPagination?.offset || 0); setTicketTotal(data.ticketPagination?.total ?? data.tickets.length); setTicketHasMore(!!data.ticketPagination?.hasMore); setMembers(data.members); setInvites(data.invites || []); setAudit(data.audit || []); setAuditOffset(0); setAuditTotal(data.audit.length); setAuditHasMore(false); setFiles(data.files || []); setFileOffset(0); setFileTotal(data.files.length); setFileHasMore(false); setScreen("app");
     }
   }, []);
@@ -872,8 +879,20 @@ export default function Page() {
     clearInterval(recordingTimerRef.current);
     recorderRef.current.stop();
   };
+  // Team members with their extra name spellings, for the speech model and card routing.
+  const voiceAttendees = useMemo(() => meetingVoiceAttendees(members, me).map((member) => ({ ...member, aliases: nameAliases[member.id] || [] })), [members, me, nameAliases]);
+  const saveNameAliases = async () => {
+    setAliasSaving(true);
+    try {
+      const aliases = Object.fromEntries(voiceAttendees.map((member) => [member.id, (aliasDrafts[member.id] ?? (nameAliases[member.id] || []).join(", ")).split(",").map((alias) => alias.trim()).filter(Boolean)]));
+      const result = await api("name-aliases", { aliases }, key, projectId);
+      if (!result.ok) { setMeetingVoiceError(result.error || "Could not save name spellings"); return; }
+      setNameAliases(result.nameAliases || {}); setAliasDrafts({});
+      setMeetingNotice("Name spellings saved. They are used for every new recording in this project.");
+    } finally { setAliasSaving(false); }
+  };
   const onTranscriptionComplete = useCallback((text) => {
-    const attendees = meetingVoiceAttendees(members, me);
+    const attendees = voiceAttendees;
     const correctedText = correctTurnNames(text, attendees);
     setMeetingVoiceError("");
     setRecordingTranscript((transcript) => transcript ? `${transcript}\n\n${correctedText}` : correctedText);
@@ -901,13 +920,15 @@ export default function Page() {
     setRecordingClips((clips) => clips.map((clip) => clip.audio === pendingRecording ? { ...clip, transcript: correctedText } : clip));
     if (!cards.length) {
       setMeetingVoiceError("");
-      setMeetingNotice("Transcript added to shared meeting notes. Say a team member's name or select their card before recording to route spoken updates into their fields.");
+      setMeetingNotice("Transcript added to shared meeting notes. To fill a member's card automatically, address them by name (for example \"Ali, tell me about your tasks\") or select their card before recording.");
+    } else {
+      setMeetingNotice(`English notes ready. Filled ${cards.length === 1 ? "the card" : "cards"} for ${cards.map((card) => card.name).join(", ")} from the names heard in the recording — review them before sharing.`);
     }
     setRecordingState("idle");
     setTranscriptionProgress("");
     setFailedRecording(null);
     setPendingRecording(null);
-  }, [key, meetingSelected, pendingRecording, projectId, members, me, selectedMeetingMemberId]);
+  }, [key, meetingSelected, pendingRecording, projectId, voiceAttendees, selectedMeetingMemberId]);
   const onTranscriptionError = useCallback((message) => {
     setMeetingVoiceError(message);
     setRecordingState("idle");
@@ -1296,7 +1317,7 @@ export default function Page() {
           </div>
           </>}
           {meetingSelected && <div className="meeting-workspace">
-            {pendingRecording && <LocalTranscriber audio={pendingRecording} language={transcriptionLanguage} onProgress={setTranscriptionProgress} onComplete={onTranscriptionComplete} onError={onTranscriptionError} />}
+            {pendingRecording && <LocalTranscriber audio={pendingRecording} names={voiceAttendees} model={transcriptionModel} onProgress={setTranscriptionProgress} onComplete={onTranscriptionComplete} onError={onTranscriptionError} />}
             <header className="panel meeting-workspace-head">
               <button type="button" className="btn alt meeting-back" disabled={meetingLocked} title={meetingLocked ? "Finish or save the recording first" : undefined} onClick={closeMeeting}>← Calendar</button>
               <div className="meeting-workspace-title">
@@ -1317,7 +1338,7 @@ export default function Page() {
                   const keyPoints = generateEnglishKeyPoints(transcript);
                   const baseNotes = recordingNotesStartRef.current || "";
                   setMeetingDraft(keyPoints ? (baseNotes.trim() ? `${baseNotes.trimEnd()}\n\n` : "") + keyPoints : baseNotes);
-                  const suggestions = generateMeetingParticipantCards(transcript, meetingVoiceAttendees(members, me), selectedMeetingMemberId);
+                  const suggestions = generateMeetingParticipantCards(transcript, voiceAttendees, selectedMeetingMemberId);
                   setRecordingCards((previous) => suggestions.map((card) => ({ ...card, priority: previous.find((item) => item.memberId === card.memberId)?.priority || "Medium" })));
                   if (suggestions.length) {
                     setParticipantSummaries((previous) => mergeVoiceCards(previous, suggestions));
@@ -1396,13 +1417,20 @@ export default function Page() {
                 <section className="panel meeting-side-card meeting-recorder" aria-label="Recording">
                   <h3>Recording</h3>
                   <div className="meeting-note-tools">
-                    <label className="meeting-language-setting">Spoken language
-                      <select value={transcriptionLanguage} onChange={(event) => setTranscriptionLanguage(event.target.value)} disabled={recordingState !== "idle"}>
-                        <option value="auto">Auto-detect</option>
-                        <option value="english">English</option>
-                        <option value="urdu">Urdu / Urdu-English</option>
+                    <p className="meeting-invite-hint">Speak in Urdu, English or a mix — notes are written in English. To fill a member's card automatically, address them by name: "Ali, apne tasks batao" / "Ali, your update".</p>
+                    <label className="meeting-language-setting">Speech model
+                      <select value={transcriptionModel} onChange={(event) => { setTranscriptionModel(event.target.value); try { localStorage.setItem("rw-transcription-model", event.target.value); } catch {} }} disabled={recordingState !== "idle"}>
+                        <option value="auto">Automatic (best this device can run)</option>
+                        <option value="best">Most accurate — Whisper Medium (~520 MB, needs a good GPU)</option>
+                        <option value="fast">Faster — Whisper Small (~300 MB)</option>
                       </select>
                     </label>
+                    {["Admin", "Collaborator"].includes(me.role) && <details className="meeting-name-spellings">
+                      <summary>Team name spellings ({voiceAttendees.filter((member) => (nameAliases[member.id] || []).length).length}/{voiceAttendees.length} set)</summary>
+                      <p className="meeting-invite-hint">Add other ways a name may be heard or written, separated by commas (for example Mashhood: "Mashood, Mashud"). Used for every recording in this project.</p>
+                      {voiceAttendees.map((member) => <label key={member.id}>{member.name}<input maxLength={300} placeholder="Other spellings, comma separated" value={aliasDrafts[member.id] ?? (nameAliases[member.id] || []).join(", ")} onChange={(event) => setAliasDrafts((drafts) => ({ ...drafts, [member.id]: event.target.value }))} /></label>)}
+                      <button type="button" className="btn alt" disabled={aliasSaving || !Object.keys(aliasDrafts).length} onClick={saveNameAliases}>{aliasSaving ? "Saving…" : "Save spellings"}</button>
+                    </details>}
                     {recordingState === "idle" && !failedRecording && (!recordingNoteId || recordingSaved) && <button className="btn meeting-record-button" disabled={!["Admin", "Collaborator"].includes(me.role)} onClick={startMeetingRecording}>{hasRecordedVoiceNote ? "Record another clip" : "Start microphone recording"}</button>}
                     {recordingState === "recording" && <>
                       <button className="btn alt meeting-record-button" onClick={pauseMeetingRecording}>Pause</button>

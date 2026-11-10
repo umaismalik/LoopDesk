@@ -741,7 +741,7 @@ async function h(req, p, m) {
       const googleCalendar = googleCalendarForOrganization(d, project.organizationId);
       const myTickets = visibleTickets(d.tickets, me);
       const ticketTotal = limitedToOwnTickets(me) && !remote ? myTickets.length : d._scope?.ticket_total ?? myTickets.length;
-      return J({ me: pub(me), projects: projects.map((item) => { const projectItem = d.projects.find((entry) => entry.id === item.id); return { ...item, organizationId: projectItem?.organizationId || defaultOrganization.id }; }), organizations, projectId: project.id, canUseMeetings, canManageMeetings, meetingEditAccess, meetingEditAccessExpiresAt, meetingEditRequests, googleCalendarConfigured: googleOAuthConfigured(), googleCalendarConnected: !!googleCalendar?.refreshToken, googleCalendarEmail: me.role === "Admin" ? googleCalendar?.email || "" : "", tickets: myTickets, ticketPagination: { offset: d._scope?.ticket_offset || 0, limit: d._scope?.ticket_limit || myTickets.length, total: ticketTotal, hasMore: (d._scope?.ticket_offset || 0) + myTickets.length < ticketTotal }, members, invites: me.role === "Admin" ? d.invites.filter((x) => x.projectId === project.id) : [], audit: me.role === "Admin" ? d.audit.slice(0, 300) : [], files: visibleFiles(d.files, d.tickets, me) });
+      return J({ me: pub(me), projects: projects.map((item) => { const projectItem = d.projects.find((entry) => entry.id === item.id); return { ...item, organizationId: projectItem?.organizationId || defaultOrganization.id }; }), organizations, projectId: project.id, canUseMeetings, canManageMeetings, meetingEditAccess, meetingEditAccessExpiresAt, meetingEditRequests, googleCalendarConfigured: googleOAuthConfigured(), googleCalendarConnected: !!googleCalendar?.refreshToken, googleCalendarEmail: me.role === "Admin" ? googleCalendar?.email || "" : "", nameAliases: project.nameAliases || {}, tickets: myTickets, ticketPagination: { offset: d._scope?.ticket_offset || 0, limit: d._scope?.ticket_limit || myTickets.length, total: ticketTotal, hasMore: (d._scope?.ticket_offset || 0) + myTickets.length < ticketTotal }, members, invites: me.role === "Admin" ? d.invites.filter((x) => x.projectId === project.id) : [], audit: me.role === "Admin" ? d.audit.slice(0, 300) : [], files: visibleFiles(d.files, d.tickets, me) });
     }
     if (m === "GET" && r === "invite") {
       const i = d.invites.find((x) => x.token === u.searchParams.get("t"));
@@ -1514,6 +1514,25 @@ async function h(req, p, m) {
         return J({ ok: true });
       }
       return J({ error: "Invalid meeting note action" }, 400);
+    }
+    if (r === "name-aliases") {
+      // Extra spellings / pronunciations of team members' names, used by meeting transcription so a
+      // spoken name opens the right member card. Shared by the whole project team.
+      if (!["Admin", "Collaborator"].includes(me.role)) return J({ error: "Only an Admin or Collaborator can edit name spellings" }, 403);
+      const b = await req.json();
+      const submitted = b.aliases && typeof b.aliases === "object" ? b.aliases : {};
+      const teamIds = new Set(project.members.filter((entry) => entry.status !== "disabled" && entry.role !== "Client").map((entry) => entry.memberId));
+      const cleaned = {};
+      for (const [memberId, value] of Object.entries(submitted)) {
+        if (!teamIds.has(memberId)) continue;
+        const list = (Array.isArray(value) ? value : String(value || "").split(","))
+          .map((alias) => String(alias).replace(/[^\p{L}\p{N}' -]/gu, "").trim().slice(0, 40)).filter(Boolean);
+        if (list.length) cleaned[memberId] = [...new Set(list)].slice(0, 10);
+      }
+      project.nameAliases = cleaned;
+      log(d, me.name, "Updated name spellings for meeting transcription");
+      await save(d);
+      return J({ ok: true, nameAliases: cleaned });
     }
     if (r === "logoutall") { account.sessions = []; delete account.key; log(d, me.name, "Signed out of all devices"); await save(d); return J({ ok: true }); }
     if (r === "logout") { account.sessions = (account.sessions || []).filter((x) => x !== key); await save(d); return J({ ok: true }); }

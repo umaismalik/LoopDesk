@@ -768,3 +768,9 @@ tbody tr td{transition:background-color .15s}
 .word-count{display:block;margin-top:4px;font-size:12px;font-weight:400;color:var(--mut)}
 .word-count.over{color:var(--warn);font-weight:600}
 .files-drop-text small + small{display:block;margin-top:2px;opacity:.85}
+
+/* Team name spellings (meeting recorder) */
+.meeting-name-spellings{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+.meeting-name-spellings summary{cursor:pointer;font-weight:600;font-size:13px}
+.meeting-name-spellings label{display:grid;gap:4px;margin:8px 0;font-size:13px}
+.meeting-name-spellings input{width:100%;min-width:0}

@@ -3,15 +3,19 @@
 import { useEffect, useRef } from "react";
 import { transcribeLocally } from "../lib/local-transcription";
 
-export default function LocalTranscriber({ audio, language, onProgress, onComplete, onError }) {
+// `names` are the meeting's team members ({ name, aliases }) so the model spells them correctly;
+// `model` is "auto", "best" (Whisper Medium) or "fast" (Whisper Small).
+export default function LocalTranscriber({ audio, names, model, onProgress, onComplete, onError }) {
   const callbacks = useRef({ onProgress, onComplete, onError });
   callbacks.current = { onProgress, onComplete, onError };
+  const options = useRef({ names, model });
+  options.current = { names, model };
 
   useEffect(() => {
     let cancelled = false;
     transcribeLocally(audio, (message) => {
       if (!cancelled) callbacks.current.onProgress(message);
-    }, language).then((text) => {
+    }, options.current).then((text) => {
       if (cancelled) return;
       if (!text) callbacks.current.onError("No speech was detected. Try a clearer recording.");
       else callbacks.current.onComplete(text);
@@ -19,7 +23,7 @@ export default function LocalTranscriber({ audio, language, onProgress, onComple
       if (!cancelled) callbacks.current.onError(error.message || "On-device transcription failed. Check your internet connection for the initial model download and try again.");
     });
     return () => { cancelled = true; };
-  }, [audio, language]);
+  }, [audio]);
 
   return null;
 }
