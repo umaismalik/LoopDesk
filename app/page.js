@@ -301,6 +301,9 @@ export default function Page() {
   const [meetingSelected, setMeetingSelected] = useState(null);
   const [meetingDraft, setMeetingDraft] = useState("");
   const [meetingFormOpen, setMeetingFormOpen] = useState(false);
+  // "Start meeting now" asks who to invite first; nobody is invited unless picked.
+  const [instantPickerOpen, setInstantPickerOpen] = useState(false);
+  const [instantAttendeeIds, setInstantAttendeeIds] = useState([]);
   const [meetingForm, setMeetingForm] = useState({ title: "Team meeting", date: today(), time: "10:00", duration: "60", agenda: "", online: true, roomProvider: "google-meet", roomUrl: "", attendeeIds: [] });
   const [participantSummaries, setParticipantSummaries] = useState([]);
   const [selectedMeetingMemberId, setSelectedMeetingMemberId] = useState("");
@@ -674,7 +677,7 @@ export default function Page() {
   };
   // One click: create a Google Meet room for "now", open it in a new tab, and open the meeting workspace here.
   // The tab is opened synchronously (before the API call) so browsers do not block it as a popup.
-  const startInstantMeeting = async () => {
+  const startInstantMeeting = async (attendeeIds) => {
     setMeetingError(""); setMeetingNotice(""); setMeetingBusy(true);
     const tab = window.open("", "_blank");
     try {
@@ -683,7 +686,8 @@ export default function Page() {
     try {
       const now = new Date();
       const date = localDateKey(now), time = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
-      const team = members.filter((m) => m.status === "active" && m.role !== "Client" && m.id !== me.id).map((m) => m.id);
+      // Only the team members picked in the start dialog; clients and the starter are never added.
+      const team = attendeeIds.filter((id) => members.some((m) => m.id === id && m.status === "active" && m.role !== "Client" && m.id !== me.id));
       const r = await api("meetings", { action: "create", title: `${activeProject?.name || "Team"} meeting`, date, time, duration: 60, agenda: "", online: true, roomProvider: "google-meet", roomUrl: "", attendeeIds: team, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC" }, key, projectId);
       if (!r.ok || !r.meeting?.roomUrl) { tab?.close(); setMeetingError(r.error || "Could not create the Google Meet room."); return; }
       if (tab && !tab.closed) tab.location.href = r.meeting.roomUrl; else window.open(r.meeting.roomUrl, "_blank", "noopener");
@@ -1193,10 +1197,25 @@ export default function Page() {
             <div className="meeting-toolbar">
               <div className="meeting-month"><button className="btn alt" aria-label="Previous month" onClick={() => { setMeetingOffset(0); setMeetingMonth(new Date(meetingMonth.getFullYear(), meetingMonth.getMonth() - 1, 1)); }}>‹</button><h2>{meetingMonth.toLocaleDateString("en-GB", { month: "long", year: "numeric" })}</h2><button className="btn alt" aria-label="Next month" onClick={() => { setMeetingOffset(0); setMeetingMonth(new Date(meetingMonth.getFullYear(), meetingMonth.getMonth() + 1, 1)); }}>›</button><button className="btn alt meeting-today" onClick={() => { setMeetingOffset(0); setMeetingMonth(new Date(new Date().getFullYear(), new Date().getMonth(), 1)); }}>Today</button></div>
               <div className="meeting-toolbar-actions">
-                <button className="btn alt" onClick={() => { setMeetingError(""); setMeetingForm({ title: "Team meeting", date: localDateKey(new Date()), time: "10:00", duration: "60", agenda: "", online: true, roomProvider: "google-meet", roomUrl: "", attendeeIds: [] }); setMeetingFormOpen((open) => !open); }}>+ Schedule meeting</button>
-                {googleCalendarConnected && <button className="btn meeting-instant" disabled={meetingBusy || meetingLocked} onClick={startInstantMeeting}><Ic d={VIDEO} />{meetingBusy ? "Starting…" : "Start meeting now"}</button>}
+                <button className="btn alt" onClick={() => { setMeetingError(""); setMeetingForm({ title: "Team meeting", date: localDateKey(new Date()), time: "10:00", duration: "60", agenda: "", online: true, roomProvider: "google-meet", roomUrl: "", attendeeIds: [] }); setMeetingFormOpen((open) => !open); setInstantPickerOpen(false); }}>+ Schedule meeting</button>
+                {googleCalendarConnected && <button className="btn meeting-instant" disabled={meetingBusy || meetingLocked} aria-expanded={instantPickerOpen} onClick={() => { setInstantPickerOpen((open) => !open); setMeetingFormOpen(false); }}><Ic d={VIDEO} />{meetingBusy ? "Starting…" : "Start meeting now"}</button>}
               </div>
             </div>
+            {instantPickerOpen && googleCalendarConnected && <div className="meeting-create instant-picker">
+              <h3>Start a Google Meet now</h3>
+              <p className="meeting-invite-hint">Select who should get the invitation and the join link. Only the people you tick are invited.</p>
+              <fieldset className="meeting-invitees">
+                <legend>Invite team members</legend>
+                {members.filter((member) => member.status === "active" && member.role !== "Client" && member.id !== me.id).map((member) => (
+                  <label key={member.id}><input type="checkbox" checked={instantAttendeeIds.includes(member.id)} onChange={(event) => setInstantAttendeeIds((ids) => event.target.checked ? [...ids, member.id] : ids.filter((id) => id !== member.id))} /> {member.name} <span>{member.email}</span></label>
+                ))}
+                {!members.some((member) => member.status === "active" && member.role !== "Client" && member.id !== me.id) && <p>No other active team members in this project.</p>}
+              </fieldset>
+              <div className="acts end">
+                <button type="button" className="btn alt" onClick={() => setInstantPickerOpen(false)}>Cancel</button>
+                <button type="button" className="btn" disabled={meetingBusy || meetingLocked} onClick={() => { const ids = instantAttendeeIds; setInstantPickerOpen(false); setInstantAttendeeIds([]); startInstantMeeting(ids); }}>{instantAttendeeIds.length ? `Start & invite ${instantAttendeeIds.length}` : "Start without inviting"}</button>
+              </div>
+            </div>}
             {!googleCalendarConnected && <div className="meet-setup">
               <span className="files-drop-icon"><Ic d={VIDEO} /></span>
               <div>
