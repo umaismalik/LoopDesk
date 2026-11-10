@@ -2,8 +2,9 @@ import path from "path";
 import crypto from "crypto";
 import { SEED } from "../../../lib/seed";
 import { sendEmail, emailStatus } from "../../../lib/email";
-import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, loadProjectTicketIds, loadClientTickets, deleteTicketFiles, loadTicketSummaries, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
+import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, loadProjectTicketIds, loadClientTickets, deleteTicketFiles, loadTicketSummaries, loadTicketAccess, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
 import { check } from "../../../lib/reminders";
+import { attachmentError, attachmentKind, descriptionError } from "../../../lib/limits";
 
 export const dynamic = "force-dynamic";
 const load = (scope) => loadDb(() => ({ tickets: SEED, members: [], invites: [], meetings: [] }), scope);
@@ -63,31 +64,43 @@ async function googleAccessToken(d, organizationId) {
   }
   return result.access_token;
 }
-async function createGoogleMeetEvent(d, meeting, timeZone, organizationId) {
+// Creates the meeting on the connected organization Google Calendar with every participant as a guest.
+// sendUpdates=all makes Google send each guest a calendar invitation, so the meeting appears in their
+// own Google Calendar and they get its notifications/reminders. With `withMeet`, a Meet room is added.
+async function createGoogleCalendarEvent(d, meeting, timeZone, organizationId, { withMeet = false } = {}) {
   const accessToken = await googleAccessToken(d, organizationId);
   const [year, month, day] = meeting.date.split("-").map(Number);
   const [hour, minute] = meeting.time.split(":").map(Number);
   const endDateTime = new Date(Date.UTC(year, month - 1, day, hour, minute + meeting.duration)).toISOString().slice(0, 19);
   const eventsUrl = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
   const eventUrl = `${eventsUrl}/${meeting.id}`;
-  let response = await fetch(`${eventsUrl}?conferenceDataVersion=1&sendUpdates=none`, {
+  const guests = new Map();
+  [...(meeting.attendees || []), ...(meeting.organizer ? [meeting.organizer] : [])]
+    .filter((person) => person?.email)
+    .forEach((person) => guests.set(person.email.toLowerCase(), { email: person.email, displayName: person.name }));
+  const location = withMeet ? "" : meeting.online ? meeting.roomUrl || (meeting.roomProvider === "zoom" ? "Zoom" : "Online") : "In person";
+  let response = await fetch(`${eventsUrl}?conferenceDataVersion=${withMeet ? 1 : 0}&sendUpdates=all`, {
     method: "POST",
     headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       id: meeting.id,
       summary: meeting.title,
-      description: meeting.agenda,
-      // Invitees are added as guests so they join the Meet room directly instead of waiting to be admitted.
-      // sendUpdates=none keeps Google from emailing them; the app sends its own invitation.
-      attendees: (meeting.attendees || []).filter((a) => a.email).map((a) => ({ email: a.email, displayName: a.name })),
+      description: [meeting.agenda, meeting.online && !withMeet && meeting.roomUrl ? `Join: ${meeting.roomUrl}` : ""].filter(Boolean).join("\n\n"),
+      ...(location ? { location } : {}),
+      // Guests join the Meet room directly instead of waiting to be admitted, and Google notifies them.
+      attendees: [...guests.values()],
+      guestsCanSeeOtherGuests: true,
+      reminders: { useDefault: false, overrides: [{ method: "popup", minutes: 10 }, { method: "email", minutes: 30 }] },
       start: { dateTime: `${meeting.date}T${meeting.time}:00`, timeZone },
       end: { dateTime: endDateTime, timeZone },
-      conferenceData: {
-        createRequest: {
-          requestId: `${meeting.id}-${uid()}`,
-          conferenceSolutionKey: { type: "hangoutsMeet" },
+      ...(withMeet ? {
+        conferenceData: {
+          createRequest: {
+            requestId: `${meeting.id}-${uid()}`,
+            conferenceSolutionKey: { type: "hangoutsMeet" },
+          },
         },
-      },
+      } : {}),
     }),
     cache: "no-store",
   });
@@ -101,6 +114,7 @@ async function createGoogleMeetEvent(d, meeting, timeZone, organizationId) {
     if (response.status === 401) throw new Error("Google Calendar authorization expired. Disconnect and reconnect the Google account.");
     throw new Error(message);
   }
+  if (!withMeet) return { eventId: event.id, htmlLink: event.htmlLink || "" };
   let meetLink = event.hangoutLink || event.conferenceData?.entryPoints?.find((entry) => entry.entryPointType === "video")?.uri;
   for (let attempt = 0; !meetLink && attempt < 5; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -110,11 +124,19 @@ async function createGoogleMeetEvent(d, meeting, timeZone, organizationId) {
     meetLink = event.hangoutLink || event.conferenceData?.entryPoints?.find((entry) => entry.entryPointType === "video")?.uri;
   }
   if (!meetLink) {
-    const cleanup = await fetch(eventUrl, { method: "DELETE", headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store" });
-    if (!cleanup.ok && cleanup.status !== 404) throw new Error("Google did not return a Meet link and the temporary calendar event could not be removed. Check Google Calendar before retrying.");
+    const cleanup = await fetch(`${eventUrl}?sendUpdates=all`, { method: "DELETE", headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store" });
+    if (!cleanup.ok && cleanup.status !== 404 && cleanup.status !== 410) throw new Error("Google did not return a Meet link and the temporary calendar event could not be removed. Check Google Calendar before retrying.");
     throw new Error("Google created the calendar event but did not return a Meet link yet. The temporary event was removed; please try again in a moment.");
   }
-  return { meetLink, eventId: event.id };
+  return { meetLink, eventId: event.id, htmlLink: event.htmlLink || "" };
+}
+// Removes a deleted meeting from Google Calendar; guests receive Google's cancellation notice.
+async function deleteGoogleCalendarEvent(d, eventId, organizationId) {
+  const accessToken = await googleAccessToken(d, organizationId);
+  const response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}?sendUpdates=all`, {
+    method: "DELETE", headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store",
+  });
+  if (!response.ok && response.status !== 404 && response.status !== 410) throw new Error(`Google Calendar returned ${response.status}`);
 }
 const pub = (m) => ({ id: m.id, name: m.name, email: m.email, phone: m.phone || "", role: m.role, hasPw: !!m.pw, status: m.status || "active" });
 const ROLES = ["Admin", "Developer", "Collaborator", "Client"];
@@ -156,6 +178,33 @@ const nextTicketId = (ids, type) => {
 // assigned to them or raised by them.
 const canManageTickets = (member) => ["Admin", "Collaborator"].includes(member?.role);
 const ownsTicket = (ticket, memberId) => (ticket.assignees || []).includes(memberId) || ticket.raisedBy === memberId;
+// Developers only see the tickets assigned to them (or that they raised), and only the files of those
+// tickets plus project-wide documents that are not tied to any ticket. The database query applies the
+// same rule; this filter keeps local storage and an older schema consistent with it.
+const limitedToOwnTickets = (member) => member?.role === "Developer";
+const visibleTickets = (tickets, member) => limitedToOwnTickets(member) ? tickets.filter((t) => ownsTicket(t, member.id)) : tickets;
+const visibleFiles = (files, tickets, member) => !limitedToOwnTickets(member) ? files : files.filter((file) => {
+  if (!file.ticket) return true;
+  const ticket = tickets.find((t) => t.id === file.ticket);
+  return !ticket || ownsTicket(ticket, member.id);
+});
+// Meeting-note action items: a Developer sees only the ones assigned to them.
+const visibleNote = (note, member) => limitedToOwnTickets(member) ? { ...note, tasks: (note.tasks || []).filter((task) => task.assigneeId === member.id) } : note;
+// Magic-byte check so a renamed file cannot pass as an allowed format. Text formats have no signature.
+const fileSignatureOk = (name, buf) => {
+  const ext = String(name || "").toLowerCase().split(".").pop();
+  const hex = buf.subarray(0, 12).toString("hex");
+  const ascii = buf.subarray(0, 12).toString("latin1");
+  if (["jpg", "jpeg"].includes(ext)) return hex.startsWith("ffd8ff");
+  if (ext === "png") return hex.startsWith("89504e470d0a1a0a");
+  if (ext === "gif") return ascii.startsWith("GIF87a") || ascii.startsWith("GIF89a");
+  if (ext === "webp") return ascii.startsWith("RIFF") && ascii.slice(8, 12) === "WEBP";
+  if (ext === "pdf") return ascii.startsWith("%PDF");
+  if (["docx", "xlsx", "pptx"].includes(ext)) return hex.startsWith("504b0304");
+  if (["doc", "xls", "ppt"].includes(ext)) return hex.startsWith("d0cf11e0a1b11ae1");
+  if (["txt", "csv"].includes(ext)) return !buf.subarray(0, 4096).includes(0);
+  return false;
+};
 const sameIds = (a, b) => JSON.stringify([...(a || [])].sort()) === JSON.stringify([...(b || [])].sort());
 // Field-order-insensitive comparison that ignores values the server maintains itself.
 const SERVER_TICKET_FIELDS = new Set(["rem", "attachments", "clientRef", "raisedBy"]);
@@ -249,8 +298,52 @@ const ticketChanges = (oldTicket, newTicket, members) => TICKET_AUDIT_FIELDS.fla
   }]
 );
 
-async function send(to, subject, html) {
-  const result = await sendEmail({ to, subject, html });
+// Wall-clock date/time in an IANA time zone -> UTC Date (two passes cover DST boundaries).
+const zonedTimeToUtc = (date, time, timeZone) => {
+  const [y, mo, d] = date.split("-").map(Number), [h, mi] = time.split(":").map(Number);
+  const wanted = Date.UTC(y, mo - 1, d, h, mi);
+  const offsetAt = (instant) => {
+    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" })
+      .formatToParts(new Date(instant)).filter((part) => part.type !== "literal").map((part) => [part.type, Number(part.value)]));
+    return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second) - instant;
+  };
+  let utc = wanted - offsetAt(wanted);
+  utc = wanted - offsetAt(utc);
+  return new Date(utc);
+};
+const icsDate = (value) => value.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+const icsText = (value) => String(value || "").replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n");
+// RFC 5545 lines are folded at 75 octets.
+const icsFold = (line) => { const out = []; let rest = line; while (rest.length > 74) { out.push(rest.slice(0, 74)); rest = " " + rest.slice(74); } out.push(rest); return out.join("\r\n"); };
+// Calendar invitation for one attendee. Mail apps (Gmail, Outlook, Apple Mail) add a REQUEST to the
+// attendee's calendar with a reminder, and remove the event again on a CANCEL with the same UID.
+function meetingIcs(meeting, attendee, organizer, method = "REQUEST") {
+  const start = zonedTimeToUtc(meeting.date, meeting.time, meeting.timeZone || "UTC");
+  const end = new Date(start.getTime() + meeting.duration * 60000);
+  const location = meeting.online ? meeting.roomUrl || (meeting.roomProvider === "zoom" ? "Zoom" : "Google Meet") : "In person";
+  const description = [meeting.agenda, meeting.roomUrl ? "Join: " + meeting.roomUrl : ""].filter(Boolean).join("\n\n");
+  return [
+    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//LoopDesk//Meetings//EN", "CALSCALE:GREGORIAN", "METHOD:" + method,
+    "BEGIN:VEVENT",
+    "UID:" + meeting.id + "@loopdesk",
+    "SEQUENCE:" + (method === "CANCEL" ? 1 : 0),
+    "DTSTAMP:" + icsDate(new Date()),
+    "DTSTART:" + icsDate(start),
+    "DTEND:" + icsDate(end),
+    "SUMMARY:" + icsText(meeting.title),
+    ...(description ? ["DESCRIPTION:" + icsText(description)] : []),
+    "LOCATION:" + icsText(location),
+    ...(meeting.roomUrl ? ["URL:" + meeting.roomUrl] : []),
+    "ORGANIZER;CN=" + icsText(organizer?.name || "LoopDesk") + ":mailto:" + (organizer?.email || attendee.email),
+    "ATTENDEE;CN=" + icsText(attendee.name) + ";ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:" + attendee.email,
+    "STATUS:" + (method === "CANCEL" ? "CANCELLED" : "CONFIRMED"),
+    ...(method === "CANCEL" ? [] : ["BEGIN:VALARM", "ACTION:DISPLAY", "DESCRIPTION:" + icsText(meeting.title), "TRIGGER:-PT10M", "END:VALARM"]),
+    "END:VEVENT", "END:VCALENDAR",
+  ].map(icsFold).join("\r\n") + "\r\n";
+}
+
+async function send(to, subject, html, calendar) {
+  const result = await sendEmail({ to, subject, html, ...(calendar ? { calendar } : {}) });
   if (!result.sent) console.error(`Email delivery failed for ${to} (${subject}): ${result.error}`);
   return result;
 }
@@ -646,7 +739,9 @@ async function h(req, p, m) {
         return member ? { ...pub(member), role: entry.role, status: entry.status === "disabled" || member.status === "disabled" ? "disabled" : "active" } : null;
       }).filter(Boolean);
       const googleCalendar = googleCalendarForOrganization(d, project.organizationId);
-      return J({ me: pub(me), projects: projects.map((item) => { const projectItem = d.projects.find((entry) => entry.id === item.id); return { ...item, organizationId: projectItem?.organizationId || defaultOrganization.id }; }), organizations, projectId: project.id, canUseMeetings, canManageMeetings, meetingEditAccess, meetingEditAccessExpiresAt, meetingEditRequests, googleCalendarConfigured: googleOAuthConfigured(), googleCalendarConnected: !!googleCalendar?.refreshToken, googleCalendarEmail: me.role === "Admin" ? googleCalendar?.email || "" : "", tickets: d.tickets, ticketPagination: { offset: d._scope?.ticket_offset || 0, limit: d._scope?.ticket_limit || d.tickets.length, total: d._scope?.ticket_total ?? d.tickets.length, hasMore: (d._scope?.ticket_offset || 0) + d.tickets.length < (d._scope?.ticket_total ?? d.tickets.length) }, members, invites: me.role === "Admin" ? d.invites.filter((x) => x.projectId === project.id) : [], audit: me.role === "Admin" ? d.audit.slice(0, 300) : [], files: d.files });
+      const myTickets = visibleTickets(d.tickets, me);
+      const ticketTotal = limitedToOwnTickets(me) && !remote ? myTickets.length : d._scope?.ticket_total ?? myTickets.length;
+      return J({ me: pub(me), projects: projects.map((item) => { const projectItem = d.projects.find((entry) => entry.id === item.id); return { ...item, organizationId: projectItem?.organizationId || defaultOrganization.id }; }), organizations, projectId: project.id, canUseMeetings, canManageMeetings, meetingEditAccess, meetingEditAccessExpiresAt, meetingEditRequests, googleCalendarConfigured: googleOAuthConfigured(), googleCalendarConnected: !!googleCalendar?.refreshToken, googleCalendarEmail: me.role === "Admin" ? googleCalendar?.email || "" : "", tickets: myTickets, ticketPagination: { offset: d._scope?.ticket_offset || 0, limit: d._scope?.ticket_limit || myTickets.length, total: ticketTotal, hasMore: (d._scope?.ticket_offset || 0) + myTickets.length < ticketTotal }, members, invites: me.role === "Admin" ? d.invites.filter((x) => x.projectId === project.id) : [], audit: me.role === "Admin" ? d.audit.slice(0, 300) : [], files: visibleFiles(d.files, d.tickets, me) });
     }
     if (m === "GET" && r === "invite") {
       const i = d.invites.find((x) => x.token === u.searchParams.get("t"));
@@ -660,6 +755,11 @@ async function h(req, p, m) {
       const ownsFileTicket = d._scope?.file_authorized ?? d.files.some((item) =>
         item.id === f && d.tickets.some((ticket) => ticket.id === item.ticket && ticket.createdBy === me.id));
       if (me.role === "Client" && !ownsFileTicket) return J({ error: "denied" }, 403);
+      if (limitedToOwnTickets(me)) {
+        const fileTicket = d.files.find((item) => item.id === f)?.ticket;
+        const access = fileTicket ? await loadTicketAccess(project.id, fileTicket, d.tickets) : null;
+        if (access && !ownsTicket(access, me.id)) return J({ error: "denied" }, 403);
+      }
       const buf = await getFile(f);
       if (!buf) return J({ error: "missing" }, 404);
       return new Response(buf, { headers: { "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(u.searchParams.get("n") || f)}` } });
@@ -715,7 +815,7 @@ async function h(req, p, m) {
         if (!validDate(from) || !validDate(to) || from > to || (new Date(`${to}T00:00:00Z`) - new Date(`${from}T00:00:00Z`)) / 864e5 > 366) return J({ error: "Enter a valid report range of no more than one year" }, 400);
         return J({
           ...access,
-          notes: d.meetingNotes.filter((note) => note.projectId === project.id && note.date >= from && note.date <= to).sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)),
+          notes: d.meetingNotes.filter((note) => note.projectId === project.id && note.date >= from && note.date <= to).sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)).map((note) => visibleNote(note, me)),
           pagination: {
             offset: d._scope?.collection_offset || 0,
             limit: d._scope?.collection_limit || d.meetingNotes.length,
@@ -727,7 +827,7 @@ async function h(req, p, m) {
       if (!/^\d{4}-\d{2}$/.test(month) || Number(month.slice(5)) < 1 || Number(month.slice(5)) > 12) return J({ error: "Invalid notes month" }, 400);
       return J({
         ...access,
-        notes: d.meetingNotes.filter((note) => note.projectId === project.id && note.date.startsWith(month)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+        notes: d.meetingNotes.filter((note) => note.projectId === project.id && note.date.startsWith(month)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((note) => visibleNote(note, me)),
         pagination: {
           offset: d._scope?.collection_offset || 0,
           limit: d._scope?.collection_limit || d.meetingNotes.length,
@@ -738,7 +838,7 @@ async function h(req, p, m) {
     }
     if (r === "files" && m === "GET") {
       return J({
-        files: d.files,
+        files: visibleFiles(d.files, d.tickets, me),
         pagination: {
           offset: d._scope?.collection_offset || 0,
           limit: d._scope?.collection_limit || d.files.length,
@@ -775,18 +875,20 @@ async function h(req, p, m) {
       if (!me || me.role === "Client") return J({ error: "Team access required" }, 403);
       const rows = (await loadTicketSummaries(project.id)) || project.tickets.map((t) => ({
         id: t.id, type: t.type, status: t.status, title: t.title, date: t.date, deadline: t.deadline,
-        priority: t.priority, closed: t.closed, assignees: t.assignees || [],
+        priority: t.priority, closed: t.closed, assignees: t.assignees || [], raisedBy: t.raisedBy,
       }));
-      return J({ tickets: rows, generatedAt: new Date().toISOString() });
+      return J({ tickets: visibleTickets(rows, me).map(({ raisedBy, ...row }) => row), generatedAt: new Date().toISOString() });
     }
     if (r === "tickets" && m === "GET") {
+      const myTickets = visibleTickets(d.tickets, me);
+      const total = limitedToOwnTickets(me) && !remote ? myTickets.length : d._scope?.ticket_total ?? myTickets.length;
       return J({
-        tickets: d.tickets,
+        tickets: myTickets,
         pagination: {
           offset: d._scope?.ticket_offset || 0,
-          limit: d._scope?.ticket_limit || d.tickets.length,
-          total: d._scope?.ticket_total ?? d.tickets.length,
-          hasMore: (d._scope?.ticket_offset || 0) + d.tickets.length < (d._scope?.ticket_total ?? d.tickets.length),
+          limit: d._scope?.ticket_limit || myTickets.length,
+          total,
+          hasMore: (d._scope?.ticket_offset || 0) + myTickets.length < total,
         },
       });
     }
@@ -921,27 +1023,47 @@ async function h(req, p, m) {
             }
           }
         }
-        const meeting = { id: uid().slice(0, 12), projectId: project.id, title, date, time, duration, agenda, weekly: false, online, roomProvider, roomName, roomUrl, attendees: attendees.map((member) => ({ id: member.id, name: member.name, email: member.email })), roster: eligibleMembers.map((member) => ({ id: member.id, name: member.name, email: member.email })), createdBy: account.id, createdByName: me.name, occurrences: {} };
-        if (online && roomProvider === "google-meet" && googleCalendarForOrganization(d, project.organizationId)?.refreshToken) {
+        const meeting = { id: uid().slice(0, 12), projectId: project.id, title, date, time, duration, agenda, weekly: false, online, roomProvider, roomName, roomUrl, attendees: attendees.map((member) => ({ id: member.id, name: member.name, email: member.email })), roster: eligibleMembers.map((member) => ({ id: member.id, name: member.name, email: member.email })), createdBy: account.id, createdByName: me.name, timeZone, occurrences: {} };
+        const calendarConnected = !!googleCalendarForOrganization(d, project.organizationId)?.refreshToken;
+        // The organizer is invited too, so the meeting also lands on their own calendar.
+        const organizer = d.members.find((member) => member.id === account.id);
+        const calendarMeeting = { ...meeting, organizer: organizer?.email ? { name: organizer.name, email: organizer.email } : null };
+        let calendarSynced = false, calendarError = "";
+        if (online && roomProvider === "google-meet" && calendarConnected && !roomUrl) {
           try {
-            const googleEvent = await createGoogleMeetEvent(d, meeting, timeZone, project.organizationId);
+            const googleEvent = await createGoogleCalendarEvent(d, calendarMeeting, timeZone, project.organizationId, { withMeet: true });
             meeting.roomUrl = googleEvent.meetLink;
             meeting.googleCalendarEventId = googleEvent.eventId;
+            calendarSynced = true;
           } catch (error) {
             return J({ error: `Could not create Google Meet room: ${error.message}` }, 502);
           }
         } else if (online && roomProvider === "google-meet" && !roomUrl) {
           return J({ error: "Connect Google Calendar as a project admin to create a Meet room automatically, or paste a Google Meet link." }, 400);
+        } else if (calendarConnected) {
+          // In-person, Zoom and pasted-link meetings are also put on everyone's Google Calendar. A calendar
+          // failure does not block the meeting; the app's own email invitation still goes out.
+          try {
+            const googleEvent = await createGoogleCalendarEvent(d, calendarMeeting, timeZone, project.organizationId);
+            meeting.googleCalendarEventId = googleEvent.eventId;
+            calendarSynced = true;
+          } catch (error) {
+            calendarError = `Google Calendar invitation was not sent: ${error.message}`;
+          }
         }
+        // Without Google Calendar sync, each invitation email carries a calendar invite (.ics) so the
+        // meeting is still added to every invitee's calendar with a reminder.
+        if (!calendarSynced) meeting.calendarInviteSent = attendees.length > 0;
         d.meetings.push(meeting); await save(d);
         const invitationResults = await Promise.all(attendees.map((member) => send(
           member.email,
           `Meeting invitation: ${title}`,
-          `<p>Hello ${emailHtml(member.name)},</p><p>${emailHtml(me.name)} invited you to the <b>${emailHtml(project.name)}</b> meeting <b>${emailHtml(title)}</b>.</p><p><b>Date:</b> ${emailHtml(date)}<br><b>Time:</b> ${emailHtml(time)}<br><b>Duration:</b> ${duration} minutes</p>${meeting.roomUrl ? `<p><b>Join the online meeting:</b> <a href="${emailHtml(meeting.roomUrl)}">${emailHtml(meeting.roomUrl)}</a></p>` : online ? "<p>The organizer has not added the online meeting link yet. Please contact them for the join link.</p>" : "<p>This meeting is in person.</p>"}${agenda ? `<p><b>Agenda:</b><br>${emailHtml(agenda).replace(/\n/g, "<br>")}</p>` : ""}`
+          `<p>Hello ${emailHtml(member.name)},</p><p>${emailHtml(me.name)} invited you to the <b>${emailHtml(project.name)}</b> meeting <b>${emailHtml(title)}</b>.</p><p><b>Date:</b> ${emailHtml(date)}<br><b>Time:</b> ${emailHtml(time)}<br><b>Duration:</b> ${duration} minutes</p>${meeting.roomUrl ? `<p><b>Join the online meeting:</b> <a href="${emailHtml(meeting.roomUrl)}">${emailHtml(meeting.roomUrl)}</a></p>` : online ? "<p>The organizer has not added the online meeting link yet. Please contact them for the join link.</p>" : "<p>This meeting is in person.</p>"}${agenda ? `<p><b>Agenda:</b><br>${emailHtml(agenda).replace(/\n/g, "<br>")}</p>` : ""}${calendarSynced ? "<p>This meeting has also been added to your Google Calendar.</p>" : "<p>A calendar invite is attached. Accept it in Gmail/Outlook (or open the invite file) to add this meeting to your calendar with a reminder.</p>"}`,
+          calendarSynced ? undefined : { method: "REQUEST", content: meetingIcs(meeting, member, calendarMeeting.organizer) },
         )));
         const sent = invitationResults.filter((result) => result.sent).length;
         const emailErrors = [...new Set(invitationResults.filter((result) => !result.sent).map((result) => result.error))];
-        return J({ ok: true, meeting: { ...meeting, occurrenceDate: date, notes: "", participantSummaries: [] }, inviteEmailsSent: sent, inviteEmailsTotal: attendees.length, emailErrors });
+        return J({ ok: true, meeting: { ...meeting, occurrenceDate: date, notes: "", participantSummaries: [] }, inviteEmailsSent: sent, inviteEmailsTotal: attendees.length, emailErrors, calendarSynced, calendarConnected, calendarError });
       }
       if (b.action === "participant-tasks") {
         if (!canManageAllMeetingContent) return J({ error: "Only an Admin or Collaborator can email meeting action items" }, 403);
@@ -1142,7 +1264,21 @@ async function h(req, p, m) {
         if (!meeting) return J({ error: "Meeting not found" }, 404);
         if (meeting.createdBy !== account.id && !isAdmin) return J({ error: "Only the meeting creator or a team admin can delete it" }, 403);
         d.meetings.splice(index, 1); await save(d);
-        return J({ ok: true });
+        let calendarError = "";
+        if (meeting.googleCalendarEventId && googleCalendarForOrganization(d, project.organizationId)?.refreshToken) {
+          try { await deleteGoogleCalendarEvent(d, meeting.googleCalendarEventId, project.organizationId); }
+          catch (error) { calendarError = `The meeting was deleted here but could not be removed from Google Calendar: ${error.message}`; }
+        } else if (meeting.calendarInviteSent) {
+          // Remove the emailed calendar invite from each invitee's calendar.
+          const organizer = d.members.find((member) => member.id === meeting.createdBy);
+          await Promise.all((meeting.attendees || []).filter((person) => person.email).map((person) => send(
+            person.email,
+            `Meeting cancelled: ${meeting.title}`,
+            `<p>Hello ${emailHtml(person.name)},</p><p>The <b>${emailHtml(project.name)}</b> meeting <b>${emailHtml(meeting.title)}</b> on ${emailHtml(meeting.date)} at ${emailHtml(meeting.time)} has been cancelled by ${emailHtml(me.name)}.</p>`,
+            { method: "CANCEL", content: meetingIcs(meeting, person, organizer?.email ? { name: organizer.name, email: organizer.email } : null, "CANCEL") },
+          )));
+        }
+        return J({ ok: true, calendarError });
       }
       return J({ error: "Invalid meeting action" }, 400);
     }
@@ -1314,15 +1450,21 @@ async function h(req, p, m) {
         task.status = b.status;
         note.updatedAt = new Date().toISOString();
         await save(d);
-        return J({ ok: true, note });
+        return J({ ok: true, note: visibleNote(note, me) });
       }
       if (!canEditMeetingContent) return J({ error: "Admin or Collaborator access, or a current one-hour admin approval, is required to edit meeting notes and tasks" }, 403);
       if (b.action === "update") {
         const title = String(b.title || "").trim().slice(0, 160), summary = String(b.summary || ""), transcript = String(b.transcript || "");
         const participantSummaries = cleanCards(b.participantSummaries || []);
-        const tasks = cleanTasks(b.tasks || [], note.tasks || []);
+        let tasks = cleanTasks(b.tasks || [], note.tasks || []);
         if (!title || summary.length > 20000 || transcript.length > 50000 || !participantSummaries || !tasks) return J({ error: "Invalid note or action item data" }, 400);
         const previousTasks = note.tasks || [];
+        if (limitedToOwnTickets(me)) {
+          // A Developer only received their own action items; keep everyone else's exactly as stored.
+          const hiddenTasks = previousTasks.filter((task) => task.assigneeId !== account.id);
+          if (tasks.some((task) => hiddenTasks.some((hidden) => hidden.id === task.id))) return J({ error: "You can only change tasks assigned to you" }, 403);
+          tasks = [...hiddenTasks, ...tasks];
+        }
         if (!canManageAllMeetingContent) {
           if (title !== note.title || summary !== note.summary || transcript !== note.transcript) return J({ error: "Temporary edit access only allows changes to your member card and your assigned tasks" }, 403);
           const previousCards = note.participantSummaries || [];
@@ -1347,7 +1489,7 @@ async function h(req, p, m) {
         await save(d);
         const taskEmailResults = await emailAssignedTasks(d, { tasks, previousTasks, title, projectName: project.name });
         return J({
-          ok: true, note,
+          ok: true, note: visibleNote(note, me),
           taskEmailsSent: taskEmailResults.filter((result) => result.sent).length,
           taskEmailsFailed: taskEmailResults.filter((result) => !result.sent && !result.skipped).length,
           emailErrors: [...new Set(taskEmailResults.filter((result) => result.error).map((result) => result.error))],
@@ -1362,7 +1504,7 @@ async function h(req, p, m) {
         task.comments = task.comments.slice(-100);
         note.updatedAt = new Date().toISOString();
         await save(d);
-        return J({ ok: true, note });
+        return J({ ok: true, note: visibleNote(note, me) });
       }
       if (b.action === "delete") {
         if (me.role !== "Admin") return J({ error: "Only an admin can delete meeting notes" }, 403);
@@ -1420,7 +1562,18 @@ async function h(req, p, m) {
       if (me.role === "Client") return J({ error: "Not allowed" }, 403);
       const b = await req.json();
       if (!Array.isArray(b.tickets)) return J({ error: "Invalid input" }, 400);
-      const gone = d.tickets.filter((t) => !b.tickets.some((x) => x.id === t.id));
+      // A Developer's browser only holds their own tickets; keep every other loaded ticket untouched
+      // instead of reading its absence as a deletion, and refuse writes to tickets they cannot see.
+      const hiddenTickets = limitedToOwnTickets(me) ? d.tickets.filter((t) => !ownsTicket(t, me.id)) : [];
+      if (hiddenTickets.some((t) => b.tickets.some((x) => x.id === t.id))) return J({ error: "You can only update tickets assigned to you" }, 403);
+      const previousIds = new Set(d.tickets.map((t) => t.id));
+      for (const t of b.tickets) {
+        const original = d.tickets.find((x) => x.id === t.id);
+        if (original && original.details === t.details) continue;
+        const problem = descriptionError(t.details);
+        if (problem) return J({ error: `${previousIds.has(t.id) ? t.id + ": " : ""}${problem}` }, 400);
+      }
+      const gone = d.tickets.filter((t) => !hiddenTickets.includes(t) && !b.tickets.some((x) => x.id === t.id));
       const old = Object.fromEntries(d.tickets.map((t) => [t.id, t]));
       // Admins and Collaborators manage every ticket. Other team members may raise tickets and update
       // the ones that are theirs (assigned to them or raised by them), but not reassign or delete.
@@ -1485,7 +1638,7 @@ async function h(req, p, m) {
       gone.forEach((t) => log(d, me.name, "Deleted " + t.id, t.title));
       const goneIds = gone.map((t) => t.id);
       if (goneIds.length && !remote) d.files = d.files.filter((file) => !goneIds.includes(file.ticket));
-      d.tickets = b.tickets; await save(d);
+      d.tickets = [...hiddenTickets, ...b.tickets]; await save(d);
       if (goneIds.length && remote) await deleteTicketFiles(project.id, goneIds).catch((error) => console.warn("Could not remove attachments of deleted tickets:", error?.message || error));
       await Promise.all(jobs.map((job) => job()));
       return J({ ok: true, renamed });
@@ -1517,8 +1670,9 @@ async function h(req, p, m) {
         await Promise.all(emails(d, t.assignees || []).map((e) => send(e, "Ticket reopened: " + t.id, `<p>${esc(me.name)} reopened <b>${t.id}</b> - ${esc(t.title)}.</p><p>Reason: ${esc(why)}</p>`)));
         return J({ ok: true });
       }
-      const x = b.ticket || {}, title = String(x.title || "").trim().slice(0, 150), details = String(x.details || "").trim().slice(0, 3000);
+      const x = b.ticket || {}, title = String(x.title || "").trim().slice(0, 150), details = String(x.details || "").trim();
       if (!title) return J({ error: "Title is required" }, 400);
+      if (descriptionError(details)) return J({ error: descriptionError(details) }, 400);
       if (x.id) {
         const t = d.tickets.find((y) => y.id === x.id && y.createdBy === me.id);
         if (!t || t.status === "Completed") return J({ error: "This ticket cannot be edited" }, 400);
@@ -1555,6 +1709,10 @@ async function h(req, p, m) {
       const b = await req.json(), tk = String(b.ticket || "");
       if (!/^https?:\/\//i.test(b.url || "") || !CATS.includes(b.cat)) return J({ error: "Enter a valid http(s) link" }, 400);
       if (me.role === "Client" && !d.tickets.some((t) => t.id === tk && t.createdBy === me.id)) return J({ error: "Not allowed" }, 403);
+      if (limitedToOwnTickets(me) && tk) {
+        const access = await loadTicketAccess(project.id, tk, d.tickets);
+        if (!access || !ownsTicket(access, me.id)) return J({ error: "You can only add links to tickets assigned to you" }, 403);
+      }
       d.files.unshift({ id: uid().slice(0, 12), name: String(b.name || b.url).slice(0, 120), url: b.url, cat: b.cat, by: me.name, at: td(), ticket: tk });
       log(d, me.name, "Added document link", String(b.name || b.url)); await save(d);
       return J({ ok: true });
@@ -1563,10 +1721,17 @@ async function h(req, p, m) {
       const fd = await req.formData(), f = fd.get("file"), cat = String(fd.get("cat") || ""), tk = String(fd.get("ticket") || "");
       if (me.role === "Client" && !d.tickets.some((t) => t.id === tk && t.createdBy === me.id)) return J({ error: "Not allowed" }, 403);
       if (!CATS.includes(cat)) return J({ error: "Invalid category" }, 400);
-      const MAX = remote ? 4e6 : 25e6;
-      if (!f || f.size > MAX) return J({ error: "File missing or larger than " + MAX / 1e6 + " MB. For bigger files use Add link." }, 400);
-      const n = uid() + path.extname(f.name || "").slice(0, 10);
-      await putFile(n, Buffer.from(await f.arrayBuffer()), f.type);
+      if (limitedToOwnTickets(me) && tk) {
+        const access = await loadTicketAccess(project.id, tk, d.tickets);
+        if (!access || !ownsTicket(access, me.id)) return J({ error: "You can only attach files to tickets assigned to you" }, 403);
+      }
+      if (!f || typeof f.arrayBuffer !== "function") return J({ error: "File is missing" }, 400);
+      const fileProblem = attachmentError(f);
+      if (fileProblem) return J({ error: fileProblem }, f.size > 0 && attachmentKind(f.name) ? 413 : 400);
+      const buffer = Buffer.from(await f.arrayBuffer());
+      if (!fileSignatureOk(f.name, buffer)) return J({ error: `"${f.name}" content does not match its file type. Upload a genuine image or document.` }, 400);
+      const n = uid() + path.extname(f.name || "").toLowerCase().slice(0, 10);
+      await putFile(n, buffer, f.type);
       d.files.unshift({ id: n, name: f.name, size: f.size, cat, by: me.name, at: td(), ticket: tk });
       log(d, me.name, "Uploaded file", f.name + " (" + cat + ")"); await save(d);
       return J({ ok: true });

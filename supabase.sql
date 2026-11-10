@@ -316,6 +316,40 @@ as $$
   )
 $$;
 
+-- Which tickets a project member may see: Clients see the tickets they raised, Developers see the
+-- tickets assigned to them or raised by them, Admins and Collaborators see every ticket.
+create or replace function public.ticket_visible_to_member(
+  p_project_id text,
+  p_ticket_id text,
+  p_role text,
+  p_member_id text
+)
+returns boolean
+language sql
+stable
+security definer
+set search_path = pg_catalog, public
+as $$
+  select case
+    when p_role = 'Client' then exists (
+      select 1 from public.tickets t
+       where t.project_id = p_project_id and t.id = p_ticket_id and t.created_by = p_member_id
+    )
+    when p_role = 'Developer' then exists (
+      select 1 from public.tickets t
+       where t.project_id = p_project_id and t.id = p_ticket_id
+         and (
+           t.payload->>'raisedBy' = p_member_id
+           or exists (
+             select 1 from public.ticket_assignees a
+              where a.project_id = t.project_id and a.ticket_id = t.id and a.member_id = p_member_id
+           )
+         )
+    )
+    else true
+  end
+$$;
+
 create or replace function public.load_authorized_workspace(
   session_token text,
   requested_project_id text default null,
@@ -403,7 +437,7 @@ begin
     into ticket_total
     from public.tickets ticket
    where ticket.project_id = active_project_id
-     and (member_project_role <> 'Client' or ticket.created_by = current_member_id);
+     and public.ticket_visible_to_member(ticket.project_id, ticket.id, member_project_role, current_member_id);
 
   return jsonb_build_object(
     'scope', jsonb_build_object(
@@ -462,7 +496,7 @@ begin
           select ticket.*
             from public.tickets ticket
            where ticket.project_id = active_project_id
-             and (member_project_role <> 'Client' or ticket.created_by = current_member_id)
+             and public.ticket_visible_to_member(ticket.project_id, ticket.id, member_project_role, current_member_id)
            order by ticket.date desc nulls last, ticket.id
            limit safe_page_size offset safe_page_offset
         ) page
@@ -479,11 +513,11 @@ begin
                 select ticket_page.id
                   from public.tickets ticket_page
                  where ticket_page.project_id = active_project_id
-                   and (member_project_role <> 'Client' or ticket_page.created_by = current_member_id)
+                   and public.ticket_visible_to_member(ticket_page.project_id, ticket_page.id, member_project_role, current_member_id)
                  order by ticket_page.date desc nulls last, ticket_page.id
                  limit safe_page_size offset safe_page_offset
               )
-              and (member_project_role <> 'Client' or ticket.created_by = current_member_id)
+              and public.ticket_visible_to_member(ticket.project_id, ticket.id, member_project_role, current_member_id)
          )
     ), '[]'::jsonb),
     'project_files', '[]'::jsonb,
@@ -520,7 +554,7 @@ begin
       select jsonb_agg(to_jsonb(row))
         from public.google_calendar_connections row
        where row.organization_id = (select project.organization_id from public.projects project where project.id = active_project_id)
-         and member_project_role = 'Admin'
+         and member_project_role <> 'Client' -- team members' meetings are synced too; the token never leaves the server
     ), '[]'::jsonb),
     'workspace_meta', coalesce((
       select jsonb_agg(to_jsonb(row))
@@ -604,6 +638,7 @@ begin
               and ticket.created_by = current_member_id
          )
        )
+       and (member_project_role <> 'Developer' or file.ticket_id = '' or public.ticket_visible_to_member(file.project_id, file.ticket_id, member_project_role, current_member_id))
        and (record_id is null or file.id = record_id);
   elsif collection_name = 'audit' then
     if member_project_role = 'Admin' then
@@ -683,6 +718,7 @@ begin
                     and ticket.created_by = current_member_id
                )
              )
+             and (member_project_role <> 'Developer' or file.ticket_id = '' or public.ticket_visible_to_member(file.project_id, file.ticket_id, member_project_role, current_member_id))
              and (record_id is null or file.id = record_id)
            order by file.payload->>'at' desc nulls last, file.id
            limit safe_page_size offset safe_page_offset
@@ -1441,6 +1477,7 @@ end
 $$;
 
 revoke all on function public.load_workspace_state() from public, anon, authenticated;
+revoke all on function public.ticket_visible_to_member(text, text, text, text) from public, anon, authenticated;
 revoke all on function public.load_authorized_workspace(text, text, integer, integer) from public, anon, authenticated;
 revoke all on function public.load_authorized_collection(text, text, text, text, text, integer, integer, text) from public, anon, authenticated;
 revoke all on function public.lookup_login_state(text, text) from public, anon, authenticated;
@@ -1453,6 +1490,7 @@ drop function if exists public.lock_member_session_writes();
 revoke all on function public.create_member_session(text, text, numeric) from public, anon, authenticated;
 revoke all on function public.apply_workspace_changes(jsonb) from public, anon, authenticated;
 grant execute on function public.load_workspace_state() to service_role;
+grant execute on function public.ticket_visible_to_member(text, text, text, text) to service_role;
 grant execute on function public.load_authorized_workspace(text, text, integer, integer) to service_role;
 grant execute on function public.load_authorized_collection(text, text, text, text, text, integer, integer, text) to service_role;
 grant execute on function public.lookup_login_state(text, text) to service_role;

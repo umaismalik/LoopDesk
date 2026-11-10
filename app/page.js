@@ -5,6 +5,7 @@ import dynamic from "next/dynamic";
 import { correctTurnNames, generateEnglishKeyPoints, generateMeetingParticipantCards } from "../lib/local-transcription";
 import MeetingNotes from "../components/MeetingNotes";
 import Dashboard from "./dashboard";
+import { ATTACHMENT_ACCEPT, ATTACHMENT_HINT, attachmentError, DESCRIPTION_CHAR_LIMIT, DESCRIPTION_WORD_LIMIT, descriptionError, wordCount } from "../lib/limits";
 
 const LocalTranscriber = dynamic(() => import("../components/LocalTranscriber"), { ssr: false });
 
@@ -569,6 +570,8 @@ export default function Page() {
   const save = async (e) => {
     e.preventDefault();
     const m = modal, t = { ...m }; ["_files", "_cat", "_url", "_uname"].forEach((k) => delete t[k]);
+    const descriptionProblem = descriptionError(t.details);
+    if (descriptionProblem) return alert(descriptionProblem);
     setModal(null);
     if (me.role === "Client") {
       const r = await api("client", { ticket: t }, key, projectId);
@@ -613,6 +616,8 @@ export default function Page() {
   const dt = tickets.find((t) => t.id === detail);
   // Used by both the file picker and drag-and-drop on the Attachments page.
   const uploadOne = async (f) => {
+    const problem = attachmentError(f);
+    if (problem) return alert(problem);
     setUploading(true);
     try {
       const fd = new FormData(); fd.append("file", f); fd.append("cat", CATS[fc]);
@@ -660,8 +665,9 @@ export default function Page() {
       setParticipantSummaries(savedCards);
       setSelectedMeetingMemberId(savedCards[0]?.memberId || "");
       setMeetingCardView("selected");
-      if (r.inviteEmailsSent < r.inviteEmailsTotal) setMeetingError(`Meeting scheduled, but invitation emails were delivered to ${r.inviteEmailsSent} of ${r.inviteEmailsTotal} invitees. ${r.emailErrors?.[0] || "Check the server email configuration."}`);
-      else if (r.inviteEmailsTotal) setMeetingNotice(`Meeting scheduled. Invitation emails sent to ${r.inviteEmailsSent} team member(s).`);
+      const calendarText = r.calendarSynced ? " Added to Google Calendar — every participant gets a calendar invitation and reminder notifications." : "";
+      if (r.inviteEmailsSent < r.inviteEmailsTotal || r.calendarError) setMeetingError(`Meeting scheduled.${calendarText} ${r.calendarError ? r.calendarError + " " : ""}${r.inviteEmailsSent < r.inviteEmailsTotal ? `Invitation emails were delivered to ${r.inviteEmailsSent} of ${r.inviteEmailsTotal} invitees. ${r.emailErrors?.[0] || "Check the server email configuration."}` : ""}`.trim());
+      else setMeetingNotice(`Meeting scheduled.${calendarText}${r.inviteEmailsTotal ? ` Invitation emails sent to ${r.inviteEmailsSent} team member(s).` : ""}${!r.calendarConnected ? " Ask a project admin to connect Google Calendar so meetings appear on everyone's calendar." : ""}`);
       await refreshMeetings(meetingForm.date.slice(0, 7));
     } catch (error) { setMeetingError(error.message || "Could not create meeting"); }
     finally { setMeetingBusy(false); }
@@ -750,6 +756,8 @@ export default function Page() {
     if (!confirm("Delete this meeting" + (meeting.weekly ? " series" : "") + "?")) return;
     const r = await api("meetings", { action: "delete", id: meeting.id }, key, projectId);
     if (!r.ok) { setMeetingError(r.error || "Could not delete meeting"); return; }
+    if (r.calendarError) setMeetingError(r.calendarError);
+    else if (meeting.googleCalendarEventId) setMeetingNotice("Meeting deleted and removed from Google Calendar; participants were notified of the cancellation.");
     setMeetingSelected(null); setMeetingDraft(""); await refreshMeetings();
   };
   const runRecordingClock = (recorder) => {
@@ -1192,14 +1200,14 @@ export default function Page() {
             {!googleCalendarConnected && <div className="meet-setup">
               <span className="files-drop-icon"><Ic d={VIDEO} /></span>
               <div>
-                <b>Create Google Meet rooms right from here</b>
+                <b>Sync meetings with Google Calendar</b>
                 <span>{canManageMeetings
                   ? googleCalendarConfigured
-                    ? "Connect your Google account once. After that, every online meeting gets its own Meet link automatically and \"Start meeting now\" opens a call in one click."
+                    ? "Connect your Google account once. After that, every meeting you schedule is added to each participant's Google Calendar (they get Google's invitation and reminder notifications), online meetings get their own Meet link automatically, and \"Start meeting now\" opens a call in one click."
                     : "One-time setup: add your Google OAuth keys (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET) in Vercel, then connect your Google account here. No more copying links from Google Meet."
-                  : "Ask a project admin to connect Google Meet. Until then, paste a Meet or Zoom link when scheduling."}</span>
+                  : "Ask a project admin to connect Google Calendar so meetings appear on everyone's calendar. Until then, paste a Meet or Zoom link when scheduling."}</span>
               </div>
-              {canManageMeetings && googleCalendarConfigured && <button className="btn" onClick={connectGoogleCalendar}>Connect Google Meet</button>}
+              {canManageMeetings && googleCalendarConfigured && <button className="btn" onClick={connectGoogleCalendar}>Connect Google Calendar</button>}
             </div>}
             {meetingError && <div className="meeting-alert" role="alert"><b>Action needed</b><span>{meetingError}</span></div>}
             {meetingNotice && <div className="meeting-success" role="status">{meetingNotice}</div>}
@@ -1214,7 +1222,7 @@ export default function Page() {
                 {meetingForm.online && <>
                   <label>Conference service<select value={meetingForm.roomProvider} onChange={(e) => setMeetingForm({ ...meetingForm, roomProvider: e.target.value, roomUrl: "" })}><option value="google-meet">Google Meet</option><option value="zoom">Zoom</option></select></label>
                   {meetingForm.roomProvider === "google-meet" ? <div className="meeting-provider-actions">
-                    {canManageMeetings && googleCalendarConnected
+                    {googleCalendarConnected
                       ? <span className="meeting-google-status">Connected to Google Calendar{googleCalendarEmail ? ` · ${googleCalendarEmail}` : ""}</span>
                       : canManageMeetings && googleCalendarConfigured
                         ? <button type="button" className="btn alt" onClick={connectGoogleCalendar}>Connect Google Calendar</button>
@@ -1242,7 +1250,7 @@ export default function Page() {
                 </fieldset>
                 <label className="meeting-agenda">Agenda<textarea rows="3" maxLength="3000" value={meetingForm.agenda} onChange={(e) => setMeetingForm({ ...meetingForm, agenda: e.target.value })} placeholder="Topics for the team to discuss" /></label>
               </div>
-              <p className="meeting-invite-hint">{meetingForm.online ? meetingForm.roomProvider === "google-meet" ? googleCalendarConnected ? "A Google Meet room and shareable link will be created automatically when you schedule." : "Connect Google Calendar to create a shareable Meet room automatically, or paste a Meet link above. Meetings are limited to 60 minutes." : "Open Zoom, create a meeting there, then paste its shareable invite link. Meetings are limited to 60 minutes." : "This is an in-person meeting; invitees receive the date and time by email. Meetings are limited to 60 minutes."} Recording uses this device's microphone; online-call audio is not captured unless the microphone can hear the room speakers.</p>
+              <p className="meeting-invite-hint">{googleCalendarConnected ? "The meeting will be added to every invitee's Google Calendar (and yours); Google sends each of them an invitation and reminder notifications. " : ""}{meetingForm.online ? meetingForm.roomProvider === "google-meet" ? googleCalendarConnected ? "A Google Meet room and shareable link will be created automatically when you schedule." : "Connect Google Calendar to create a shareable Meet room automatically, or paste a Meet link above. Meetings are limited to 60 minutes." : "Open Zoom, create a meeting there, then paste its shareable invite link. Meetings are limited to 60 minutes." : "This is an in-person meeting; invitees receive the date and time by email. Meetings are limited to 60 minutes."} Recording uses this device's microphone; online-call audio is not captured unless the microphone can hear the room speakers.</p>
               <div className="acts end"><button type="button" className="btn alt" onClick={() => setMeetingFormOpen(false)}>Cancel</button><button className="btn" disabled={meetingBusy}>{meetingBusy ? "Saving…" : "Schedule"}</button></div>
             </form>}
             <div className="meeting-calendar">
@@ -1421,9 +1429,9 @@ export default function Page() {
             <label className={"files-drop" + (dragOver ? " over" : "") + (uploading ? " busy" : "")}
               onDragOver={(e) => { e.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)}
               onDrop={(e) => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files?.[0]; if (f) uploadOne(f); }}>
-              <input type="file" className="sr-only" disabled={uploading} onChange={uploadFile} />
+              <input type="file" className="sr-only" accept={ATTACHMENT_ACCEPT} disabled={uploading} onChange={uploadFile} />
               <span className="files-drop-icon"><Ic d={UPLOAD} /></span>
-              <span className="files-drop-text"><b>{uploading ? "Uploading…" : <>Click to upload <span>or drag a file here</span></>}</b><small>Saved to <strong>{CATS[fc]}</strong></small></span>
+              <span className="files-drop-text"><b>{uploading ? "Uploading…" : <>Click to upload <span>or drag a file here</span></>}</b><small>Saved to <strong>{CATS[fc]}</strong></small><small>{ATTACHMENT_HINT}</small></span>
             </label>
             <form className="files-link" onSubmit={(e) => { e.preventDefault(); addLink(); }}>
               <div className="files-link-head"><span className="files-drop-icon small"><Ic d={LINK} /></span><div><b>Add a document link</b><small>Google Drive, Docs, Figma, Notion…</small></div></div>
@@ -1467,7 +1475,7 @@ export default function Page() {
                 <button className="ic" onClick={() => adm("status", { id: m.id, disabled: m.status !== "disabled" })}>{m.status === "disabled" ? "Enable" : "Disable"}</button>
                 <button className="ic dl" onClick={() => confirm("Remove " + m.name + "?") && adm("remove", { id: m.id })}><Ic d={TRASH} /></button></>)}</td></tr>))}
           </tbody></table></div>
-          <p className="note">Roles and team membership apply only to {activeProject?.name} in {activeOrganization?.name}. Admin and Collaborator: full access to tickets (create, edit, assign, change status, delete). Developer: create tickets, and edit or change the status of tickets assigned to them or raised by them; cannot reassign or delete. Assignees are emailed the full task when they are assigned. For meeting cards, saved meeting notes, and task details, only Admins and Collaborators can edit; other team members can change status on tasks assigned to them or request one-hour admin-approved edit access. Client: sees only tickets they raised in this project; can create, update, reopen and delete them.</p></section>
+          <p className="note">Roles and team membership apply only to {activeProject?.name} in {activeOrganization?.name}. Admin and Collaborator: full access to tickets (create, edit, assign, change status, delete). Developer: sees only the tickets assigned to them or raised by them (with their attachments and meeting-note tasks), can create tickets and edit or change the status of their own tickets; cannot reassign or delete. Assignees are emailed the full task when they are assigned. For meeting cards, saved meeting notes, and task details, only Admins and Collaborators can edit; other team members can change status on tasks assigned to them or request one-hour admin-approved edit access. Client: sees only tickets they raised in this project; can create, update, reopen and delete them.</p></section>
         </>) : (<>
           {view === "all" ? <Dashboard key={projectId} apiGet={(path) => api(path, null, key, projectId)} members={members} projectName={activeProject?.name || ""} onOpenTicket={openTicket} /> : (
           <section className="panel">
@@ -1478,7 +1486,7 @@ export default function Page() {
               <select value={fp} onChange={(e) => setFp(e.target.value)}><option value="">All priorities</option>{PRIO.map((s) => <option key={s}>{s}</option>)}</select>
               <select value={fa} onChange={(e) => setFa(e.target.value)}><option value="">All assignees</option><option value="none">Unassigned</option>{members.filter((x) => x.role !== "Client").map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}</select>
             </div>
-            <p className="note">Showing {tickets.length ? ticketOffset + 1 : 0}–{ticketOffset + tickets.length} of {ticketTotal} tickets. Search and filters apply to this page.</p>
+            <p className="note">Showing {tickets.length ? ticketOffset + 1 : 0}–{ticketOffset + tickets.length} of {ticketTotal} tickets. Search and filters apply to this page.{me.role === "Developer" && " You see only the tickets assigned to you or raised by you."}</p>
             <div className="wrap"><table>
               <thead><tr><th>ID</th><th>Ticket</th><th>Raised</th><th>Priority</th><th>Assignee</th><th>Release</th><th>Status</th><th>Completed</th><th>Actions</th></tr></thead>
               <tbody>
@@ -1523,15 +1531,22 @@ export default function Page() {
           <label>Client (notified when closed)<select disabled={!manager && !!modal.id} {...f("createdBy")}><option value="">None</option>{members.filter((x) => x.role === "Client").map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}</select></label>
           </>)}
           {client && <p className="note full">The date is added automatically.</p>}
-          <label className="full">{client ? "Description" : "Description / fix details"}<textarea rows="4" {...f("details")} /></label>
+          <label className="full">{client ? "Description" : "Description / fix details"}<textarea rows="4" maxLength={DESCRIPTION_CHAR_LIMIT} aria-invalid={wordCount(modal.details) > DESCRIPTION_WORD_LIMIT} {...f("details")} />
+            <small className={"word-count" + (wordCount(modal.details) > DESCRIPTION_WORD_LIMIT ? " over" : "")} aria-live="polite">{wordCount(modal.details)} / {DESCRIPTION_WORD_LIMIT} words{wordCount(modal.details) > DESCRIPTION_WORD_LIMIT ? " — please shorten the description" : ""}</small></label>
           {!client && <label className="full">Resolution / solution (shown to the client)<textarea rows="3" {...f("resolution")} /></label>}
           <div className="full ab"><b>Attachments</b>
             <div className="tools up"><select value={modal._cat || CATS[CATS.length - 1]} onChange={(e) => setModal({ ...modal, _cat: e.target.value })}>{CATS.map((c) => <option key={c}>{c}</option>)}</select>
-              <input type="file" multiple onChange={(e) => setModal({ ...modal, _files: [...e.target.files] })} /></div>
+              <input type="file" multiple accept={ATTACHMENT_ACCEPT} onChange={(e) => {
+                const picked = [...e.target.files];
+                const problems = picked.map(attachmentError).filter(Boolean);
+                if (problems.length) { alert(problems.join("\n")); e.target.value = ""; }
+                setModal({ ...modal, _files: problems.length ? [] : picked });
+              }} /></div>
+            <p className="note">{ATTACHMENT_HINT}</p>
             <div className="tools up"><input placeholder="Or paste a link (Google Drive, Docs...)" value={modal._url || ""} onChange={(e) => setModal({ ...modal, _url: e.target.value })} />
               <input placeholder="Link name (optional)" value={modal._uname || ""} onChange={(e) => setModal({ ...modal, _uname: e.target.value })} /></div></div>
         </div>
-        <div className="acts end"><button type="button" className="btn alt" onClick={() => setModal(null)}>Cancel</button><button className="btn">Save ticket</button></div>
+        <div className="acts end"><button type="button" className="btn alt" onClick={() => setModal(null)}>Cancel</button><button className="btn" disabled={!!descriptionError(modal.details)}>Save ticket</button></div>
       </form></div>)}
 
       {projectModal && (<div className="ov" onClick={() => setProjectModal(false)}><form className="modal project-modal" onClick={(e) => e.stopPropagation()} onSubmit={createProject}>
