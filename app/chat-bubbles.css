@@ -132,3 +132,61 @@ a.chat-ticket:hover{text-decoration:underline}
   .bubble-row:hover .bubble-actions{opacity:0;pointer-events:none}
   .bubble-row.show-actions .bubble-actions{opacity:1;pointer-events:auto;transform:none}
 }
+
+/* ---------- Chat search bar (step through matches, WhatsApp-style) ---------- */
+.chat-search{display:none!important}
+.chat-searchbar{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--line);background:#fff;position:relative;z-index:3;animation:searchbar-in .2s cubic-bezier(.22,1,.36,1)}
+@keyframes searchbar-in{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+.chat-searchbar-field{flex:1;min-width:0;display:flex;align-items:center;gap:8px;height:38px;padding:0 10px 0 12px;border:1.5px solid var(--line-2);border-radius:999px;background:var(--card-2);color:var(--mut);transition:border-color .15s,box-shadow .15s,background .15s}
+.chat-searchbar-field:focus-within{border-color:var(--pri);background:#fff;box-shadow:0 0 0 4px var(--pri-ring);color:var(--pri)}
+.chat-searchbar-field input{flex:1;min-width:0;border:0!important;background:none!important;box-shadow:none!important;outline:none;padding:0;min-height:0;height:100%;font-size:14px;color:var(--ink)}
+.chat-searchbar-clear{border:0;background:var(--line);color:var(--ink-2);width:20px;height:20px;border-radius:50%;font-size:14px;line-height:1;cursor:pointer;display:grid;place-items:center}
+.chat-searchbar-count{font-size:12px;font-weight:600;color:var(--ink-2);white-space:nowrap;min-width:64px;text-align:center}
+.chat-searchbar-count.none{color:var(--bad)}
+.chat-searchbar-nav{display:grid;place-items:center;width:34px;height:34px;border:1px solid var(--line-2);border-radius:50%;background:#fff;color:var(--ink-2);cursor:pointer;transition:all .15s}
+.chat-searchbar-nav:hover:not(:disabled){background:var(--pri-soft);border-color:#a5b4fc;color:var(--pri)}
+.chat-searchbar-nav:disabled{opacity:.4;cursor:not-allowed}
+.chat-searchbar-close{border:0;background:none;color:var(--pri);font:inherit;font-weight:700;font-size:13px;cursor:pointer;padding:6px 4px}
+.bubble-row.match .bubble{box-shadow:0 0 0 2.5px #facc15,0 4px 14px -4px rgba(250,204,21,.6)}
+.bubble-text mark{background:#fde047;color:#111;border-radius:3px;padding:0 2px}
+
+/* ---------- Read receipts: double tick turns into a filled circle when read ---------- */
+.bubble-read{display:inline-grid;place-items:center;width:17px;height:17px;border-radius:50%;background:#22d3ee;color:#0e3a5a;font-size:8.5px;font-weight:900;letter-spacing:-2.5px;padding-right:2px;box-shadow:0 0 0 1.5px rgba(255,255,255,.85);animation:read-pop .35s cubic-bezier(.34,1.56,.64,1)}
+.bubble-row.theirs .bubble-read{background:#0ea5e9;color:#fff}
+@keyframes read-pop{from{transform:scale(.3);opacity:0}to{transform:none;opacity:1}}
+.seen-by{display:flex;align-items:center;gap:2px;margin:4px 4px 0 0;animation:fade-in .3s ease-out}
+.seen-dot{--av:var(--pri);width:18px;height:18px;border-radius:50%;display:grid;place-items:center;background:var(--av);color:#fff;font-size:7.5px;font-weight:800;border:1.5px solid #fff;margin-left:-5px;box-shadow:0 1px 2px rgba(15,23,42,.2)}
+.seen-dot:first-child{margin-left:0}
+.seen-more{font-size:10px;font-weight:700;color:var(--mut);margin-left:3px}
+.seen-by small{font-size:10.5px;color:var(--mut);margin-left:5px}
+@media(max-width:760px){
+  .chat-searchbar{padding:8px 10px;gap:6px;flex-wrap:wrap}
+  .chat-searchbar-field{flex:1 1 100%;order:-1}
+  .chat-searchbar-count{flex:1;text-align:left}
+  .chat-searchbar-field input{font-size:16px}
+}
+
+/* ---------- Self sign-up screens ---------- */
+.gate .modal.gate-wide{max-width:620px}
+.signup .g{margin-top:6px}
+.signup label small{font-weight:400;color:var(--mut)}
+.signup-terms{display:flex!important;align-items:center;gap:8px;font-weight:500}
+.signup-terms input{width:auto;min-height:0}
+.signup-cta{display:flex;align-items:center;justify-content:center;gap:6px;flex-wrap:wrap;margin-top:18px;padding-top:14px;border-top:1px solid var(--line);font-size:13px;color:var(--mut)}
+.signup-sent{display:grid;gap:10px;text-align:center;justify-items:center}
+.signup-sent .acts{width:100%}
+.signup-mail{width:64px;height:64px;border-radius:20px;display:grid;place-items:center;font-size:30px;background:var(--pri-soft);color:var(--pri);animation:bob 2.6s ease-in-out infinite}
+.signup-wait{display:grid;gap:12px;justify-items:center;padding:12px 0;color:var(--ink-2)}
+.signup-spinner{width:34px;height:34px;border-radius:50%;border:3px solid var(--pri-soft);border-top-color:var(--pri);animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ---------- Departments and sub-companies ---------- */
+.org-trail{display:block;margin-top:-2px;color:#a5b4fc;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.org-kind{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:4px 0 12px}
+.org-kind label{display:grid;gap:3px;padding:12px;border:1.5px solid var(--line-2);border-radius:12px;cursor:pointer;transition:all .15s}
+.org-kind label input{position:absolute;opacity:0;pointer-events:none}
+.org-kind label b{font-size:14px;color:var(--ink)}
+.org-kind label small{font-size:12px;color:var(--mut);font-weight:400;line-height:1.45}
+.org-kind label:hover{border-color:#a5b4fc}
+.org-kind label.on{border-color:var(--pri);background:var(--pri-soft);box-shadow:0 0 0 3px var(--pri-ring)}
+@media(max-width:480px){.org-kind{grid-template-columns:minmax(0,1fr)}}

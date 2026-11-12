@@ -2,6 +2,15 @@
 
 LoopDesk is a multi-organization workspace for projects, team collaboration, client ticket requests, meetings, notes, and task tracking. The product name and logo are provisional branding; verify domain and trademark availability before a commercial launch.
 
+## Companies, departments and self sign-up
+
+- **Main companies (tenants)** are created only through **self sign-up**. Click **Create your company workspace** on the sign-in screen and enter the company name, your name, work email and password. The app emails a confirmation link (valid for 24 hours, works once). Opening it creates the company, its first project and the owner account (Admin), and signs the owner in. Someone who already has a LoopDesk login signs up with that login's password, and the new company is added to the same account. Set `SIGNUP_DISABLED=true` on the server to close sign-ups.
+- **Child organizations:** inside a company, its admins use **+ Add department or sub-company** in the company picker. A *Department* is a team inside the company (Marketing, Development). A *Sub-company* is a separate business owned by it (a branch or brand). Each child can have its own projects, and the company's admins manage all of them. The dashboard can no longer create new main companies.
+- Companies that existed before this change remain main companies. Each company's data stays separate: members only see the projects they belong to.
+- **Email delivery matters for sign-up:** the confirmation email must reach any address. With Resend, verify your sending domain (sandbox mode only emails the account owner). With Gmail SMTP, keep within Gmail's daily sending limit.
+- **Platform Admin console:** the LoopDesk operator sees **Platform Admin** in the sidebar. It lists every company with its owner, projects, people, departments and sub-companies. From there the operator can change a company's plan (Trial, Starter, Business, Enterprise) or **suspend / reactivate** it. A suspended company's members can only sign out: their dashboard, chat and live updates are blocked within about a minute, and no data is deleted. Platform admins are the emails in `PLATFORM_ADMIN_EMAILS` (comma separated), or the `ADMIN_EMAIL` account by default. The console never shows a company's tickets, chats or files.
+- **Setup:** re-run the current `supabase.sql`. It adds `org_meta`, `signup_requests` and `chat_reads`.
+
 ## Live updates and Team Chat
 
 - **Live updates.** Every open browser checks the project's change version every 5 seconds (only while the tab is visible). When anyone changes a ticket, file, meeting, note or team member, tickets, the dashboard, the files, the activity log, the meeting calendar and Meeting Notes refresh by themselves, with no page reload. Forms you are typing in and Meeting Notes you are editing are never overwritten.

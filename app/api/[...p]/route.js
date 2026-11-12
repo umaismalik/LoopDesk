@@ -5,6 +5,9 @@ import { sendEmail } from "../../../lib/email";
 import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, loadProjectTicketIds, loadClientTickets, deleteTicketFiles, loadTicketSummaries, loadTicketAccess, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
 import { check } from "../../../lib/reminders";
 import { liveRequest, bumpProjectVersion } from "../../../lib/live-api";
+import { signupRequest } from "../../../lib/signup-api";
+import { CHILD_KINDS, loadOrgMeta, saveOrgMeta, tenantSuspended } from "../../../lib/tenant-store";
+import { isPlatformAdmin, platformRequest } from "../../../lib/platform-api";
 import { attachmentError, attachmentKind, descriptionError } from "../../../lib/limits";
 
 export const dynamic = "force-dynamic";
@@ -387,6 +390,10 @@ async function h(req, p, m) {
   const key = req.headers.get("x-key");
   // Live-update polling and team chat use a lightweight session check, not the workspace load.
   if (r === "pulse" || r === "chat") return liveRequest(req, r, m, key, u);
+  // Public self sign-up creates a new company workspace (see lib/signup-api.js).
+  if (r === "signup") return signupRequest(req, m, u);
+  // Platform Admin console: every company on LoopDesk, for the operator only (see lib/platform-api.js).
+  if (r === "platform") return platformRequest(req, m, key);
   if (remote && r === "login" && m === "POST") {
     const body = await req.json();
     const id = String(body.id || "").trim().toLowerCase();
@@ -638,6 +645,10 @@ async function h(req, p, m) {
   d.tickets = project.tickets; d.files = project.files; d.audit = project.audit;
   const membership = account && project.members.find((x) => x.memberId === account.id && x.status !== "disabled");
   const me = membership ? { ...account, role: membership.role } : null;
+  // A suspended company's members can only sign out until the platform operator reactivates it.
+  if (me && !["logout", "logoutall"].includes(r) && !isPlatformAdmin(account.email) && await tenantSuspended(project.organizationId)) {
+    return J({ error: "This company workspace is suspended. Please contact LoopDesk support.", suspended: true }, 403);
+  }
   const meetingMemberships = account ? project.members
     .filter((entry) => entry.memberId === account.id && entry.status !== "disabled") : [];
   const canUseMeetings = !!meetingMemberships?.some((entry) => entry.role !== "Client");
@@ -718,9 +729,18 @@ async function h(req, p, m) {
       if (!d.members.length) return J({ setup: true });
       if (!me) return J({ error: account ? "You are not a member of this project" : "denied" }, account ? 403 : 401);
       const projects = d.projects.filter((x) => x.members.some((entry) => entry.memberId === account.id && entry.status !== "disabled")).map(({ id, name, organizationId }) => ({ id, name, organizationId: organizationId || defaultOrganization.id }));
-      const organizations = d.organizations
+      const organizationRows = d.organizations
         .filter((organization) => (organization.adminIds || []).includes(account.id) || projects.some((item) => d.projects.find((projectItem) => projectItem.id === item.id)?.organizationId === organization.id))
         .map(({ id, name, adminIds }) => ({ id, name, canCreateProject: (adminIds || []).includes(account.id) }));
+      // Main companies (tenants) and their child organizations (departments / sub-companies).
+      const orgMeta = await loadOrgMeta(d.organizations.map((item) => item.id));
+      const organizations = organizationRows.map((item) => {
+        const meta = orgMeta.get(item.id);
+        const parentId = meta?.parentId || "";
+        const parent = parentId && d.organizations.find((entry) => entry.id === parentId);
+        const tenantAdmin = (d.organizations.find((entry) => entry.id === (parentId || item.id))?.adminIds || []).includes(account.id);
+        return { ...item, parentId, kind: parentId ? meta.kind : "tenant", status: meta?.status || "active", parentName: parent?.name || "", canCreateProject: item.canCreateProject || (!!parentId && tenantAdmin), canAddChild: !parentId && tenantAdmin };
+      });
       const elevatedMeetingRole = ["Admin", "Collaborator"].includes(me.role);
       const editGrant = d.meetingEditRequests.find((item) => item.projectId === project.id && item.memberId === account.id && item.status === "approved" && item.expiresAt > Date.now());
       const meetingEditRequests = d.meetingEditRequests.filter((item) => item.projectId === project.id && (me.role === "Admin" ? true : item.memberId === account.id));
@@ -744,7 +764,7 @@ async function h(req, p, m) {
       const googleCalendar = googleCalendarForOrganization(d, project.organizationId);
       const myTickets = visibleTickets(d.tickets, me);
       const ticketTotal = limitedToOwnTickets(me) && !remote ? myTickets.length : d._scope?.ticket_total ?? myTickets.length;
-      return J({ me: pub(me), projects: projects.map((item) => { const projectItem = d.projects.find((entry) => entry.id === item.id); return { ...item, organizationId: projectItem?.organizationId || defaultOrganization.id }; }), organizations, projectId: project.id, canUseMeetings, canManageMeetings, meetingEditAccess, meetingEditAccessExpiresAt, meetingEditRequests, googleCalendarConfigured: googleOAuthConfigured(), googleCalendarConnected: !!googleCalendar?.refreshToken, googleCalendarEmail: me.role === "Admin" ? googleCalendar?.email || "" : "", nameAliases: project.nameAliases || {}, tickets: myTickets, ticketPagination: { offset: d._scope?.ticket_offset || 0, limit: d._scope?.ticket_limit || myTickets.length, total: ticketTotal, hasMore: (d._scope?.ticket_offset || 0) + myTickets.length < ticketTotal }, members, invites: me.role === "Admin" ? d.invites.filter((x) => x.projectId === project.id) : [], audit: me.role === "Admin" ? d.audit.slice(0, 300) : [], files: visibleFiles(d.files, d.tickets, me) });
+      return J({ me: pub(me), projects: projects.map((item) => { const projectItem = d.projects.find((entry) => entry.id === item.id); return { ...item, organizationId: projectItem?.organizationId || defaultOrganization.id }; }), organizations, projectId: project.id, canUseMeetings, canManageMeetings, meetingEditAccess, meetingEditAccessExpiresAt, meetingEditRequests, isPlatformAdmin: isPlatformAdmin(account.email), googleCalendarConfigured: googleOAuthConfigured(), googleCalendarConnected: !!googleCalendar?.refreshToken, googleCalendarEmail: me.role === "Admin" ? googleCalendar?.email || "" : "", nameAliases: project.nameAliases || {}, tickets: myTickets, ticketPagination: { offset: d._scope?.ticket_offset || 0, limit: d._scope?.ticket_limit || myTickets.length, total: ticketTotal, hasMore: (d._scope?.ticket_offset || 0) + myTickets.length < ticketTotal }, members, invites: me.role === "Admin" ? d.invites.filter((x) => x.projectId === project.id) : [], audit: me.role === "Admin" ? d.audit.slice(0, 300) : [], files: visibleFiles(d.files, d.tickets, me) });
     }
     if (m === "GET" && r === "invite") {
       const i = d.invites.find((x) => x.token === u.searchParams.get("t"));
@@ -1555,15 +1575,31 @@ async function h(req, p, m) {
       return J({ ok: true });
     }
     if (r === "organization") {
-      if (me.role !== "Admin") return J({ error: "Admin only" }, 403);
+      // New main companies are created only through self sign-up. Inside a company, its admins add
+      // child organizations: departments or sub-companies.
       const body = await req.json();
       const name = String(body.name || "").trim().slice(0, 80);
-      if (!name) return J({ error: "Company name is required" }, 400);
-      if (d.organizations.some((item) => item.name.toLowerCase() === name.toLowerCase())) return J({ error: "A company with this name already exists" }, 400);
-      const organization = { id: uid().slice(0, 12), name, adminIds: [account.id] };
+      const kind = CHILD_KINDS.includes(body.kind) ? body.kind : "department";
+      const parentId = String(body.parentId || "");
+      if (!name) return J({ error: "Enter a name" }, 400);
+      const meta = await loadOrgMeta(d.organizations.map((item) => item.id));
+      const parent = d.organizations.find((item) => item.id === parentId);
+      if (!parent || meta.get(parentId)?.parentId) return J({ error: "Choose the main company to add this to" }, 400);
+      if (!(parent.adminIds || []).includes(account.id)) return J({ error: `Only an admin of ${parent.name} can add departments or sub-companies` }, 403);
+      const siblings = d.organizations.filter((item) => meta.get(item.id)?.parentId === parentId);
+      if (siblings.some((item) => item.name.toLowerCase() === name.toLowerCase())) return J({ error: `${parent.name} already has "${name}"` }, 400);
+      const organization = { id: uid().slice(0, 12), name, adminIds: [...new Set([...(parent.adminIds || []), account.id])] };
       d.organizations.push(organization);
       await save(d);
-      return J({ ok: true, organization });
+      try {
+        await saveOrgMeta({ organizationId: organization.id, parentId, kind, ownerId: account.id });
+      } catch (error) {
+        // Without its parent link it would look like a separate main company; undo it.
+        d.organizations = d.organizations.filter((item) => item !== organization);
+        await save(d).catch(() => {});
+        throw error;
+      }
+      return J({ ok: true, organization: { id: organization.id, name, parentId, kind, parentName: parent.name, status: "active", canCreateProject: true, canAddChild: false } });
     }
     if (r === "project") {
       if (me.role !== "Admin") return J({ error: "Admin only" }, 403);

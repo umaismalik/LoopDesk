@@ -1556,3 +1556,47 @@ begin
     execute format('grant all on public.%I to service_role', table_name);
   end loop;
 end $$;
+
+-- ---------------------------------------------------------------------------------------------
+-- Companies, child organizations, self sign-up and chat read receipts (added later; safe to re-run).
+-- org_meta: which organization is a main company (tenant) and which is a child (a department or a
+--   sub-company) of which parent. Organizations without a row are main companies.
+-- signup_requests: self sign-ups waiting for email confirmation (expire after 24 hours).
+-- chat_reads: up to which time each member has read each chat conversation (for read ticks).
+-- ---------------------------------------------------------------------------------------------
+create table if not exists public.org_meta (
+  organization_id text primary key references public.organizations(id) on delete cascade,
+  parent_id text references public.organizations(id) on delete cascade,
+  kind text not null default 'tenant',
+  status text not null default 'active',
+  plan text not null default '',
+  owner_member_id text not null default '',
+  created_at bigint not null default 0
+);
+create index if not exists org_meta_parent_idx on public.org_meta (parent_id);
+
+create table if not exists public.signup_requests (
+  token text primary key,
+  email text not null,
+  payload jsonb not null,
+  expires_at bigint not null
+);
+create index if not exists signup_requests_email_idx on public.signup_requests (email);
+
+create table if not exists public.chat_reads (
+  channel_id text not null references public.chat_channels(id) on delete cascade,
+  member_id text not null,
+  last_read_at bigint not null default 0,
+  primary key (channel_id, member_id)
+);
+
+do $$
+declare
+  table_name text;
+begin
+  foreach table_name in array array['org_meta', 'signup_requests', 'chat_reads'] loop
+    execute format('alter table public.%I enable row level security', table_name);
+    execute format('revoke all on public.%I from anon, authenticated', table_name);
+    execute format('grant all on public.%I to service_role', table_name);
+  end loop;
+end $$;

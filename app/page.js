@@ -6,6 +6,7 @@ import { correctTurnNames, generateEnglishKeyPoints, generateMeetingParticipantC
 import MeetingNotes from "../components/MeetingNotes";
 import ActivityLog from "../components/ActivityLog";
 import TeamChat from "../components/TeamChat";
+import PlatformConsole from "../components/PlatformConsole";
 import Dashboard from "./dashboard";
 import { ATTACHMENT_ACCEPT, ATTACHMENT_HINT, attachmentError, DESCRIPTION_CHAR_LIMIT, DESCRIPTION_WORD_LIMIT, descriptionError, wordCount } from "../lib/limits";
 
@@ -256,6 +257,11 @@ export default function Page() {
   const [projectModal, setProjectModal] = useState(false);
   const [organizationModal, setOrganizationModal] = useState(false);
   const [organizationName, setOrganizationName] = useState("");
+  const [organizationKind, setOrganizationKind] = useState("department");
+  // Self sign-up: a new company creates its own workspace (confirmed by email).
+  const [signup, setSignup] = useState({ companyName: "", name: "", email: "", password: "", projectName: "", accept: false });
+  const [signupBusy, setSignupBusy] = useState(false);
+  const [signupSentTo, setSignupSentTo] = useState("");
   const [projectOrganizationId, setProjectOrganizationId] = useState("");
   const [projectName, setProjectName] = useState("");
   const [tickets, setTickets] = useState([]);
@@ -331,6 +337,7 @@ export default function Page() {
   const [pulseChannels, setPulseChannels] = useState([]);
   const [chatRead, setChatRead] = useState({});
   const [pwOpen, setPwOpen] = useState(false);
+  const [isPlatformAdmin, setIsPlatformAdmin] = useState(false);
   const [hasRecordedVoiceNote, setHasRecordedVoiceNote] = useState(false);
   const [transcriptionProgress, setTranscriptionProgress] = useState("");
   const [pendingRecording, setPendingRecording] = useState(null);
@@ -364,7 +371,7 @@ export default function Page() {
   // Workspace fields shared by a full load and a silent live refresh. A live refresh never touches the
   // current view, forms the user is typing in, or the page they are on.
   const applyWorkspace = useCallback((data) => {
-      setMe(data.me); setCanUseMeetings(data.canUseMeetings === undefined ? data.me.role !== "Client" : data.canUseMeetings); setCanManageMeetings(!!data.canManageMeetings); setMeetingEditAccess(!!data.meetingEditAccess); setMeetingEditAccessExpiresAt(data.meetingEditAccessExpiresAt || null); setMeetingEditRequests(data.meetingEditRequests || []); setGoogleCalendarConfigured(!!data.googleCalendarConfigured); setGoogleCalendarConnected(!!data.googleCalendarConnected); setGoogleCalendarEmail(data.googleCalendarEmail || ""); setNameAliases(data.nameAliases || {}); setProjects(data.projects || []); setOrganizations(data.organizations || []); setProjectId(data.projectId); localStorage.setItem("rw-project", data.projectId);
+      setMe(data.me); setIsPlatformAdmin(!!data.isPlatformAdmin); setCanUseMeetings(data.canUseMeetings === undefined ? data.me.role !== "Client" : data.canUseMeetings); setCanManageMeetings(!!data.canManageMeetings); setMeetingEditAccess(!!data.meetingEditAccess); setMeetingEditAccessExpiresAt(data.meetingEditAccessExpiresAt || null); setMeetingEditRequests(data.meetingEditRequests || []); setGoogleCalendarConfigured(!!data.googleCalendarConfigured); setGoogleCalendarConnected(!!data.googleCalendarConnected); setGoogleCalendarEmail(data.googleCalendarEmail || ""); setNameAliases(data.nameAliases || {}); setProjects(data.projects || []); setOrganizations(data.organizations || []); setProjectId(data.projectId); localStorage.setItem("rw-project", data.projectId);
       setTickets(data.tickets); setTicketOffset(data.ticketPagination?.offset || 0); setTicketTotal(data.ticketPagination?.total ?? data.tickets.length); setTicketHasMore(!!data.ticketPagination?.hasMore); setMembers(data.members); setInvites(data.invites || []);
   }, []);
   const load = useCallback(async (k, requestedProject) => {
@@ -383,6 +390,7 @@ export default function Page() {
       const fallback = await api("db", null, k);
       if (fallback.ok) return applyDb(fallback);
     }
+    if (r.suspended) { setMsg(r.error); return setScreen("suspended"); }
     if (!r.ok) { if (r.status === 401) setScreen("login"); else alert(r.error || "Unable to load project"); return; }
     applyDb(r);
     function applyDb(data) {
@@ -393,6 +401,16 @@ export default function Page() {
   useEffect(() => {
     const sp = new URLSearchParams(location.search), t = sp.get("invite");
     if (sp.get("reset")) { setScreen("reset"); return; }
+    if (sp.get("signup")) {
+      setScreen("verifying");
+      api("signup", { action: "verify", token: sp.get("signup") }).then((r) => {
+        history.replaceState(null, "", "/");
+        if (!r.key) { setMsg(r.error || "We could not confirm your sign-up."); setScreen("login"); return; }
+        localStorage.setItem("rw-key", r.key); localStorage.setItem("rw-project", r.projectId);
+        setKey(r.key); load(r.key, r.projectId);
+      });
+      return;
+    }
     if (sp.has("google-meet")) {
       setView("meetings");
       if (sp.get("google-meet") === "connected") setMeetingNotice("Google Calendar connected. New online meetings can now create shareable Google Meet rooms automatically.");
@@ -649,6 +667,15 @@ export default function Page() {
   const canEditMeetingContent = !!me && (["Admin", "Collaborator"].includes(me.role) || meetingEditAccess);
   const activeProject = projects.find((p) => p.id === projectId);
   const activeOrganization = organizations.find((organization) => organization.id === activeProject?.organizationId);
+  // The main company (tenant) of the open project, and every organization in display order:
+  // each main company followed by its departments and sub-companies.
+  const activeTenant = activeOrganization?.parentId ? organizations.find((item) => item.id === activeOrganization.parentId) || null : activeOrganization;
+  const orgLabel = (item) => item.parentId ? `${item.parentName ? item.parentName + " › " : ""}${item.name}` : item.name;
+  const KIND_LABEL = { department: "Department", subsidiary: "Sub-company" };
+  const orderedOrganizations = [
+    ...organizations.filter((item) => !item.parentId).flatMap((tenant) => [tenant, ...organizations.filter((child) => child.parentId === tenant.id)]),
+    ...organizations.filter((item) => item.parentId && !organizations.some((tenant) => tenant.id === item.parentId)),
+  ];
   const canDel = () => manager;
   // Dashboard lists cover the whole project; a ticket outside the loaded page opens via its log search.
   // Opens a ticket from anywhere (dashboard, chat links like "ISS-01", "iss-1" or "FTR 3"): goes to the
@@ -1141,8 +1168,8 @@ export default function Page() {
   };
   const createOrganization = async (e) => {
     e.preventDefault();
-    const result = await api("organization", { name: organizationName }, key, projectId);
-    if (!result.ok) return alert(result.error || "Could not create company");
+    const result = await api("organization", { name: organizationName, kind: organizationKind, parentId: activeTenant?.id }, key, projectId);
+    if (!result.ok) return alert(result.error || "Could not create it");
     setOrganizations((items) => [...items.filter((item) => item.id !== result.organization.id), result.organization]);
     setProjectOrganizationId(result.organization.id);
     setOrganizationName("");
@@ -1222,16 +1249,49 @@ export default function Page() {
 
   const L = (k) => ({ value: lf[k], onChange: (e) => setLf({ ...lf, [k]: e.target.value }) });
   const A = (k) => ({ value: (acct || {})[k] || "", onChange: (e) => setAcct({ ...acct, [k]: e.target.value }) });
+  const S = (k) => ({ value: signup[k], onChange: (e) => setSignup({ ...signup, [k]: e.target.value }) });
+  const submitSignup = async (e) => {
+    e?.preventDefault();
+    setMsg(""); setSignupBusy(true);
+    const r = await api("signup", { action: "request", ...signup });
+    setSignupBusy(false);
+    if (!r.ok) { setMsg(r.error || "Sign-up failed"); return; }
+    setSignupSentTo(r.email); setScreen("signupSent");
+  };
   if (screen !== "app") return (
-    <div className="gate"><div className="modal">
+    <div className="gate"><div className={"modal" + (screen === "signup" ? " gate-wide" : "")}>
       <div className="brand dk"><span className="brand-mark"><img src="/loopdesk-mark.svg" alt="" /></span><div><b>LoopDesk</b><small>Team &amp; project management</small></div></div>
       {screen === "loading" && <p>Loading...</p>}
+      {screen === "suspended" && <div className="signup-sent"><span className="signup-mail" aria-hidden="true">⏸</span><h2>Workspace paused</h2><p>{msg || "This company workspace is suspended."}</p><div className="acts end"><button type="button" className="btn alt" onClick={async () => { await api("logout", {}, key); localStorage.removeItem("rw-key"); location.reload(); }}>Sign out</button></div></div>}
+      {screen === "verifying" && <div className="signup-wait"><span className="signup-spinner" /><p>Confirming your email and creating your workspace…</p></div>}
+      {screen === "signup" && (<form className="signup" onSubmit={submitSignup}>
+        <h2>Create your company workspace</h2>
+        <p className="note">Free to start. You become the owner and admin of your company; invite your team and clients afterwards.</p>
+        <div className="g">
+          <label className="full">Company name<input required maxLength={80} autoComplete="organization" placeholder="e.g. Acme Technologies" {...S("companyName")} /></label>
+          <label>Your name<input required maxLength={80} autoComplete="name" {...S("name")} /></label>
+          <label>Work email<input required type="email" autoComplete="email" {...S("email")} /></label>
+          <label>Password<input required type="password" minLength={8} autoComplete="new-password" placeholder="8+ characters, letter and number" {...S("password")} /></label>
+          <label>First project <small>(optional)</small><input maxLength={60} placeholder="My first project" {...S("projectName")} /></label>
+          <label className="full signup-terms"><input type="checkbox" checked={signup.accept} onChange={(e) => setSignup({ ...signup, accept: e.target.checked })} /> <span>I agree to the Terms of Service and Privacy Policy.</span></label>
+        </div>
+        <p className="note">Already use LoopDesk with this email (for example, invited by another company)? Enter that account's password and the new company is added to your existing login.</p>
+        <div className="acts end"><button type="button" className="ic" onClick={() => { setMsg(""); setScreen("login"); }}>I already have an account</button><button className="btn" disabled={signupBusy || !signup.accept}>{signupBusy ? "Sending…" : "Create workspace"}</button></div>
+      </form>)}
+      {screen === "signupSent" && (<div className="signup-sent">
+        <span className="signup-mail" aria-hidden="true">✉</span>
+        <h2>Check your inbox</h2>
+        <p>We sent a confirmation link to <b>{signupSentTo}</b>. Open it to create <b>{signup.companyName}</b> and sign in. The link expires in 24 hours.</p>
+        <p className="note">Nothing arrived? Check your spam folder, or send the email again.</p>
+        <div className="acts end"><button type="button" className="ic" onClick={() => { setMsg(""); setScreen("signup"); }}>Change details</button><button type="button" className="btn alt" disabled={signupBusy} onClick={submitSignup}>{signupBusy ? "Sending…" : "Send again"}</button></div>
+      </div>)}
       {screen === "denied" && <p>This invitation is invalid or has expired. Please ask an admin for a new one.</p>}
       {screen === "inviteError" && <><p>We could not open this invitation because the server had a temporary problem. Your invitation is still valid.</p>{inv?.error && <p className="muted">{inv.error}</p>}<div className="acts end"><button className="btn" onClick={() => location.reload()}>Try again</button></div></>}
       {screen === "login" && (<form onSubmit={(e) => { e.preventDefault(); join("login", { id: lf.id, password: lf.password }); }}><h2>Sign in</h2>
         <div className="g"><label className="full">Email or phone number<input required autoComplete="username" {...L("id")} /></label>
           <label className="full">Password<input required type="password" autoComplete="current-password" {...L("password")} /></label></div>
-        <div className="acts end"><button type="button" className="ic" onClick={() => { setMsg(""); setScreen("forgot"); }}>Forgot password?</button><button className="btn">Sign in</button></div></form>)}
+        <div className="acts end"><button type="button" className="ic" onClick={() => { setMsg(""); setScreen("forgot"); }}>Forgot password?</button><button className="btn">Sign in</button></div>
+        <div className="signup-cta"><span>New to LoopDesk?</span><button type="button" className="ic" onClick={() => { setMsg(""); setScreen("signup"); }}>Create your company workspace →</button></div></form>)}
       {screen === "forgot" && (<form onSubmit={async (e) => { e.preventDefault(); await api("forgot", { id: lf.id }); setMsg("If an account exists for that email or phone, a reset link has been sent."); }}><h2>Forgot password</h2>
         <div className="g"><label className="full">Email or phone number<input required {...L("id")} /></label></div>
         <div className="acts end"><button type="button" className="ic" onClick={() => { setMsg(""); setScreen("login"); }}>Back to sign in</button><button className="btn">Send reset link</button></div></form>)}
@@ -1246,11 +1306,11 @@ export default function Page() {
         </div>
         {msg && <p className="err">{msg}</p>}
         <div className="acts end"><button className="btn">{inv.existing ? "Join project" : "Create account and join"}</button></div></form>)}
-      {msg && <p className="err">{msg}</p>}
+      {msg && screen !== "suspended" && <p className="err">{msg}</p>}
     </div></div>
   );
 
-  const nav = client ? [["portal", "My Tickets"], ...(canUseMeetings ? [["meetings", "Meetings"]] : [])] : [["all", "Dashboard"], ["issue", "Issues"], ["feature", "Features"], ["files", "Attachments"], ["team", "Team"], ["chat", "Team Chat"], ...(canUseMeetings ? [["meetings", "Meetings"], ["meeting-notes", "Meeting Notes"]] : []), ...(admin ? [["activity", "Activity"]] : [])];
+  const nav = client ? [["portal", "My Tickets"], ...(canUseMeetings ? [["meetings", "Meetings"]] : [])] : [["all", "Dashboard"], ["issue", "Issues"], ["feature", "Features"], ["files", "Attachments"], ["team", "Team"], ["chat", "Team Chat"], ...(canUseMeetings ? [["meetings", "Meetings"], ["meeting-notes", "Meeting Notes"]] : []), ...(admin ? [["activity", "Activity"]] : []), ...(isPlatformAdmin ? [["platform", "Platform Admin"]] : [])];
   const firstOfMonth = new Date(meetingMonth.getFullYear(), meetingMonth.getMonth(), 1);
   const calendarStart = new Date(firstOfMonth); calendarStart.setDate(firstOfMonth.getDate() - ((firstOfMonth.getDay() + 6) % 7));
   const calendarDates = Array.from({ length: 42 }, (_, i) => { const date = new Date(calendarStart); date.setDate(calendarStart.getDate() + i); return date; });
@@ -1262,13 +1322,17 @@ export default function Page() {
         <div className="project-picker">
           <label htmlFor="organization-select">COMPANY</label>
           <select id="organization-select" value={activeOrganization?.id || ""} onChange={(event) => {
-            if (event.target.value === "__add_company__") { setOrganizationName(""); setOrganizationModal(true); return; }
-            const nextProject = projects.find((item) => item.organizationId === event.target.value);
-            if (nextProject) { setProjectId(nextProject.id); setMeetingSelected(null); setMeetingDraft(""); setParticipantSummaries([]); setView(client ? "portal" : "all"); setModal(null); setDetail(null); load(key, nextProject.id); }
+            const value = event.target.value;
+            if (value === "__add_child__") { setOrganizationName(""); setOrganizationKind("department"); setOrganizationModal(true); return; }
+            const nextProject = projects.find((item) => item.organizationId === value);
+            if (nextProject) { setProjectId(nextProject.id); setMeetingSelected(null); setMeetingDraft(""); setParticipantSummaries([]); setView(client ? "portal" : "all"); setModal(null); setDetail(null); load(key, nextProject.id); return; }
+            // A department or sub-company without projects yet: offer to create its first project.
+            if (organizations.find((item) => item.id === value)?.canCreateProject) { setProjectName(""); setProjectOrganizationId(value); setProjectModal(true); }
           }}>
-            {organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}
-            {admin && <option value="__add_company__">＋ Add company…</option>}
+            {orderedOrganizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.parentId ? `\u00a0\u00a0↳ ${organization.name} · ${KIND_LABEL[organization.kind] || "Unit"}` : organization.name}</option>)}
+            {activeTenant?.canAddChild && <option value="__add_child__">＋ Add department or sub-company…</option>}
           </select>
+          {activeOrganization?.parentId && <small className="org-trail">{activeOrganization.parentName || activeTenant?.name} › {activeOrganization.name}</small>}
           <label htmlFor="project-select">PROJECT</label>
           <select id="project-select" value={projectId} onChange={(e) => {
             if (e.target.value === "__add_project__") { setProjectName(""); setProjectOrganizationId(activeOrganization?.id || organizations.find((item) => item.canCreateProject)?.id || ""); setProjectModal(true); return; }
@@ -1285,7 +1349,7 @@ export default function Page() {
             setRecordingTranscript(""); setRecordingCards([]); setRecordingNoteId(""); setRecordingSaved(false); setMeetingError(""); setMeetingNotice("");
           }
           setView(k);
-        }}>{l}{k === "chat" ? chatUnread > 0 && <em className="nav-unread">{chatUnread > 9 ? "9+" : chatUnread}</em> : k !== "meeting-notes" && <em>{k === "files" ? fileTotal : k === "activity" ? auditTotal : k === "team" ? members.length : k === "meetings" ? meetingTotal : tickets.filter((t) => k === "all" || k === "portal" || t.type === k).length}</em>}</button>))}
+        }}>{l}{k === "platform" ? null : k === "chat" ? chatUnread > 0 && <em className="nav-unread">{chatUnread > 9 ? "9+" : chatUnread}</em> : k !== "meeting-notes" && <em>{k === "files" ? fileTotal : k === "activity" ? auditTotal : k === "team" ? members.length : k === "meetings" ? meetingTotal : tickets.filter((t) => k === "all" || k === "portal" || t.type === k).length}</em>}</button>))}
         <button className={"nav ghost " + (view === "account" ? "on" : "")} onClick={() => { setAmsg(""); setView("account"); }}>My account</button>
         <button className="nav ghost" onClick={async () => { await api("logout", {}, key); localStorage.removeItem("rw-key"); location.reload(); }}>Sign out</button>
       </aside>
@@ -1298,7 +1362,7 @@ export default function Page() {
           <span className="mobile-view">{activeProject?.name}</span>
         </div>
         <header className="top">
-          <div><h1>{{ all: "Support Dashboard", issue: "Issues Log", feature: "Features Log", team: "Team & Roles", meetings: "Meeting Calendar", "meeting-notes": "Meeting Notes & Tasks", activity: "Activity Log", files: "Attachments", account: "My Account", portal: "My Tickets", chat: "Team Chat" }[view]}</h1><p><b>{activeOrganization?.name}</b> · <b>{activeProject?.name}</b> · Signed in as <b>{me.name}</b> <span className={"pill r" + me.role}>{me.role}</span></p></div>
+          <div><h1>{{ all: "Support Dashboard", issue: "Issues Log", feature: "Features Log", team: "Team & Roles", meetings: "Meeting Calendar", "meeting-notes": "Meeting Notes & Tasks", activity: "Activity Log", files: "Attachments", account: "My Account", portal: "My Tickets", chat: "Team Chat", platform: "Platform Admin" }[view]}</h1><p><b>{activeOrganization?.name}</b> · <b>{activeProject?.name}</b> · Signed in as <b>{me.name}</b> <span className={"pill r" + me.role}>{me.role}</span></p></div>
           <div className="top-actions">
             {["issue", "feature", "portal"].includes(view) && <div className="acts">
               {view !== "issue" && <button className={"btn" + (view === "portal" ? " alt" : "")} onClick={() => setModal(blank("feature"))}>+ New Feature</button>}
@@ -1588,7 +1652,7 @@ export default function Page() {
               <td className="ra files-actions">{a.url ? <a className="ic" href={fh(a)} target="_blank" rel="noreferrer">Open link</a> : <button type="button" className="ic" onClick={() => openFile(a)}>Download</button>}{canDeleteFiles && <button type="button" className="ic dl" aria-label={"Delete " + a.name} onClick={() => confirm("Delete " + a.name + "?") && adm("filedel", { id: a.id })}><Ic d={TRASH} /></button>}</td></tr>))}
             </tbody></table></div> : <div className="files-empty"><span className="files-drop-icon"><Ic d={CLIP} /></span><b>No files in {CATS[fc]} yet</b><span>Upload a file or add a link above. Ticket attachments appear here too.</span></div>}
           <div className="tools"><span className="note">Showing {files.length ? fileOffset + 1 : 0}–{fileOffset + files.length} of {fileTotal} files</span><button className="btn alt" disabled={!fileOffset || fileLoading} onClick={() => loadFilePage(Math.max(0, fileOffset - 100))}>Previous</button><button className="btn alt" disabled={!fileHasMore || fileLoading} onClick={() => loadFilePage(fileOffset + 100)}>{fileLoading ? "Loading…" : "Next"}</button></div>
-        </section>) : view === "activity" ? <ActivityLog audit={audit} offset={auditOffset} total={auditTotal} hasMore={auditHasMore} loading={auditLoading} onPage={loadAuditPage} /> : view === "chat" ? <TeamChat key={projectId} projectId={projectId} keyValue={key} me={me} members={members} projectName={activeProject?.name || ""} organizationName={activeOrganization?.name || ""} pulseChannels={pulseChannels} lastRead={chatRead} onRead={markChatRead} onOpenTicket={openTicket} /> : view === "team" ? (<>
+        </section>) : view === "platform" && isPlatformAdmin ? <PlatformConsole keyValue={key} /> : view === "activity" ? <ActivityLog audit={audit} offset={auditOffset} total={auditTotal} hasMore={auditHasMore} loading={auditLoading} onPage={loadAuditPage} /> : view === "chat" ? <TeamChat key={projectId} projectId={projectId} keyValue={key} me={me} members={members} projectName={activeProject?.name || ""} organizationName={activeOrganization?.name || ""} pulseChannels={pulseChannels} lastRead={chatRead} onRead={markChatRead} onOpenTicket={openTicket} /> : view === "team" ? (<>
           {admin && (<section className="panel"><h3>Invite a member to {activeProject?.name}</h3>
             <p className="note">This invitation is for <b>{activeProject?.name}</b> only. Members can have different roles in other projects.</p>
             <form className="tools" onSubmit={sendInvite}>
@@ -1688,15 +1752,19 @@ export default function Page() {
       {projectModal && (<div className="ov" onClick={() => setProjectModal(false)}><form className="modal project-modal" onClick={(e) => e.stopPropagation()} onSubmit={createProject}>
         <h2>Add a project</h2>
         <p className="note">Each company can have multiple isolated projects. Project members, notes, tasks, files, and meetings stay scoped to their project.</p>
-        <label>Company<select required value={projectOrganizationId} onChange={(event) => setProjectOrganizationId(event.target.value)}>{organizations.filter((item) => item.canCreateProject || item.id === projectOrganizationId).map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}</select></label>
+        <label>Company, department or sub-company<select required value={projectOrganizationId} onChange={(event) => setProjectOrganizationId(event.target.value)}>{orderedOrganizations.filter((item) => item.canCreateProject || item.id === projectOrganizationId).map((organization) => <option key={organization.id} value={organization.id}>{orgLabel(organization)}</option>)}</select></label>
         <label>Project name<input autoFocus required maxLength={60} value={projectName} onChange={(e) => setProjectName(e.target.value)} placeholder="e.g. DocuTect" /></label>
         <div className="acts end"><button type="button" className="btn alt" onClick={() => setProjectModal(false)}>Cancel</button><button className="btn">Create project</button></div>
       </form></div>)}
       {organizationModal && (<div className="ov" onClick={() => setOrganizationModal(false)}><form className="modal project-modal" onClick={(e) => e.stopPropagation()} onSubmit={createOrganization}>
-        <h2>Add a company</h2>
-        <p className="note">Create an isolated company workspace, then add multiple projects under it. You will be its initial company admin.</p>
-        <label>Company name<input autoFocus required maxLength={80} value={organizationName} onChange={(event) => setOrganizationName(event.target.value)} placeholder="e.g. Northstar Labs" /></label>
-        <div className="acts end"><button type="button" className="btn alt" onClick={() => setOrganizationModal(false)}>Cancel</button><button className="btn">Create company</button></div>
+        <h2>Add to {activeTenant?.name}</h2>
+        <p className="note">Organize {activeTenant?.name} into departments or sub-companies. Each one gets its own projects; {activeTenant?.name}'s admins can manage all of them.</p>
+        <div className="org-kind" role="radiogroup" aria-label="Type">
+          {[["department", "Department", "A team inside the company, e.g. Marketing, Development, HR"], ["subsidiary", "Sub-company", "A separate business owned by the company, e.g. a branch or brand"]].map(([value, label, hint]) =>
+            <label key={value} className={organizationKind === value ? "on" : ""}><input type="radio" name="org-kind" value={value} checked={organizationKind === value} onChange={() => setOrganizationKind(value)} /><b>{label}</b><small>{hint}</small></label>)}
+        </div>
+        <label>{organizationKind === "subsidiary" ? "Sub-company name" : "Department name"}<input autoFocus required maxLength={80} value={organizationName} onChange={(event) => setOrganizationName(event.target.value)} placeholder={organizationKind === "subsidiary" ? "e.g. Solexes Dubai" : "e.g. Mobile Development"} /></label>
+        <div className="acts end"><button type="button" className="btn alt" onClick={() => setOrganizationModal(false)}>Cancel</button><button className="btn">Create {organizationKind === "subsidiary" ? "sub-company" : "department"}</button></div>
       </form></div>)}
 
       {dt && (<div className="ov" onClick={() => setDetail(null)}><div className="modal" onClick={(e) => e.stopPropagation()}>

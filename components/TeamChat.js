@@ -52,6 +52,11 @@ export default function TeamChat({ projectId, keyValue, me, members, projectName
   const [setupNeeded, setSetupNeeded] = useState(false);
   const [filter, setFilter] = useState("");
   const [messageSearch, setMessageSearch] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [matchIndex, setMatchIndex] = useState(-1);
+  // Read receipts: how far each other member has read this conversation.
+  const [reads, setReads] = useState([]);
+  const sentReadRef = useRef({});
   const [editing, setEditing] = useState(null);
   const [reactingTo, setReactingTo] = useState(null);
   const [modal, setModal] = useState(null);
@@ -134,13 +139,13 @@ export default function TeamChat({ projectId, keyValue, me, members, projectName
     try { localStorage.setItem(`rw-chat-active:${projectId}`, activeId); } catch {}
     let cancelled = false;
     const cachedChannel = channelCacheRef.current.get(activeId);
-    setEditing(null); setReactingTo(null); setMessageSearch(""); setReplyTo(null); setEmojiOpen(false); setNewBelow(0); setAtBottom(true); stickRef.current = true;
+    setEditing(null); setReactingTo(null); setMessageSearch(""); setSearchOpen(false); setReads([]); setReplyTo(null); setEmojiOpen(false); setNewBelow(0); setAtBottom(true); stickRef.current = true;
     setUnreadMarker(lastRead?.[activeId] || 0);
     if (cachedChannel) {
       // Show what we already have immediately, then fetch only what changed since.
       setMessages(cachedChannel.messages); setHasOlder(cachedChannel.hasOlder); updatedRef.current = cachedChannel.updated; setLoadingMessages(false);
       call(`channel=${encodeURIComponent(activeId)}&after=${cachedChannel.updated}&limit=200`).then((result) => {
-        if (!cancelled && result.ok && result.messages?.length) merge(result.messages);
+        if (!cancelled && result.ok) { if (result.messages?.length) merge(result.messages); if (result.reads) setReads(result.reads); }
       });
     } else {
       setMessages([]); updatedRef.current = 0;
@@ -150,6 +155,7 @@ export default function TeamChat({ projectId, keyValue, me, members, projectName
         setLoadingMessages(false);
         if (!result.ok) { setError(result.error || "Could not load messages"); return; }
         merge(result.messages || []);
+        if (result.reads) setReads(result.reads);
         setHasOlder(!!result.hasMore);
       });
     }
@@ -166,9 +172,10 @@ export default function TeamChat({ projectId, keyValue, me, members, projectName
     if (!activeId) return;
     let busy = false;
     const poll = async () => {
-      if (document.hidden || !updatedRef.current || busy) return;
+      if (document.hidden || busy) return;
       busy = true;
-      const result = await call(`channel=${encodeURIComponent(activeId)}&after=${updatedRef.current}&limit=200`);
+      const result = await call(`channel=${encodeURIComponent(activeId)}${updatedRef.current ? `&after=${updatedRef.current}` : ""}&limit=${updatedRef.current ? 200 : 80}`);
+      if (result.ok && result.reads) setReads((previous) => JSON.stringify(previous) === JSON.stringify(result.reads) ? previous : result.reads);
       if (result.ok && result.messages?.length) {
         const known = new Set(messagesRef.current.map((m) => m.id));
         const fresh = result.messages.filter((m) => !known.has(m.id) && m.authorId !== me.id).length;
@@ -189,7 +196,12 @@ export default function TeamChat({ projectId, keyValue, me, members, projectName
   // Everything visible in the open conversation counts as read.
   const newest = messages.reduce((latest, m) => m.pending ? latest : Math.max(latest, m.createdAt), 0);
   useEffect(() => {
-    if (activeId && newest && !document.hidden) onRead(activeId, Math.max(newest, active?.lastMessageAt || 0));
+    if (!activeId || !newest || document.hidden) return;
+    onRead(activeId, Math.max(newest, active?.lastMessageAt || 0));
+    if ((sentReadRef.current[activeId] || 0) < newest) {
+      sentReadRef.current[activeId] = newest;
+      call("", { action: "read", channelId: activeId, at: newest });
+    }
   }, [activeId, newest, active?.lastMessageAt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Stay pinned to the bottom unless the reader scrolled up to read history.
@@ -398,7 +410,19 @@ export default function TeamChat({ projectId, keyValue, me, members, projectName
   const dms = channels.filter((c) => c.kind === "dm" && (!f || titleOf(c).toLowerCase().includes(f)))
     .sort((a, b) => b.lastMessageAt - a.lastMessageAt);
   const dmPartners = new Set(channels.filter((c) => c.kind === "dm").map(dmPartner));
-  const shown = messageSearch.trim() ? messages.filter((m) => !m.deleted && parseBody(m.body).text.toLowerCase().includes(messageSearch.trim().toLowerCase())) : messages;
+  const shown = messages;
+  const searchQuery = messageSearch.trim().toLowerCase();
+  const matches = searchQuery ? messages.filter((m) => !m.deleted && !m.pending && parseBody(m.body).text.toLowerCase().includes(searchQuery)) : [];
+  const currentMatchId = matches[matchIndex]?.id || "";
+  const goToMatch = (index) => {
+    if (!matches.length) return;
+    const next = (index + matches.length) % matches.length;
+    setMatchIndex(next);
+    jumpTo(matches[next].id);
+  };
+  const closeSearch = () => { setSearchOpen(false); setMessageSearch(""); setMatchIndex(-1); };
+  const lastMineId = [...messages].reverse().find((m) => m.authorId === me.id && !m.pending && !m.deleted)?.id || "";
+  const readersOf = (m) => reads.filter((r) => r.memberId !== me.id && r.lastReadAt >= m.createdAt);
   const byId = new Map(messages.map((m) => [m.id, m]));
   const channelSaved = saved.filter((x) => x.channelId === activeId);
   const firstUnreadId = useMemo(() => unreadMarker ? messages.find((m) => m.createdAt > unreadMarker && m.authorId !== me.id)?.id || "" : "", [messages, unreadMarker, me.id]);
@@ -448,22 +472,40 @@ export default function TeamChat({ projectId, keyValue, me, members, projectName
           <div className="chat-head-tools">
             <button type="button" className={"chat-tool" + (notify ? " on" : "")} title={notify ? "Desktop notifications on" : "Turn on desktop notifications"} aria-pressed={notify} onClick={toggleNotify}><Svg d={BELL} size={15} /></button>
             <button type="button" className={"chat-tool" + (savedOpen ? " on" : "")} title="Saved messages" aria-pressed={savedOpen} onClick={() => setSavedOpen((o) => !o)}><Svg d={STAR} size={15} />{channelSaved.length > 0 && <em>{channelSaved.length}</em>}</button>
-            <label className="chat-search"><Svg d="M11 18a7 7 0 100-14 7 7 0 000 14zM20 20l-3.5-3.5" size={14} /><input type="search" placeholder="Search messages" value={messageSearch} onChange={(e) => setMessageSearch(e.target.value)} aria-label="Search messages in this conversation" /></label>
+            <button type="button" className={"chat-tool" + (searchOpen ? " on" : "")} title="Search in this conversation" aria-pressed={searchOpen} onClick={() => searchOpen ? closeSearch() : setSearchOpen(true)}><Svg d="M11 18a7 7 0 100-14 7 7 0 000 14zM20 20l-3.5-3.5" size={15} /></button>
             {active.kind === "channel" && <button type="button" className="chat-members" title="Channel details" onClick={() => setModal({ type: "details", topic: active.topic, memberIds: active.memberIds })}>
               <span className="chat-stack">{(active.isPrivate ? active.memberIds : teamIds).slice(0, 3).map((id) => <span key={id} className="chat-avatar xs" style={{ "--av": colorFor(id) }}>{initials(nameOf(id))}</span>)}</span>{memberCount}
             </button>}
           </div>
         </header>
 
+        {searchOpen && <div className="chat-searchbar" role="search">
+          <span className="chat-searchbar-field">
+            <Svg d="M11 18a7 7 0 100-14 7 7 0 000 14zM20 20l-3.5-3.5" size={16} />
+            <input autoFocus type="text" placeholder={`Search in ${active.kind === "dm" ? titleOf(active) : "#" + active.name}`} value={messageSearch} aria-label="Search messages"
+              onChange={(e) => {
+                const value = e.target.value, q = value.trim().toLowerCase();
+                setMessageSearch(value);
+                const found = q ? messages.filter((m) => !m.deleted && !m.pending && parseBody(m.body).text.toLowerCase().includes(q)) : [];
+                setMatchIndex(found.length - 1);
+                if (found.length) jumpTo(found[found.length - 1].id);
+              }}
+              onKeyDown={(e) => { if (e.key === "Escape") closeSearch(); if (e.key === "Enter") { e.preventDefault(); goToMatch(matchIndex + (e.shiftKey ? 1 : -1)); } }} />
+            {messageSearch && <button type="button" className="chat-searchbar-clear" aria-label="Clear search" onClick={() => { setMessageSearch(""); setMatchIndex(-1); }}>×</button>}
+          </span>
+          <span className={"chat-searchbar-count" + (searchQuery && !matches.length ? " none" : "")} aria-live="polite">{searchQuery ? (matches.length ? `${matchIndex + 1} of ${matches.length}` : "No results") : "Type to search"}</span>
+          <button type="button" className="chat-searchbar-nav" title="Older match (Enter)" aria-label="Older match" disabled={matches.length < 2} onClick={() => goToMatch(matchIndex - 1)}><Svg d="M18 15l-6-6-6 6" size={16} /></button>
+          <button type="button" className="chat-searchbar-nav" title="Newer match (Shift+Enter)" aria-label="Newer match" disabled={matches.length < 2} onClick={() => goToMatch(matchIndex + 1)}><Svg d="M6 9l6 6 6-6" size={16} /></button>
+          <button type="button" className="chat-searchbar-close" onClick={closeSearch}>Done</button>
+        </div>}
         <div className="chat-messages" ref={listRef} onScroll={onScroll}>
-          {hasOlder && !messageSearch && <button type="button" className="chat-older" onClick={loadOlder}>Load earlier messages</button>}
+          {hasOlder && <button type="button" className="chat-older" onClick={loadOlder}>Load earlier messages</button>}
           {!loadingMessages && !messages.length && <div className="chat-welcome">
             <span className="chat-welcome-icon">{active.kind === "dm" ? <span className="chat-avatar lg" style={{ "--av": colorFor(dmPartner(active)) }}>{initials(titleOf(active))}</span> : <Svg d={active.isPrivate ? LOCK : HASH} size={26} />}</span>
             <h3>{active.kind === "dm" ? `This is the start of your conversation with ${titleOf(active)}` : `Welcome to #${active.name}`}</h3>
             <p>{active.kind === "dm" ? "Messages here are only visible to the two of you." : active.topic || "Start the conversation — share updates, ask questions and mention teammates with @."}</p>
           </div>}
           {loadingMessages && <div className="chat-loading"><span /><span /><span /></div>}
-          {messageSearch && <p className="chat-search-note">{shown.length} message{shown.length === 1 ? "" : "s"} matching “{messageSearch}”</p>}
           {shown.map((m, i) => {
             const prev = shown[i - 1], next = shown[i + 1];
             const newDay = !prev || new Date(prev.createdAt).toDateString() !== new Date(m.createdAt).toDateString();
@@ -478,7 +520,7 @@ export default function TeamChat({ projectId, keyValue, me, members, projectName
             return <Fragment key={m.id}>
               {newDay && <div className="chat-day"><span>{dayLabel(m.createdAt)}</span></div>}
               {showUnread && <div className="chat-new"><span>New messages</span></div>}
-              <article id={"msg-" + m.id} className={"bubble-row" + (mine ? " mine" : " theirs") + (sameAsPrev ? " cont" : "") + (nextBreaks ? " tail" : "") + (flashId === m.id ? " flash" : "") + (actionsFor === m.id ? " show-actions" : "")}>
+              <article id={"msg-" + m.id} className={"bubble-row" + (mine ? " mine" : " theirs") + (sameAsPrev ? " cont" : "") + (nextBreaks ? " tail" : "") + (flashId === m.id ? " flash" : "") + (currentMatchId === m.id ? " match" : "") + (actionsFor === m.id ? " show-actions" : "")}>
                 {!mine && <span className="bubble-avatar">{nextBreaks ? <span className="chat-avatar sm" style={{ "--av": colorFor(m.authorId) }} title={nameOf(m.authorId)}>{initials(nameOf(m.authorId))}</span> : null}</span>}
                 <div className="bubble-stack">
                   <div className={"bubble" + (m.deleted ? " gone" : "") + (m.pending ? " pending" : "") + (m.failed ? " failed" : "") + (editing?.id === m.id ? " editing" : "")} onClick={(e) => { if (!e.target.closest("a,button,textarea") && !window.getSelection()?.toString()) setActionsFor((id) => id === m.id ? "" : m.id); }}>
@@ -493,8 +535,15 @@ export default function TeamChat({ projectId, keyValue, me, members, projectName
                         <div><button type="button" className="btn alt" onClick={() => setEditing(null)}>Cancel</button><button type="button" className="btn" onClick={saveEdit}>Save</button></div>
                       </div>
                       : <p className="bubble-text">{renderBody(text, messageSearch.trim())}</p>}
-                    <span className="bubble-meta">{isSaved && <span title="Saved">★</span>}{m.editedAt && !m.deleted && <span>edited</span>}<time dateTime={new Date(m.createdAt).toISOString()} title={new Date(m.createdAt).toLocaleString("en-GB")}>{timeOf(m.createdAt)}</time>{mine && !m.deleted && (m.failed ? <button type="button" className="bubble-retry" onClick={() => retry(m)}>⚠ Retry</button> : m.pending ? <span className="bubble-clock" title="Sending…">🕓</span> : <span className="bubble-tick" title="Sent">✓✓</span>)}</span>
+                    <span className="bubble-meta">{isSaved && <span title="Saved">★</span>}{m.editedAt && !m.deleted && <span>edited</span>}<time dateTime={new Date(m.createdAt).toISOString()} title={new Date(m.createdAt).toLocaleString("en-GB")}>{timeOf(m.createdAt)}</time>{mine && !m.deleted && (m.failed ? <button type="button" className="bubble-retry" onClick={() => retry(m)}>⚠ Retry</button> : m.pending ? <span className="bubble-clock" title="Sending…">🕓</span> : (readersOf(m).length
+                      ? <span className="bubble-read" title={"Seen by " + readersOf(m).map((r) => nameOf(r.memberId)).join(", ")}>✓✓</span>
+                      : <span className="bubble-tick" title="Sent · not read yet">✓✓</span>))}</span>
                   </div>
+                  {m.id === lastMineId && readersOf(m).length > 0 && <div className="seen-by" title={"Seen by " + readersOf(m).map((r) => nameOf(r.memberId)).join(", ")}>
+                    {readersOf(m).slice(0, 5).map((r) => <span key={r.memberId} className="seen-dot" style={{ "--av": colorFor(r.memberId) }}>{initials(nameOf(r.memberId))}</span>)}
+                    {readersOf(m).length > 5 && <span className="seen-more">+{readersOf(m).length - 5}</span>}
+                    <small>{active.kind === "dm" ? "Seen" : `Seen by ${readersOf(m).length}`}</small>
+                  </div>}
                   {!m.deleted && Object.keys(m.reactions || {}).length > 0 && <div className="chat-reactions">{Object.entries(m.reactions).map(([emoji, who]) => <button type="button" key={emoji} className={"chat-reaction" + (who.includes(me.id) ? " mine" : "")} title={who.map((id) => id === me.id ? "You" : nameOf(id)).join(", ")} onClick={() => react(m, emoji)}>{emoji} <b>{who.length}</b></button>)}</div>}
                 </div>
                 {!m.deleted && !m.pending && editing?.id !== m.id && <div className="bubble-actions">
