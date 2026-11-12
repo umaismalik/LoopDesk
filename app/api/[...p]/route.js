@@ -1,9 +1,10 @@
 import path from "path";
 import crypto from "crypto";
 import { SEED } from "../../../lib/seed";
-import { sendEmail, emailStatus } from "../../../lib/email";
+import { sendEmail } from "../../../lib/email";
 import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, loadProjectTicketIds, loadClientTickets, deleteTicketFiles, loadTicketSummaries, loadTicketAccess, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
 import { check } from "../../../lib/reminders";
+import { liveRequest, bumpProjectVersion } from "../../../lib/live-api";
 import { attachmentError, attachmentKind, descriptionError } from "../../../lib/limits";
 
 export const dynamic = "force-dynamic";
@@ -384,6 +385,8 @@ async function h(req, p, m) {
     await check(); return J({ ok: true });
   }
   const key = req.headers.get("x-key");
+  // Live-update polling and team chat use a lightweight session check, not the workspace load.
+  if (r === "pulse" || r === "chat") return liveRequest(req, r, m, key, u);
   if (remote && r === "login" && m === "POST") {
     const body = await req.json();
     const id = String(body.id || "").trim().toLowerCase();
@@ -1686,7 +1689,20 @@ async function h(req, p, m) {
           { field: "Status", old: previousStatus, new: t.status },
           { field: "Reopen reason", old: "—", new: why },
         ]); await save(d);
-        await Promise.all(emails(d, t.assignees || []).map((e) => send(e, "Ticket reopened: " + t.id, `<p>${esc(me.name)} reopened <b>${t.id}</b> - ${esc(t.title)}.</p><p>Reason: ${esc(why)}</p>`)));
+        // The assignees are told their ticket is back on their plate; project admins get a copy.
+        const link = emailHtml(browserSiteUrl(u.origin));
+        const ref = emailHtml(t.id) + (t.clientRef ? ` (client's ${emailHtml(t.clientRef)})` : "");
+        const assigneeNames = d.members.filter((x) => (t.assignees || []).includes(x.id)).map((x) => x.name).join(", ");
+        const assigneeEmails = emails(d, t.assignees || []);
+        const adminIds = project.members.filter((x) => x.role === "Admin" && x.status !== "disabled").map((x) => x.memberId);
+        const adminEmails = emails(d, adminIds).filter((e) => !assigneeEmails.includes(e));
+        const reasonBlock = `<blockquote style="margin:12px 0;padding:10px 14px;border-left:3px solid #eb6834;background:#fff7ed">${emailHtml(why)}</blockquote>`;
+        await Promise.all([
+          ...assigneeEmails.map((e) => send(e, `Your ticket ${t.id} was reopened by the client`,
+            `<p>Hello,</p><p><b>${emailHtml(me.name)}</b> reopened your ticket <b>${ref}</b> — ${emailHtml(t.title)} in <b>${emailHtml(project.name)}</b>. They are not satisfied with the solution.</p><p>Reason given:</p>${reasonBlock}<p>Please review the ticket and update its status once it is fixed.</p><p><a href="${link}">Open LoopDesk</a></p>`)),
+          ...adminEmails.map((e) => send(e, `Copy: ticket ${t.id} reopened by ${me.name}`,
+            `<p>This is a copy for project admins.</p><p><b>${emailHtml(me.name)}</b> (client) reopened <b>${ref}</b> — ${emailHtml(t.title)} in <b>${emailHtml(project.name)}</b>.</p><p>Reason given:</p>${reasonBlock}<p>Assigned to: <b>${assigneeNames ? emailHtml(assigneeNames) : "nobody yet — please assign it"}</b>${assigneeNames ? " (they have been emailed)" : ""}.</p><p><a href="${link}">Open LoopDesk</a></p>`)),
+        ]);
         return J({ ok: true });
       }
       const x = b.ticket || {}, title = String(x.title || "").trim().slice(0, 150), details = String(x.details || "").trim();
@@ -1775,11 +1791,6 @@ async function h(req, p, m) {
       const result = await mail(b.email, link, b.role, project.name);
       return J({ link, sent: result.sent, emailError: result.error });
     }
-    if (r === "testmail") {
-      const st = emailStatus();
-      const result = await sendEmail({ to: account.email, subject: "Test email from LoopDesk", html: "<p>Your email setup works. This message was sent from LoopDesk Team & Project Management.</p>" });
-      return J({ ...result, to: account.email, from: st.from, replyTo: st.replyTo });
-    }
     if (r === "adminreset") {
       const x = d.members.find((y) => y.id === b.id);
       if (!x) return J({ error: "Not found" }, 404);
@@ -1826,9 +1837,16 @@ async function h(req, p, m) {
   }
   return J({ error: "not found" }, 404);
 }
+// Writes that do not change what other people see in the project; everything else bumps the
+// project's version so open browsers refresh automatically.
+const NO_PULSE = new Set(["pulse", "chat", "login", "logout", "logoutall", "forgot", "reset", "accept", "cron"]);
 const handle = async (req, { params }, method) => {
   try {
-    return await h(req, params.p, method);
+    const response = await h(req, params.p, method);
+    if (method === "POST" && response.status < 400 && !NO_PULSE.has(params.p[0])) {
+      await bumpProjectVersion(new URL(req.url).searchParams.get("project") || "");
+    }
+    return response;
   } catch (error) {
     console.error("API request failed:", error);
     if (isWorkspaceWriteBusy(error)) {

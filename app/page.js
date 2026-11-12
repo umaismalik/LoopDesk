@@ -4,6 +4,8 @@ import { createPortal } from "react-dom";
 import dynamic from "next/dynamic";
 import { correctTurnNames, generateEnglishKeyPoints, generateMeetingParticipantCards } from "../lib/local-transcription";
 import MeetingNotes from "../components/MeetingNotes";
+import ActivityLog from "../components/ActivityLog";
+import TeamChat from "../components/TeamChat";
 import Dashboard from "./dashboard";
 import { ATTACHMENT_ACCEPT, ATTACHMENT_HINT, attachmentError, DESCRIPTION_CHAR_LIMIT, DESCRIPTION_WORD_LIMIT, descriptionError, wordCount } from "../lib/limits";
 
@@ -321,14 +323,14 @@ export default function Page() {
   const [googleCalendarEmail, setGoogleCalendarEmail] = useState("");
   const [recordingState, setRecordingState] = useState("idle");
   const [recordingSeconds, setRecordingSeconds] = useState(0);
-  // Speech is always Urdu / Urdu-English, translated to English. "auto" picks Whisper Medium on a GPU.
-  const [transcriptionModel, setTranscriptionModel] = useState(() => {
-    try { return localStorage.getItem("rw-transcription-model") || "auto"; } catch { return "auto"; }
-  });
   // Extra spellings of team members' names (per project), so a spoken name opens the right card.
   const [nameAliases, setNameAliases] = useState({});
-  const [aliasDrafts, setAliasDrafts] = useState({});
-  const [aliasSaving, setAliasSaving] = useState(false);
+  // Live updates: the project's change version (bumps whenever anyone changes something) and the
+  // chat channels' latest-message times, both from the lightweight /api/pulse poll.
+  const [liveVersion, setLiveVersion] = useState("");
+  const [pulseChannels, setPulseChannels] = useState([]);
+  const [chatRead, setChatRead] = useState({});
+  const [pwOpen, setPwOpen] = useState(false);
   const [hasRecordedVoiceNote, setHasRecordedVoiceNote] = useState(false);
   const [transcriptionProgress, setTranscriptionProgress] = useState("");
   const [pendingRecording, setPendingRecording] = useState(null);
@@ -359,6 +361,12 @@ export default function Page() {
     recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
   }, []);
 
+  // Workspace fields shared by a full load and a silent live refresh. A live refresh never touches the
+  // current view, forms the user is typing in, or the page they are on.
+  const applyWorkspace = useCallback((data) => {
+      setMe(data.me); setCanUseMeetings(data.canUseMeetings === undefined ? data.me.role !== "Client" : data.canUseMeetings); setCanManageMeetings(!!data.canManageMeetings); setMeetingEditAccess(!!data.meetingEditAccess); setMeetingEditAccessExpiresAt(data.meetingEditAccessExpiresAt || null); setMeetingEditRequests(data.meetingEditRequests || []); setGoogleCalendarConfigured(!!data.googleCalendarConfigured); setGoogleCalendarConnected(!!data.googleCalendarConnected); setGoogleCalendarEmail(data.googleCalendarEmail || ""); setNameAliases(data.nameAliases || {}); setProjects(data.projects || []); setOrganizations(data.organizations || []); setProjectId(data.projectId); localStorage.setItem("rw-project", data.projectId);
+      setTickets(data.tickets); setTicketOffset(data.ticketPagination?.offset || 0); setTicketTotal(data.ticketPagination?.total ?? data.tickets.length); setTicketHasMore(!!data.ticketPagination?.hasMore); setMembers(data.members); setInvites(data.invites || []);
+  }, []);
   const load = useCallback(async (k, requestedProject) => {
     const selectedProject = requestedProject || localStorage.getItem("rw-project") || "";
     localStorage.setItem("rw-ticket-offset", "0");
@@ -378,8 +386,8 @@ export default function Page() {
     if (!r.ok) { if (r.status === 401) setScreen("login"); else alert(r.error || "Unable to load project"); return; }
     applyDb(r);
     function applyDb(data) {
-      setMe(data.me); setCanUseMeetings(data.canUseMeetings === undefined ? data.me.role !== "Client" : data.canUseMeetings); setCanManageMeetings(!!data.canManageMeetings); setMeetingEditAccess(!!data.meetingEditAccess); setMeetingEditAccessExpiresAt(data.meetingEditAccessExpiresAt || null); setMeetingEditRequests(data.meetingEditRequests || []); setGoogleCalendarConfigured(!!data.googleCalendarConfigured); setGoogleCalendarConnected(!!data.googleCalendarConnected); setGoogleCalendarEmail(data.googleCalendarEmail || ""); setNameAliases(data.nameAliases || {}); setProjects(data.projects || []); setOrganizations(data.organizations || []); setProjectId(data.projectId); localStorage.setItem("rw-project", data.projectId);
-      setView((v) => data.me.role === "Client" && v !== "account" ? "portal" : v); setAcct({ name: data.me.name, phone: data.me.phone || "", current: "", password: "", confirm: "" }); setTickets(data.tickets); setTicketOffset(data.ticketPagination?.offset || 0); setTicketTotal(data.ticketPagination?.total ?? data.tickets.length); setTicketHasMore(!!data.ticketPagination?.hasMore); setMembers(data.members); setInvites(data.invites || []); setAudit(data.audit || []); setAuditOffset(0); setAuditTotal(data.audit.length); setAuditHasMore(false); setFiles(data.files || []); setFileOffset(0); setFileTotal(data.files.length); setFileHasMore(false); setScreen("app");
+      applyWorkspace(data);
+      setView((v) => data.me.role === "Client" && v !== "account" ? "portal" : v); setAcct({ name: data.me.name, phone: data.me.phone || "", current: "", password: "", confirm: "" }); setAudit(data.audit || []); setAuditOffset(0); setAuditTotal(data.audit.length); setAuditHasMore(false); setFiles(data.files || []); setFileOffset(0); setFileTotal(data.files.length); setFileHasMore(false); setScreen("app");
     }
   }, []);
   useEffect(() => {
@@ -407,6 +415,69 @@ export default function Page() {
     }
     else { const k = localStorage.getItem("rw-key") || ""; setKey(k); load(k); }
   }, [load]);
+  // ---- Live updates -------------------------------------------------------------------------
+  // Every 5 seconds (while the tab is visible) ask the server for the project's change version. When
+  // someone changes anything, quietly reload what is on screen; nobody has to press refresh.
+  const liveRef = useRef({});
+  liveRef.current = { key, projectId, view, ticketOffset, fileOffset, auditOffset, meetingOffset, meetingMonth, meetingSelected, role: me?.role };
+  const silentRefresh = useCallback(async () => {
+    const c = liveRef.current;
+    if (!c.key || !c.projectId) return;
+    const r = await api(`db?ticketOffset=${c.ticketOffset || 0}`, null, c.key, c.projectId);
+    if (!r.ok || !r.me || r.projectId !== c.projectId || liveRef.current.projectId !== c.projectId) return;
+    applyWorkspace(r);
+    if (c.view === "files") {
+      const f = await api(`files?offset=${c.fileOffset}&limit=100`, null, c.key, c.projectId);
+      if (f.ok) { setFiles(f.files || []); setFileTotal(f.pagination?.total ?? (f.files || []).length); setFileHasMore(!!f.pagination?.hasMore); }
+    } else setFiles(r.files || []);
+    if (c.view === "activity" && c.role === "Admin") {
+      const a = await api(`activity?offset=${c.auditOffset}&limit=100`, null, c.key, c.projectId);
+      if (a.ok) { setAudit(a.audit || []); setAuditTotal(a.pagination?.total ?? (a.audit || []).length); setAuditHasMore(!!a.pagination?.hasMore); }
+    }
+    if (c.view === "meetings" && !c.meetingSelected) {
+      const m = await api(`meetings?month=${monthKey(c.meetingMonth)}&offset=${c.meetingOffset}&limit=100`, null, c.key, c.projectId);
+      if (m.ok && !liveRef.current.meetingSelected) { setMeetings(m.meetings || []); setMeetingTotal(m.pagination?.total ?? (m.meetings || []).length); setMeetingHasMore(!!m.pagination?.hasMore); }
+    }
+  }, [applyWorkspace]);
+  useEffect(() => {
+    if (screen !== "app" || !key || !projectId) return;
+    let stopped = false, busy = false, last = "", timer;
+    const tick = async () => {
+      clearTimeout(timer);
+      if (!document.hidden && !busy) {
+        busy = true;
+        const r = await api("pulse", null, key, projectId);
+        busy = false;
+        if (stopped) return;
+        if (r.ok) {
+          if (r.channels) setPulseChannels((previous) => JSON.stringify(previous) === JSON.stringify(r.channels) ? previous : r.channels);
+          if (last && r.v !== last) { setLiveVersion(r.v); silentRefresh(); }
+          last = r.v;
+        }
+      }
+      if (!stopped) timer = setTimeout(tick, 5000);
+    };
+    tick();
+    const onVisible = () => { if (!document.hidden) tick(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { stopped = true; clearTimeout(timer); document.removeEventListener("visibilitychange", onVisible); };
+  }, [screen, key, projectId, silentRefresh]);
+  // Chat "last read" times live in this browser, per project and person.
+  const chatReadKey = me && projectId ? `rw-chat-read:${projectId}:${me.id}` : "";
+  useEffect(() => {
+    if (!chatReadKey) return;
+    try { setChatRead(JSON.parse(localStorage.getItem(chatReadKey) || "{}")); } catch { setChatRead({}); }
+  }, [chatReadKey]);
+  const markChatRead = useCallback((channelId, at) => {
+    setChatRead((current) => {
+      if ((current[channelId] || 0) >= at) return current;
+      const next = { ...current, [channelId]: at };
+      try { localStorage.setItem(chatReadKey, JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }, [chatReadKey]);
+  const chatUnread = pulseChannels.filter((c) => c.lastMessageAt > (chatRead[c.id] || 0) && c.lastAuthorId !== me?.id).length;
+
   useEffect(() => {
     if (!meetingEditAccessExpiresAt) return;
     const timer = setTimeout(() => {
@@ -619,11 +690,15 @@ export default function Page() {
     if (!r.ok) return alert(r.error || "Failed");
     setLk({ url: "", name: "" }); await load(key); await loadFilePage(fileOffset);
   };
+  // Exports exactly what the Issues or Features table shows (current filters and search applied).
   const exportCsv = () => {
-    const cols = ["id", "type", "date", "by", "title", "priority", "assignee", "details", "version", "deployed", "status", "closed"];
-    const csv = [cols.join(","), ...tickets.map((t) => cols.map((c) => '"' + String(c === "assignee" ? anames(t.assignees) : t[c] || "").replace(/"/g, '""') + '"').join(","))].join("\n");
+    const cols = [["id", "ID"], ["date", "Raised on"], ["by", "Raised by"], ["title", "Title"], ["priority", "Priority"], ["assignee", "Assignees"], ["details", "Description"], ["version", "Version"], ["deployed", "Deployed on"], ["deadline", "Deadline"], ["status", "Status"], ["closed", "Completed on"]];
+    const cell = (value) => { let text = String(value ?? ""); if (/^[\t\r\n ]*[=+\-@]/.test(text)) text = "'" + text; return '"' + text.replace(/"/g, '""') + '"'; };
+    const csv = "﻿" + [cols.map(([, label]) => cell(label)).join(","), ...rows.map((t) => cols.map(([c]) => cell(c === "assignee" ? anames(t.assignees) : t[c] || "")).join(","))].join("\r\n");
     const projectSlug = (activeProject?.name || "project").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-    const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" })); a.download = projectSlug + "-tickets.csv"; a.click();
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const a = document.createElement("a"); a.href = url; a.download = `${projectSlug}-${view === "feature" ? "features" : "issues"}-${today()}.csv`; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
   const dt = tickets.find((t) => t.id === detail);
   // Used by both the file picker and drag-and-drop on the Attachments page.
@@ -648,7 +723,7 @@ export default function Page() {
     if (pw && acct.password !== acct.confirm) return setAmsg("Passwords do not match");
     const r = await api("account", pw ? { current: acct.current, password: acct.password } : { name: acct.name, phone: acct.phone }, key, projectId);
     if (!r.ok) return setAmsg(r.error || "Failed");
-    setAmsg(pw ? "Password changed" : "Profile saved"); load(key);
+    setAmsg(pw ? "Password changed" : "Profile saved"); if (pw) setPwOpen(false); load(key);
   };
   const adm = async (p, body) => {
     const r = await api(p, body, key, projectId);
@@ -881,16 +956,6 @@ export default function Page() {
   };
   // Team members with their extra name spellings, for the speech model and card routing.
   const voiceAttendees = useMemo(() => meetingVoiceAttendees(members, me).map((member) => ({ ...member, aliases: nameAliases[member.id] || [] })), [members, me, nameAliases]);
-  const saveNameAliases = async () => {
-    setAliasSaving(true);
-    try {
-      const aliases = Object.fromEntries(voiceAttendees.map((member) => [member.id, (aliasDrafts[member.id] ?? (nameAliases[member.id] || []).join(", ")).split(",").map((alias) => alias.trim()).filter(Boolean)]));
-      const result = await api("name-aliases", { aliases }, key, projectId);
-      if (!result.ok) { setMeetingVoiceError(result.error || "Could not save name spellings"); return; }
-      setNameAliases(result.nameAliases || {}); setAliasDrafts({});
-      setMeetingNotice("Name spellings saved. They are used for every new recording in this project.");
-    } finally { setAliasSaving(false); }
-  };
   const onTranscriptionComplete = useCallback((text) => {
     const attendees = voiceAttendees;
     const correctedText = correctTurnNames(text, attendees);
@@ -1154,7 +1219,7 @@ export default function Page() {
     </div></div>
   );
 
-  const nav = client ? [["portal", "My Tickets"], ...(canUseMeetings ? [["meetings", "Meetings"]] : [])] : [["all", "Dashboard"], ["issue", "Issues"], ["feature", "Features"], ["files", "Attachments"], ["team", "Team"], ...(canUseMeetings ? [["meetings", "Meetings"], ["meeting-notes", "Meeting Notes"]] : []), ...(admin ? [["activity", "Activity"]] : [])];
+  const nav = client ? [["portal", "My Tickets"], ...(canUseMeetings ? [["meetings", "Meetings"]] : [])] : [["all", "Dashboard"], ["issue", "Issues"], ["feature", "Features"], ["files", "Attachments"], ["team", "Team"], ["chat", "Team Chat"], ...(canUseMeetings ? [["meetings", "Meetings"], ["meeting-notes", "Meeting Notes"]] : []), ...(admin ? [["activity", "Activity"]] : [])];
   const firstOfMonth = new Date(meetingMonth.getFullYear(), meetingMonth.getMonth(), 1);
   const calendarStart = new Date(firstOfMonth); calendarStart.setDate(firstOfMonth.getDate() - ((firstOfMonth.getDay() + 6) % 7));
   const calendarDates = Array.from({ length: 42 }, (_, i) => { const date = new Date(calendarStart); date.setDate(calendarStart.getDate() + i); return date; });
@@ -1189,8 +1254,7 @@ export default function Page() {
             setRecordingTranscript(""); setRecordingCards([]); setRecordingNoteId(""); setRecordingSaved(false); setMeetingError(""); setMeetingNotice("");
           }
           setView(k);
-        }}>{l}{k !== "meeting-notes" && <em>{k === "files" ? fileTotal : k === "activity" ? auditTotal : k === "team" ? members.length : k === "meetings" ? meetingTotal : tickets.filter((t) => k === "all" || k === "portal" || t.type === k).length}</em>}</button>))}
-        {!client && <button className="nav ghost" onClick={exportCsv}>Export CSV</button>}
+        }}>{l}{k === "chat" ? chatUnread > 0 && <em className="nav-unread">{chatUnread > 9 ? "9+" : chatUnread}</em> : k !== "meeting-notes" && <em>{k === "files" ? fileTotal : k === "activity" ? auditTotal : k === "team" ? members.length : k === "meetings" ? meetingTotal : tickets.filter((t) => k === "all" || k === "portal" || t.type === k).length}</em>}</button>))}
         <button className={"nav ghost " + (view === "account" ? "on" : "")} onClick={() => { setAmsg(""); setView("account"); }}>My account</button>
         <button className="nav ghost" onClick={async () => { await api("logout", {}, key); localStorage.removeItem("rw-key"); location.reload(); }}>Sign out</button>
       </aside>
@@ -1203,9 +1267,13 @@ export default function Page() {
           <span className="mobile-view">{activeProject?.name}</span>
         </div>
         <header className="top">
-          <div><h1>{{ all: "Support Dashboard", issue: "Issues Log", feature: "Features Log", team: "Team & Roles", meetings: "Meeting Calendar", "meeting-notes": "Meeting Notes & Tasks", activity: "Activity Log", files: "Attachments", account: "My Account", portal: "My Tickets" }[view]}</h1><p><b>{activeOrganization?.name}</b> · <b>{activeProject?.name}</b> · Signed in as <b>{me.name}</b> <span className={"pill r" + me.role}>{me.role}</span></p></div>
+          <div><h1>{{ all: "Support Dashboard", issue: "Issues Log", feature: "Features Log", team: "Team & Roles", meetings: "Meeting Calendar", "meeting-notes": "Meeting Notes & Tasks", activity: "Activity Log", files: "Attachments", account: "My Account", portal: "My Tickets", chat: "Team Chat" }[view]}</h1><p><b>{activeOrganization?.name}</b> · <b>{activeProject?.name}</b> · Signed in as <b>{me.name}</b> <span className={"pill r" + me.role}>{me.role}</span></p></div>
           <div className="top-actions">
-            {!["team", "activity", "files", "account", "meetings", "meeting-notes"].includes(view) && <div className="acts"><button className="btn alt" onClick={() => setModal(blank("feature"))}>+ New Feature</button><button className="btn" onClick={() => setModal(blank("issue"))}>+ New Issue</button></div>}
+            {["issue", "feature", "portal"].includes(view) && <div className="acts">
+              {view !== "issue" && <button className={"btn" + (view === "portal" ? " alt" : "")} onClick={() => setModal(blank("feature"))}>+ New Feature</button>}
+              {view !== "feature" && <button className="btn" onClick={() => setModal(blank("issue"))}>+ New Issue</button>}
+            </div>}
+            <span className="live-dot" title="Live: changes from your team appear automatically">Live</span>
             {!client && <NotificationBell requests={meetingEditRequests.filter((item) => item.projectId === projectId)} isAdmin={!!admin} meId={me.id} notice={dashboardNotice} onReview={reviewMeetingEditRequest} />}
           </div>
         </header>
@@ -1317,7 +1385,7 @@ export default function Page() {
           </div>
           </>}
           {meetingSelected && <div className="meeting-workspace">
-            {pendingRecording && <LocalTranscriber audio={pendingRecording} names={voiceAttendees} model={transcriptionModel} onProgress={setTranscriptionProgress} onComplete={onTranscriptionComplete} onError={onTranscriptionError} />}
+            {pendingRecording && <LocalTranscriber audio={pendingRecording} names={voiceAttendees} model="best" onProgress={setTranscriptionProgress} onComplete={onTranscriptionComplete} onError={onTranscriptionError} />}
             <header className="panel meeting-workspace-head">
               <button type="button" className="btn alt meeting-back" disabled={meetingLocked} title={meetingLocked ? "Finish or save the recording first" : undefined} onClick={closeMeeting}>← Calendar</button>
               <div className="meeting-workspace-title">
@@ -1361,7 +1429,6 @@ export default function Page() {
                 <section className="meeting-summary-cards" aria-label="Team member updates and upcoming tasks">
                   <div className="meeting-cards-heading"><h3>Team task cards <small>Say a member's name to route their update automatically, or click a card before recording to use it as the default. Clicking alone does not add or change any notes.</small></h3>
                     <div className="meeting-member-controls">
-                      <label>Select team member<select aria-label="Select team member card" value={selectedMeetingMemberId} onChange={(event) => selectMeetingMember(event.target.value)}><option value="">Choose a member…</option>{members.filter((member) => member.status === "active" && member.role !== "Client").map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>
                       <button type="button" className="btn alt" onClick={() => moveMeetingMember(-1)} disabled={!members.some((member) => member.status === "active" && member.role !== "Client")}>‹ Previous</button>
                       <button type="button" className="btn alt" onClick={() => moveMeetingMember(1)} disabled={!members.some((member) => member.status === "active" && member.role !== "Client")}>Next member ›</button>
                       <button type="button" className={"btn " + (meetingCardView === "all" ? "" : "alt")} aria-pressed={meetingCardView === "all"} onClick={() => setMeetingCardView((mode) => mode === "all" ? "selected" : "all")}>{meetingCardView === "all" ? "Show selected" : "Show all members"}</button>
@@ -1390,7 +1457,7 @@ export default function Page() {
                       <label>Next tasks (one per line)<textarea disabled={!canEditMeetingContent || (!["Admin", "Collaborator"].includes(me.role) && card.memberId !== me.id)} rows="2" value={(card.tasks || []).join("\n")} onChange={(event) => setParticipantSummaries((items) => items.map((item) => item.memberId === card.memberId ? { ...item, tasks: event.target.value.split("\n") } : item))} placeholder="Write the next action; details and deadline can be managed in Meeting Notes" /></label>
                     </article>;
                   })}
-                    {!selectedMeetingMemberId && <div className="meeting-member-empty"><b>Ready for the next update?</b><span>Select a team member above, or start recording and their turn will be selected when their name is recognized.</span></div>}
+                    {!selectedMeetingMemberId && <div className="meeting-member-empty"><b>Ready for the next update?</b><span>Click a team member's card above, or start recording and their turn will be selected when their name is recognized.</span></div>}
                   </div>
                 </section>
                 {meetingNotesOpen && <section className="panel meeting-notes-panel">
@@ -1418,19 +1485,6 @@ export default function Page() {
                   <h3>Recording</h3>
                   <div className="meeting-note-tools">
                     <p className="meeting-invite-hint">Speak in Urdu, English or a mix — notes are written in English. To fill a member's card automatically, address them by name: "Ali, apne tasks batao" / "Ali, your update".</p>
-                    <label className="meeting-language-setting">Speech model
-                      <select value={transcriptionModel} onChange={(event) => { setTranscriptionModel(event.target.value); try { localStorage.setItem("rw-transcription-model", event.target.value); } catch {} }} disabled={recordingState !== "idle"}>
-                        <option value="auto">Automatic (best this device can run)</option>
-                        <option value="best">Most accurate — Whisper Medium (~520 MB, needs a good GPU)</option>
-                        <option value="fast">Faster — Whisper Small (~300 MB)</option>
-                      </select>
-                    </label>
-                    {["Admin", "Collaborator"].includes(me.role) && <details className="meeting-name-spellings">
-                      <summary>Team name spellings ({voiceAttendees.filter((member) => (nameAliases[member.id] || []).length).length}/{voiceAttendees.length} set)</summary>
-                      <p className="meeting-invite-hint">Add other ways a name may be heard or written, separated by commas (for example Mashhood: "Mashood, Mashud"). Used for every recording in this project.</p>
-                      {voiceAttendees.map((member) => <label key={member.id}>{member.name}<input maxLength={300} placeholder="Other spellings, comma separated" value={aliasDrafts[member.id] ?? (nameAliases[member.id] || []).join(", ")} onChange={(event) => setAliasDrafts((drafts) => ({ ...drafts, [member.id]: event.target.value }))} /></label>)}
-                      <button type="button" className="btn alt" disabled={aliasSaving || !Object.keys(aliasDrafts).length} onClick={saveNameAliases}>{aliasSaving ? "Saving…" : "Save spellings"}</button>
-                    </details>}
                     {recordingState === "idle" && !failedRecording && (!recordingNoteId || recordingSaved) && <button className="btn meeting-record-button" disabled={!["Admin", "Collaborator"].includes(me.role)} onClick={startMeetingRecording}>{hasRecordedVoiceNote ? "Record another clip" : "Start microphone recording"}</button>}
                     {recordingState === "recording" && <>
                       <button className="btn alt meeting-record-button" onClick={pauseMeetingRecording}>Pause</button>
@@ -1442,7 +1496,7 @@ export default function Page() {
                     </>}
                     {recordingState === "transcribing" && <button className="btn meeting-record-button" disabled>Transcribing…</button>}
                     {recordingState === "idle" && failedRecording && <button className="btn alt meeting-record-button" disabled={!["Admin", "Collaborator"].includes(me.role)} onClick={retryLastTranscription}>Retry last clip</button>}
-                    <span className={"meeting-record-status " + recordingState} aria-live="polite">{recordingState === "recording" ? `Recording · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")} · max 60 minutes` : recordingState === "paused" ? `Recording paused · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")}` : recordingState === "transcribing" ? transcriptionProgress || "Translating and preparing English key points…" : "For Urdu-English speech, select Urdu / Urdu-English. Repeated output is retried with a more accurate model. Review the transcript and speaker suggestions before saving."}</span>
+                    <span className={"meeting-record-status " + recordingState} aria-live="polite">{recordingState === "recording" ? `Recording · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")} · max 60 minutes` : recordingState === "paused" ? `Recording paused · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")}` : recordingState === "transcribing" ? transcriptionProgress || "Translating and preparing English key points…" : "Speak in Urdu, English or a mix. Review the transcript and member cards before saving."}</span>
                   </div>
                   {!!recordingClips.length && <div className="meeting-audio-preview"><span>Recording clips ({recordingClips.length})</span><div>{recordingClips.map((clip, index) => <div key={clip.id}><label>Clip {index + 1}</label><audio controls preload="metadata" src={clip.url}>Audio preview unavailable in this browser.</audio></div>)}</div></div>}
                   {!!recordingClips.length && !recordingSaved && <div className="meeting-record-save"><span>{recordingNoteId ? "The note is saved. Retry to finish uploading its clips." : `${recordingClips.filter((clip) => clip.transcript).length} of ${recordingClips.length} clip(s) transcribed. Add more clips, then save them together as one monthly note. Cancel removes this set's generated text from Shared meeting notes.`}</span><div>{!recordingNoteId && <button className="btn alt" disabled={meetingBusy || recordingState !== "idle"} onClick={cancelRecordingNotes}>Cancel recording notes</button>}{recordingNoteId || (recordingClips.every((clip) => clip.transcript) && recordingTranscript) ? <button className="btn" disabled={!["Admin", "Collaborator"].includes(me.role) || meetingBusy || recordingState !== "idle"} onClick={saveRecordingAsNote}>{meetingBusy ? "Saving…" : "Save recording as note"}</button> : null}</div></div>}
@@ -1451,14 +1505,16 @@ export default function Page() {
               </aside>
             </div>
           </div>}
-        </section>) : view === "meeting-notes" ? <MeetingNotes projectId={projectId} keyValue={key} members={members} canDelete={admin} canManageContent={!!me && ["Admin", "Collaborator"].includes(me.role)} me={me} onAccessChange={handleMeetingAccessChange} /> : view === "portal" ? (<section className="panel"><div className="wrap"><table className="tm"><thead><tr><th>ID</th><th>Ticket</th><th>Type</th><th>Raised</th><th>Status</th><th>Completed</th><th>Actions</th></tr></thead><tbody>
+        </section>) : view === "meeting-notes" ? <MeetingNotes projectId={projectId} keyValue={key} members={members} canDelete={admin} canManageContent={!!me && ["Admin", "Collaborator"].includes(me.role)} me={me} onAccessChange={handleMeetingAccessChange} refreshKey={liveVersion} /> : view === "portal" ? (<section className="panel"><div className="wrap"><table className="tm"><thead><tr><th>ID</th><th>Ticket</th><th>Type</th><th>Raised</th><th>Status</th><th>Completed</th><th className="ra-h">Actions</th></tr></thead><tbody>
           {[...tickets].sort((a, b) => (b.date || "").localeCompare(a.date || "")).map((t) => (<tr key={t.id}>
             <td><b className={"id " + t.type}>{t.clientRef || t.id}</b></td><td className="tt">{t.title}</td><td>{t.type === "issue" ? "Issue" : "Feature"}</td><td className="nw">{fmt(t.date)}</td>
             <td><span className={"pill st " + t.status.replace(" ", "")}>{t.status}</span></td><td className="nw">{fmt(t.closed)}</td>
-            <td className="ra"><button className="ic" title="View details, solution and attachments" onClick={() => setDetail(t.id)}><Ic d={EYE} /></button>
-              {t.status !== "Completed" && <button className="ic" title="Edit" onClick={() => setModal({ ...t })}><Ic d={PEN} /></button>}
-              {t.status === "Completed" && <button className="ic" onClick={() => reopen(t)}>Reopen</button>}
-              <button className="ic dl" title="Delete ticket" onClick={() => deleteOwnTicket(t)}><Ic d={TRASH} /></button></td></tr>))}
+            <td className="ra"><div className="row-actions">
+              {t.status === "Completed"
+                ? <button className="ic reopen" title="Not satisfied? Reopen this ticket" onClick={() => reopen(t)}>Reopen</button>
+                : <button className="ic" title="Edit" aria-label="Edit" onClick={() => setModal({ ...t })}><Ic d={PEN} /></button>}
+              <button className="ic" title="View details, solution and attachments" aria-label="View details" onClick={() => setDetail(t.id)}><Ic d={EYE} /></button>
+              <button className="ic dl" title="Delete ticket" aria-label="Delete ticket" onClick={() => deleteOwnTicket(t)}><Ic d={TRASH} /></button></div></td></tr>))}
           {!tickets.length && <tr><td colSpan="7" className="empty">You have not raised any tickets yet. Use the buttons above to raise one.</td></tr>}</tbody></table></div>
           <div className="tools"><span className="note">Showing {tickets.length ? ticketOffset + 1 : 0}–{ticketOffset + tickets.length} of {ticketTotal} tickets</span><button className="btn alt" disabled={ticketOffset === 0 || ticketPageLoading} onClick={() => loadTicketPage(Math.max(0, ticketOffset - 100))}>Previous</button><button className="btn alt" disabled={!ticketHasMore || ticketPageLoading} onClick={() => loadTicketPage(ticketOffset + 100)}>{ticketPageLoading ? "Loading…" : "Next"}</button></div></section>) : view === "account" ? (<section className="acc">
           <div className="panel"><h3>Profile</h3>
@@ -1468,12 +1524,13 @@ export default function Page() {
               <label>Email<input disabled value={me.email} /></label><label>Role<input disabled value={me.role} /></label></div>
               <div className="acts end"><button className="btn">Save profile</button></div></form></div>
           <div className="panel"><h3>Security</h3>
-            <form onSubmit={(e) => saveAcct(e, true)}><div className="g">
+            {!pwOpen ? <div className="pw-closed"><div><b>Password</b><span>Use a strong password you do not use anywhere else.</span></div><button type="button" className="btn" onClick={() => { setAmsg(""); setAcct({ ...acct, current: "", password: "", confirm: "" }); setPwOpen(true); }}>Change password</button></div>
+            : <form className="pw-form" onSubmit={(e) => saveAcct(e, true)}><div className="g">
               {me.hasPw && <label className="full">Current password<input required type="password" autoComplete="current-password" {...A("current")} /></label>}
               <label>New password<input required type="password" minLength={8} autoComplete="new-password" {...A("password")} /></label>
               <label>Confirm new password<input required type="password" minLength={8} autoComplete="new-password" {...A("confirm")} /></label></div>
               <p className="note">8+ characters with at least one letter and one number.</p>
-              <div className="acts end"><button className="btn">Change password</button></div></form>
+              <div className="acts end"><button type="button" className="btn alt" onClick={() => { setPwOpen(false); setAmsg(""); }}>Cancel</button><button className="btn">Update password</button></div></form>}
             <div className="acts"><button className="btn alt" onClick={async () => { if (confirm("Sign out of all devices?")) { await api("logoutall", {}, key); localStorage.removeItem("rw-key"); location.reload(); } }}>Sign out of all devices</button></div>
             {amsg && <p className="err">{amsg}</p>}</div>
         </section>) : view === "files" ? (<section className="panel files-page">
@@ -1500,20 +1557,13 @@ export default function Page() {
               <td className="ra files-actions">{a.url ? <a className="ic" href={fh(a)} target="_blank" rel="noreferrer">Open link</a> : <button type="button" className="ic" onClick={() => openFile(a)}>Download</button>}{canDeleteFiles && <button type="button" className="ic dl" aria-label={"Delete " + a.name} onClick={() => confirm("Delete " + a.name + "?") && adm("filedel", { id: a.id })}><Ic d={TRASH} /></button>}</td></tr>))}
             </tbody></table></div> : <div className="files-empty"><span className="files-drop-icon"><Ic d={CLIP} /></span><b>No files in {CATS[fc]} yet</b><span>Upload a file or add a link above. Ticket attachments appear here too.</span></div>}
           <div className="tools"><span className="note">Showing {files.length ? fileOffset + 1 : 0}–{fileOffset + files.length} of {fileTotal} files</span><button className="btn alt" disabled={!fileOffset || fileLoading} onClick={() => loadFilePage(Math.max(0, fileOffset - 100))}>Previous</button><button className="btn alt" disabled={!fileHasMore || fileLoading} onClick={() => loadFilePage(fileOffset + 100)}>{fileLoading ? "Loading…" : "Next"}</button></div>
-        </section>) : view === "activity" ? (<section className="panel"><div className="wrap"><table className="tm"><thead><tr><th>Time</th><th>User</th><th>Action</th><th>Details</th></tr></thead><tbody>
-          {audit.map((a, i) => (<tr key={i}><td className="nw">{new Date(a.at).toLocaleString("en-GB")}</td><td>{a.who}</td><td className="tt">{a.act}</td><td>
-            {Array.isArray(a.detail) ? <div className="audit-diff">{a.detail.map((change, j) => <div className="audit-change" key={j}>
-              <b>{change.field}</b><span className="audit-value old"><small>Old</small>{change.old}</span><span className="audit-value new"><small>New</small>{change.new}</span>
-            </div>)}</div> : a.detail}
-          </td></tr>))}
-          {!audit.length && <tr><td colSpan="4" className="empty">No activity yet.</td></tr>}</tbody></table></div><div className="tools"><span className="note">Showing {audit.length ? auditOffset + 1 : 0}–{auditOffset + audit.length} of {auditTotal} events</span><button className="btn alt" disabled={!auditOffset || auditLoading} onClick={() => loadAuditPage(Math.max(0, auditOffset - 100))}>Previous</button><button className="btn alt" disabled={!auditHasMore || auditLoading} onClick={() => loadAuditPage(auditOffset + 100)}>{auditLoading ? "Loading…" : "Next"}</button></div></section>) : view === "team" ? (<>
+        </section>) : view === "activity" ? <ActivityLog audit={audit} offset={auditOffset} total={auditTotal} hasMore={auditHasMore} loading={auditLoading} onPage={loadAuditPage} /> : view === "chat" ? <TeamChat key={projectId} projectId={projectId} keyValue={key} me={me} members={members} projectName={activeProject?.name || ""} organizationName={activeOrganization?.name || ""} pulseChannels={pulseChannels} lastRead={chatRead} onRead={markChatRead} onOpenTicket={openTicket} /> : view === "team" ? (<>
           {admin && (<section className="panel"><h3>Invite a member to {activeProject?.name}</h3>
             <p className="note">This invitation is for <b>{activeProject?.name}</b> only. Members can have different roles in other projects.</p>
             <form className="tools" onSubmit={sendInvite}>
               <input required type="email" placeholder="Email address" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
               <select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}>{ROLES.map((r) => <option key={r}>{r}</option>)}</select>
               <button className="btn">Send invite</button></form>
-            <div className="acts"><button type="button" className="btn alt" onClick={async () => { setMsg("Sending test email..."); const r = await api("testmail", {}, key, projectId); setMsg(r.sent ? "Test email sent to " + r.to + " using " + r.provider + ". Check your inbox (and spam folder)." : "Test email failed: " + (r.error || "unknown error")); }}>Send test email</button></div>
             {msg && <p className="note">{msg}</p>}
             {invites.map((i) => (<div className="inv" key={i.token}><span>{i.email} <em>({i.role} · {activeProject?.name}, pending)</em></span>
               <button className="ic" onClick={() => navigator.clipboard.writeText(location.origin + "/?invite=" + i.token)}>Copy link</button>
@@ -1530,7 +1580,7 @@ export default function Page() {
           </tbody></table></div>
           <p className="note">Roles and team membership apply only to {activeProject?.name} in {activeOrganization?.name}. Admin and Collaborator: full access to tickets (create, edit, assign, change status, delete). Developer: sees only the tickets assigned to them or raised by them (with their attachments and meeting-note tasks), can create tickets and edit or change the status of their own tickets; cannot reassign or delete. Assignees are emailed the full task when they are assigned. For meeting cards, saved meeting notes, and task details, only Admins and Collaborators can edit; other team members can change status on tasks assigned to them or request one-hour admin-approved edit access. Client: sees only tickets they raised in this project; can create, update, reopen and delete them.</p></section>
         </>) : (<>
-          {view === "all" ? <Dashboard key={projectId} apiGet={(path) => api(path, null, key, projectId)} members={members} projectName={activeProject?.name || ""} onOpenTicket={openTicket} /> : (
+          {view === "all" ? <Dashboard key={projectId} apiGet={(path) => api(path, null, key, projectId)} members={members} projectName={activeProject?.name || ""} onOpenTicket={openTicket} refreshKey={liveVersion} /> : (
           <section className="panel">
             <div className="tools">
               <input placeholder="Search by ID, title, details..." value={q} onChange={(e) => setQ(e.target.value)} />
@@ -1538,10 +1588,12 @@ export default function Page() {
               <select value={fs} onChange={(e) => setFs(e.target.value)}><option value="">All statuses</option>{STATUS.map((s) => <option key={s}>{s}</option>)}</select>
               <select value={fp} onChange={(e) => setFp(e.target.value)}><option value="">All priorities</option>{PRIO.map((s) => <option key={s}>{s}</option>)}</select>
               <select value={fa} onChange={(e) => setFa(e.target.value)}><option value="">All assignees</option><option value="none">Unassigned</option>{members.filter((x) => x.role !== "Client").map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}</select>
+              <button type="button" className="btn alt export-btn" disabled={!rows.length} title={`Download the ${rows.length} ticket(s) shown below as an Excel CSV`} onClick={exportCsv}>
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" /></svg>Export CSV</button>
             </div>
             <p className="note">Showing {tickets.length ? ticketOffset + 1 : 0}–{ticketOffset + tickets.length} of {ticketTotal} tickets. Search and filters apply to this page.{me.role === "Developer" && " You see only the tickets assigned to you or raised by you."}</p>
             <div className="wrap"><table>
-              <thead><tr><th>ID</th><th>Ticket</th><th>Raised</th><th>Priority</th><th>Assignee</th><th>Release</th><th>Status</th><th>Completed</th><th>Actions</th></tr></thead>
+              <thead><tr><th>ID</th><th>Ticket</th><th>Raised</th><th>Priority</th><th>Assignee</th><th>Release</th><th>Status</th><th>Completed</th><th className="ra-h">Actions</th></tr></thead>
               <tbody>
                 {rows.map((t) => (<tr key={t.id}>
                     <td><b className={"id " + t.type}>{t.id}</b></td>
@@ -1552,11 +1604,11 @@ export default function Page() {
                     <td className="nw">{t.version || "-"}<div className="dd">{fmt(t.deployed)}</div></td>
                     <td><select className={"st " + t.status.replace(" ", "")} disabled={!canEditTicket(t)} title={canEditTicket(t) ? undefined : "Only the assignee, an admin or a collaborator can change this"} value={t.status} onChange={(e) => setStatus(t, e.target.value)}>{STATUS.map((s) => <option key={s}>{s}</option>)}</select></td>
                     <td className="nw">{fmt(t.closed)}{t.deadline && <div className="dd">Due {fmt(t.deadline)}</div>}</td>
-                    <td className="ra">
-                      <button className="ic" title="View details and attachments" onClick={() => setDetail(t.id)}><Ic d={EYE} /></button>
-                      {canEditTicket(t) && <button className="ic" title="Edit" onClick={() => setModal({ ...t })}><Ic d={PEN} /></button>}
-                      <button className="ic dl" disabled={!canDel(t)} title={canDel(t) ? "Delete" : "Only admins and collaborators can delete tickets"} onClick={() => del(t)}><Ic d={TRASH} /></button>
-                    </td></tr>))}
+                    <td className="ra"><div className="row-actions">
+                      <button className="ic" title="View details and attachments" aria-label="View details" onClick={() => setDetail(t.id)}><Ic d={EYE} /></button>
+                      <button className={"ic" + (canEditTicket(t) ? "" : " ghost-slot")} title="Edit" aria-label="Edit" disabled={!canEditTicket(t)} aria-hidden={!canEditTicket(t)} tabIndex={canEditTicket(t) ? 0 : -1} onClick={() => setModal({ ...t })}><Ic d={PEN} /></button>
+                      <button className="ic dl" disabled={!canDel(t)} title={canDel(t) ? "Delete" : "Only admins and collaborators can delete tickets"} aria-label="Delete" onClick={() => del(t)}><Ic d={TRASH} /></button>
+                    </div></td></tr>))}
                 {!rows.length && <tr><td colSpan="9" className="empty">No tickets found.</td></tr>}
               </tbody>
             </table></div>

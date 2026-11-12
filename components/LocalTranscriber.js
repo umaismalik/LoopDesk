@@ -4,7 +4,7 @@ import { useEffect, useRef } from "react";
 import { transcribeLocally } from "../lib/local-transcription";
 
 // `names` are the meeting's team members ({ name, aliases }) so the model spells them correctly;
-// `model` is "auto", "best" (Whisper Medium) or "fast" (Whisper Small).
+// the most accurate speech model is always used (see lib/local-transcription.js).
 export default function LocalTranscriber({ audio, names, model, onProgress, onComplete, onError }) {
   const callbacks = useRef({ onProgress, onComplete, onError });
   callbacks.current = { onProgress, onComplete, onError };

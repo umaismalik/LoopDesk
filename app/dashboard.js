@@ -149,22 +149,29 @@ function BarList({ rows, total, empty, unit = "open" }) {
   );
 }
 
-export default function Dashboard({ apiGet, members, projectName, onOpenTicket }) {
+export default function Dashboard({ apiGet, members, projectName, onOpenTicket, refreshKey }) {
   const [data, setData] = useState({ tickets: [], generatedAt: "" });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [member, setMember] = useState("");
   const team = useMemo(() => members.filter((m) => m.role !== "Client"), [members]);
 
-  const refresh = async () => {
-    setLoading(true);
+  // A silent refresh (live update) keeps the current charts on screen while new numbers load.
+  const refresh = async (silent = false) => {
+    if (!silent) setLoading(true);
     const r = await apiGet("analytics");
     if (r.ok) { setData({ tickets: r.tickets || [], generatedAt: r.generatedAt }); setError(""); }
-    else setError(r.error || "Analytics could not be loaded.");
+    else if (!silent) setError(r.error || "Analytics could not be loaded.");
     setLoading(false);
   };
   // Reload whenever the project changes; the parent remounts this view per project.
   useEffect(() => { refresh(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // Something changed in the project (live update): refresh the numbers in place.
+  const firstRefreshKey = useRef(refreshKey);
+  useEffect(() => {
+    if (refreshKey === firstRefreshKey.current) return;
+    refresh(true);
+  }, [refreshKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const view = useMemo(() => {
     const today = dateKey(new Date());
@@ -200,7 +207,7 @@ export default function Dashboard({ apiGet, members, projectName, onOpenTicket }
           <label><span>Team member</span>
             <select value={member} onChange={(e) => setMember(e.target.value)}><option value="">All team members</option>{team.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}</select>
           </label>
-          <button type="button" className="btn alt" onClick={refresh} disabled={loading}>{loading ? "Refreshing…" : "Refresh"}</button>
+          <button type="button" className="btn alt" onClick={() => refresh()} disabled={loading}>{loading ? "Refreshing…" : "Refresh"}</button>
         </div>
       </div>
       {error && <div className="meeting-alert" role="alert"><b>Analytics unavailable</b><span>{error}</span></div>}

@@ -1,4 +1,5 @@
 import "./globals.css";
+import "./workspace.css";
 
 export const metadata = {
   applicationName: "LoopDesk",

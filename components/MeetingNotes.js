@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const currentMonth = () => {
   const date = new Date();
@@ -13,13 +13,28 @@ const localDateTime = (value) => {
   if (!Number.isFinite(date.getTime())) return "";
   return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
 };
+const shiftMonth = (value, delta) => {
+  const [year, monthNumber] = value.split("-").map(Number);
+  const d = new Date(year, monthNumber - 1 + delta, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+};
+const monthTitle = (value) => new Date(`${value}-01T00:00:00`).toLocaleDateString("en-GB", { month: "long", year: "numeric" });
+const initials = (name) => String(name || "?").split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase();
+const AVATAR_COLORS = ["#4f46e5", "#0f9f8f", "#d97706", "#7c3aed", "#db2777", "#0891b2", "#65a30d"];
+const avatarColor = (id) => AVATAR_COLORS[[...String(id || "")].reduce((sum, ch) => sum + ch.charCodeAt(0), 0) % AVATAR_COLORS.length];
+const isOverdue = (task) => task.dueDate && task.status !== "Completed" && new Date(task.dueDate).getTime() < Date.now();
+const dueLabel = (value) => {
+  if (!value) return "No deadline";
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "No deadline";
+};
 const csvCell = (value) => {
   let text = String(value ?? "");
   if (/^[\t\r\n ]*[=+\-@]/.test(text)) text = "'" + text;
   return `"${text.replace(/"/g, '""')}"`;
 };
 
-export default function MeetingNotes({ projectId, keyValue, members, canDelete, canManageContent, me, onAccessChange }) {
+export default function MeetingNotes({ projectId, keyValue, members, canDelete, canManageContent, me, onAccessChange, refreshKey }) {
   const [month, setMonth] = useState(currentMonth);
   const [reportPeriod, setReportPeriod] = useState("month");
   const [reportWeek, setReportWeek] = useState(() => new Date().toISOString().slice(0, 10));
@@ -42,6 +57,13 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
   const [editAccess, setEditAccess] = useState(!!canManageContent);
   const [editAccessExpiresAt, setEditAccessExpiresAt] = useState(null);
   const [accessRequests, setAccessRequests] = useState([]);
+  const [tab, setTab] = useState("overview");
+  const [search, setSearch] = useState("");
+  const [reportOpen, setReportOpen] = useState(false);
+  // The note as last loaded from the server; a live refresh only replaces the open note when the
+  // user has not started editing it.
+  const baselineRef = useRef("");
+  const openNote = (note) => { baselineRef.current = note ? JSON.stringify(note) : ""; setSelected(note); };
 
   const request = useCallback(async (body, offset = 0) => {
     try {
@@ -73,10 +95,17 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
       setEditAccessExpiresAt(result.expiresAt || null);
       onAccessChange?.(canEdit, result.expiresAt || null, result.requests || []);
       setAccessRequests(result.requests || []);
-      setSelected((previous) => previous ? (result.notes || []).find((note) => note.id === previous.id) || null : null);
+      setSelected((previous) => {
+        if (!previous) return null;
+        const fresh = (result.notes || []).find((note) => note.id === previous.id);
+        if (!fresh) return null;
+        if (JSON.stringify(previous) !== baselineRef.current) return previous;
+        baselineRef.current = JSON.stringify(fresh);
+        return fresh;
+      });
     }).finally(() => { if (active) setNotesLoading(false); });
     return () => { active = false; };
-  }, [request, canManageContent, onAccessChange, notesOffset]);
+  }, [request, canManageContent, onAccessChange, notesOffset, refreshKey]);
   const refreshAccessState = async () => {
     const result = await request();
     if (!result.ok) { setError(result.error || "Could not refresh meeting access"); return; }
@@ -133,7 +162,7 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
     const result = await request({ action: "update", noteId: selected.id, title: selected.title, summary: selected.summary, transcript: selected.transcript, participantSummaries: selected.participantSummaries, tasks: selected.tasks });
     setBusy(false);
     if (!result.ok) { setError(result.error || "Could not save note"); return; }
-    setSelected(result.note);
+    openNote(result.note);
     setNotes((items) => items.map((item) => item.id === result.note.id ? result.note : item));
     setNotice(result.taskEmailsFailed ? `Saved, but ${result.taskEmailsFailed} task assignment email(s) failed: ${result.emailErrors?.[0] || "check email settings"}` : `Note and tasks saved.${result.taskEmailsSent ? ` Assignment notification sent to ${result.taskEmailsSent} team member(s).` : ""}`);
   };
@@ -147,7 +176,7 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
     const result = await request({ action: "update", noteId: updated.id, title: updated.title, summary: updated.summary, transcript: updated.transcript, participantSummaries: updated.participantSummaries, tasks: updated.tasks });
     setBusy(false);
     if (!result.ok) { setError(result.error || "Could not add task"); return; }
-    setSelected(result.note); setNotes((items) => items.map((item) => item.id === result.note.id ? result.note : item));
+    openNote(result.note); setNotes((items) => items.map((item) => item.id === result.note.id ? result.note : item));
     setTaskTitle(""); setTaskAssignee(""); setTaskDeadline(""); setTaskPriority("Medium");
     if (result.taskEmailsFailed) setError(`Task saved, but assignment email failed: ${result.emailErrors?.[0] || "check email settings"}`);
     else if (result.taskEmailsSent) setNotice(`Task saved and emailed to ${result.taskEmailsSent} assigned team member(s).`);
@@ -160,7 +189,7 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
     const result = await request({ action: "comment", noteId: selected.id, taskId: task.id, text });
     setBusy(false);
     if (!result.ok) { setError(result.error || "Could not add comment"); return; }
-    setSelected(result.note); setNotes((items) => items.map((item) => item.id === result.note.id ? result.note : item));
+    openNote(result.note); setNotes((items) => items.map((item) => item.id === result.note.id ? result.note : item));
     setCommentDrafts((drafts) => ({ ...drafts, [task.id]: "" }));
   };
   const deleteNote = async () => {
@@ -178,7 +207,7 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
     const result = await request({ action: "task-status", noteId: selected.id, taskId: task.id, status });
     setBusy(false);
     if (!result.ok) { setError(result.error || "Could not update task status"); return; }
-    setSelected(result.note);
+    openNote(result.note);
     setNotes((items) => items.map((item) => item.id === result.note.id ? result.note : item));
   };
   const exportReport = async () => {
@@ -265,18 +294,61 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
   const myAccessRequest = accessRequests.find((item) => item.memberId === me?.id && item.projectId === projectId && item.status === "pending");
   const pendingAccessRequests = accessRequests.filter((item) => item.status === "pending");
 
-  return <section className="panel managed-notes">
-    <div className="managed-notes-toolbar">
-      <div><h2>Meeting notes & action items</h2><p>Meeting decisions become assigned tasks; set deadlines here.</p></div>
-      <label>Month<input type="month" value={month} onChange={(event) => { setMonth(event.target.value); setNotesOffset(0); setSelected(null); }} /></label>
+  const allTasks = notes.flatMap((note) => note.tasks || []);
+  const stats = {
+    notes: notesTotal || notes.length,
+    tasks: allTasks.length,
+    done: allTasks.filter((task) => task.status === "Completed").length,
+    open: allTasks.filter((task) => task.status !== "Completed").length,
+    overdue: allTasks.filter(isOverdue).length,
+  };
+  const q = search.trim().toLowerCase();
+  const visibleNotes = q ? notes.filter((note) => `${note.title} ${note.summary || ""} ${note.createdByName || ""} ${(note.tasks || []).map((task) => task.title).join(" ")}`.toLowerCase().includes(q)) : notes;
+  const selectedTasks = selected?.tasks || [];
+  const selectedDone = selectedTasks.filter((task) => task.status === "Completed").length;
+  const memberOf = (id) => members.find((item) => item.id === id);
+  const changeMonth = (next) => { setMonth(next); setNotesOffset(0); openNote(null); };
+
+  return <section className="mn">
+    <header className="mn-hero">
+      <div className="mn-hero-text">
+        <span className="mn-eyebrow">MEETING NOTES</span>
+        <h2>Decisions & action items</h2>
+        <p>Every meeting's key points, member updates and assigned tasks — in one place.</p>
+      </div>
+      <div className="mn-month" role="group" aria-label="Choose month">
+        <button type="button" aria-label="Previous month" onClick={() => changeMonth(shiftMonth(month, -1))}>‹</button>
+        <label><b>{monthTitle(month)}</b><input type="month" value={month} onChange={(event) => event.target.value && changeMonth(event.target.value)} aria-label="Pick a month" /></label>
+        <button type="button" aria-label="Next month" onClick={() => changeMonth(shiftMonth(month, 1))}>›</button>
+        <button type="button" className="mn-today" onClick={() => changeMonth(currentMonth())}>This month</button>
+      </div>
+      <div className="mn-stats">
+        <div><b>{stats.notes}</b><span>Notes</span></div>
+        <div><b>{stats.tasks}</b><span>Action items</span></div>
+        <div className="ok"><b>{stats.done}</b><span>Completed</span></div>
+        <div className="info"><b>{stats.open}</b><span>Open</span></div>
+        <div className={stats.overdue ? "bad" : ""}><b>{stats.overdue}</b><span>Overdue</span></div>
+      </div>
+    </header>
+
+    <div className="mn-bar">
+      <div className="mn-search">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="M20 20l-3.5-3.5" /></svg>
+        <input type="search" placeholder="Search notes, tasks or people…" value={search} onChange={(event) => setSearch(event.target.value)} aria-label="Search meeting notes" />
+      </div>
+      <button type="button" className={"btn alt" + (reportOpen ? " on" : "")} aria-expanded={reportOpen} onClick={() => setReportOpen((open) => !open)}>
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" /></svg>
+        Export report
+      </button>
     </div>
-    <div className="meeting-report-toolbar">
-      <div><b>Team meeting report</b><span>Export assigned work by team member and week or month.</span></div>
-      <label>Period<select value={reportPeriod} onChange={(event) => setReportPeriod(event.target.value)}><option value="month">Month</option><option value="week">Week</option></select></label>
+    {reportOpen && <div className="meeting-report-toolbar mn-report">
+      <div><b>Team meeting report</b><span>Download assigned work by team member for a week or a month (opens in Excel).</span></div>
+      <label>Period<select value={reportPeriod} onChange={(event) => setReportPeriod(event.target.value)}><option value="month">Month ({monthTitle(month)})</option><option value="week">Week</option></select></label>
       {reportPeriod === "week" && <label>Week of<input type="date" value={reportWeek} onChange={(event) => setReportWeek(event.target.value)} /></label>}
       <label>Team member<select value={reportMember} onChange={(event) => setReportMember(event.target.value)}><option value="">All members</option>{members.filter((member) => member.status === "active" && member.role !== "Client").map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>
-      <button type="button" className="btn alt" onClick={exportReport}>Export Excel CSV</button>
-    </div>
+      <button type="button" className="btn" onClick={exportReport}>Download CSV</button>
+    </div>}
+
     {error && <div className="meeting-alert" role="alert">{error}</div>}
     {notice && <div className="meeting-success" role="status">{notice}</div>}
     {!editAccess && <div className="meeting-access-banner">
@@ -285,63 +357,119 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
     </div>}
     {editAccess && editAccessExpiresAt && <div className="meeting-access-banner active"><div><b>Temporary edit access is active</b><span>Expires {new Date(editAccessExpiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}. After expiry, you can still update statuses of your assigned tasks.</span></div></div>}
     {canDelete && !!pendingAccessRequests.length && <section className="meeting-access-requests"><h3>Temporary edit requests</h3>{pendingAccessRequests.map((item) => <article key={item.id}><div><b>{item.memberName}</b><span>Requested {new Date(item.requestedAt).toLocaleString()}</span></div><div><button type="button" className="btn" disabled={busy} onClick={() => reviewEditAccess(item.id, "approve")}>Approve for 1 hour</button><button type="button" className="btn alt" disabled={busy} onClick={() => reviewEditAccess(item.id, "deny")}>Deny</button></div></article>)}</section>}
-    <div className="managed-notes-layout">
-      <div className="managed-notes-list">
-        <p className="meeting-empty">Showing {notes.length ? notesOffset + 1 : 0}–{notesOffset + notes.length} of {notesTotal} notes</p>
-        {!notes.length && <p className="meeting-empty">No saved meeting notes for this month in this project.</p>}
-        {notes.map((note) => <button type="button" className={"managed-note-item" + (selected?.id === note.id ? " selected" : "")} key={note.id} onClick={() => { setSelected(note); setNotice(""); }}>
-          <b>{note.title}</b><span>{dateLabel(note.date)}</span><small>{note.tasks?.length || 0} action items · {note.createdByName}</small>
-        </button>)}
-        <div className="tools"><button type="button" className="btn alt" disabled={!notesOffset || notesLoading} onClick={() => setNotesOffset(Math.max(0, notesOffset - 50))}>Previous</button><button type="button" className="btn alt" disabled={!notesHasMore || notesLoading} onClick={() => setNotesOffset(notesOffset + 50)}>{notesLoading ? "Loading…" : "Next"}</button></div>
+
+    <div className={"mn-layout" + (selected ? " has-selection" : "")}>
+      <div className="mn-list">
+        <div className="mn-list-head"><b>{monthTitle(month)}</b><span>{notes.length ? `${notesOffset + 1}–${notesOffset + notes.length} of ${notesTotal}` : "0 notes"}</span></div>
+        {notesLoading && !notes.length && <div className="mn-skeleton"><span /><span /><span /></div>}
+        {!notesLoading && !visibleNotes.length && <div className="mn-empty-list"><b>{q ? "No notes match your search" : "No meeting notes this month"}</b><span>{q ? "Try another word." : "Notes saved from a meeting appear here."}</span></div>}
+        {visibleNotes.map((note, index) => {
+          const tasks = note.tasks || [];
+          const done = tasks.filter((task) => task.status === "Completed").length;
+          const overdue = tasks.filter(isOverdue).length;
+          const date = new Date(note.date + "T00:00:00");
+          return <button type="button" key={note.id} style={{ animationDelay: `${Math.min(index, 10) * 35}ms` }} className={"mn-card" + (selected?.id === note.id ? " selected" : "")} onClick={() => { openNote(note); setTab("overview"); setNotice(""); }}>
+            <span className="mn-date"><b>{Number.isFinite(date.getTime()) ? date.getDate() : "–"}</b><small>{Number.isFinite(date.getTime()) ? date.toLocaleDateString("en-GB", { month: "short" }) : ""}</small></span>
+            <span className="mn-card-body">
+              <b>{note.title}</b>
+              <small>{note.createdByName ? `by ${note.createdByName}` : dateLabel(note.date)}{(note.audioFiles?.length || note.audioFile) ? " · 🎙 recording" : ""}</small>
+              {tasks.length > 0 ? <span className="mn-progress" aria-label={`${done} of ${tasks.length} action items completed`}><i style={{ width: `${Math.round((done / tasks.length) * 100)}%` }} /></span> : null}
+              <span className="mn-card-chips"><em>{tasks.length} action item{tasks.length === 1 ? "" : "s"}</em>{tasks.length > 0 && <em className="ok">{done} done</em>}{overdue > 0 && <em className="bad">{overdue} overdue</em>}</span>
+            </span>
+          </button>;
+        })}
+        {(notesOffset > 0 || notesHasMore) && <div className="tools"><button type="button" className="btn alt" disabled={!notesOffset || notesLoading} onClick={() => setNotesOffset(Math.max(0, notesOffset - 50))}>Previous</button><button type="button" className="btn alt" disabled={!notesHasMore || notesLoading} onClick={() => setNotesOffset(notesOffset + 50)}>{notesLoading ? "Loading…" : "Next"}</button></div>}
       </div>
-      {selected && <div className="managed-note-detail">
-        <div className="managed-note-meta">{dateLabel(selected.date)} · Meeting notes by {selected.createdByName}{canDelete && <button type="button" className="ic dl" disabled={busy} onClick={deleteNote}>Delete note</button>}</div>
-        {!!recordingUrls.length && <div className="managed-saved-recording"><b>Saved recording clips ({recordingUrls.length})</b>{recordingUrls.map((url, index) => <label key={url}>Clip {index + 1}<audio controls preload="metadata" src={url}>Recording playback is unavailable in this browser.</audio></label>)}</div>}
-        <label>Note title<input disabled={!canManageContent} maxLength="160" value={selected.title} onChange={(event) => setSelected({ ...selected, title: event.target.value })} /></label>
-        <label>Generic key points / shared notes<textarea disabled={!canManageContent} rows="6" maxLength="20000" value={selected.summary} onChange={(event) => setSelected({ ...selected, summary: event.target.value })} /></label>
-        {!!selected.participantSummaries?.length && <section className="managed-participant-notes"><h3>Member-specific notes</h3>
-          {selected.participantSummaries.map((card, index) => <details className="managed-member-note" key={card.memberId} open={index === 0}><summary><b>{card.name}</b><span>{(card.points || []).length} previous updates · {(card.tasks || []).length} upcoming tasks</span></summary>
-            <div className="managed-member-note-fields">
-              <label>Previous task updates<textarea disabled={!canEditMember(card.memberId)} rows="3" value={(card.points || []).join("\n")} onChange={(event) => setSelected({ ...selected, participantSummaries: selected.participantSummaries.map((item) => item.memberId === card.memberId ? { ...item, points: event.target.value.split("\n") } : item) })} /></label>
-              <label>Upcoming tasks · {card.priority || "Medium"} priority<textarea disabled={!canEditMember(card.memberId)} rows="2" value={(card.tasks || []).join("\n")} onChange={(event) => setSelected({ ...selected, participantSummaries: selected.participantSummaries.map((item) => item.memberId === card.memberId ? { ...item, tasks: event.target.value.split("\n") } : item) })} /></label>
+
+      {!selected ? <div className="mn-placeholder">
+        <span className="mn-placeholder-icon"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8zM14 2v6h6M8 13h8M8 17h5" /></svg></span>
+        <b>Select a meeting note</b>
+        <span>Open a note on the left to see its key points, member updates and action items.</span>
+      </div> : <article className="mn-detail" key={selected.id}>
+        <header className="mn-detail-head">
+          <button type="button" className="mn-back" onClick={() => openNote(null)}>‹ All notes</button>
+          <input className="mn-title" disabled={!canManageContent} maxLength="160" value={selected.title} onChange={(event) => setSelected({ ...selected, title: event.target.value })} aria-label="Note title" />
+          <div className="mn-detail-meta">
+            <span>📅 {dateLabel(selected.date)}</span>
+            {selected.createdByName && <span className="mn-by"><i style={{ "--av": avatarColor(selected.createdBy || selected.createdByName) }}>{initials(selected.createdByName)}</i>{selected.createdByName}</span>}
+            {selectedTasks.length > 0 && <span className="mn-ring" style={{ "--pct": `${Math.round((selectedDone / selectedTasks.length) * 100)}%` }}><i />{selectedDone}/{selectedTasks.length} done</span>}
+            {canDelete && <button type="button" className="ic dl" disabled={busy} onClick={deleteNote}>Delete note</button>}
+          </div>
+          <nav className="mn-tabs" role="tablist">
+            {[["overview", "Overview"], ["tasks", `Action items${selectedTasks.length ? ` · ${selectedTasks.length}` : ""}`], ["transcript", `Transcript${recordingUrls.length ? " & audio" : ""}`]].map(([id, label]) =>
+              <button type="button" role="tab" key={id} aria-selected={tab === id} className={tab === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>)}
+          </nav>
+        </header>
+
+        {tab === "overview" && <div className="mn-pane">
+          <section className="mn-block">
+            <h3>Key points</h3>
+            <textarea disabled={!canManageContent} rows="7" maxLength="20000" value={selected.summary} onChange={(event) => setSelected({ ...selected, summary: event.target.value })} placeholder="Decisions, progress, blockers and next steps…" />
+          </section>
+          {!!selected.participantSummaries?.length && <section className="mn-block">
+            <h3>Member updates <small>{selected.participantSummaries.length} member{selected.participantSummaries.length === 1 ? "" : "s"}</small></h3>
+            <div className="mn-members">
+              {selected.participantSummaries.map((card) => <details className="mn-member" key={card.memberId} open={selected.participantSummaries.length <= 2}>
+                <summary><i style={{ "--av": avatarColor(card.memberId) }}>{initials(card.name)}</i><b>{card.name}</b><span>{(card.points || []).filter(Boolean).length} updates · {(card.tasks || []).filter(Boolean).length} next tasks</span><em className={"pill " + (card.priority || "Medium")}>{card.priority || "Medium"}</em></summary>
+                <div className="mn-member-fields">
+                  <label>Updates (done / in progress / blockers)<textarea disabled={!canEditMember(card.memberId)} rows="3" value={(card.points || []).join("\n")} onChange={(event) => setSelected({ ...selected, participantSummaries: selected.participantSummaries.map((item) => item.memberId === card.memberId ? { ...item, points: event.target.value.split("\n") } : item) })} /></label>
+                  <label>Next tasks<textarea disabled={!canEditMember(card.memberId)} rows="3" value={(card.tasks || []).join("\n")} onChange={(event) => setSelected({ ...selected, participantSummaries: selected.participantSummaries.map((item) => item.memberId === card.memberId ? { ...item, tasks: event.target.value.split("\n") } : item) })} /></label>
+                </div>
+              </details>)}
             </div>
-          </details>)}
-        </section>}
-        <details className="managed-transcript"><summary>Transcript</summary><textarea disabled={!canManageContent} rows="8" maxLength="50000" value={selected.transcript} onChange={(event) => setSelected({ ...selected, transcript: event.target.value })} /></details>
-        <section className="managed-tasks"><h3>Action items</h3>
-          {canManageContent && <form className="managed-task-create" onSubmit={addTask}>
-            <input required maxLength="300" placeholder="Action item" value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)} />
-            <select value={taskAssignee} onChange={(event) => setTaskAssignee(event.target.value)}><option value="">Unassigned</option>{members.filter((member) => member.role !== "Client" && member.status === "active").map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select>
+          </section>}
+        </div>}
+
+        {tab === "tasks" && <div className="mn-pane">
+          {canManageContent && <form className="mn-add-task" onSubmit={addTask}>
+            <input required maxLength="300" placeholder="Add an action item…" value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)} />
+            <select aria-label="Assignee" value={taskAssignee} onChange={(event) => setTaskAssignee(event.target.value)}><option value="">Unassigned</option>{members.filter((member) => member.role !== "Client" && member.status === "active").map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select>
             <select aria-label="Task priority" value={taskPriority} onChange={(event) => setTaskPriority(event.target.value)}><option>High</option><option>Medium</option><option>Low</option></select>
             <input aria-label="Deadline" type="datetime-local" value={taskDeadline} onChange={(event) => setTaskDeadline(event.target.value)} />
             <button className="btn" disabled={busy}>Add task</button>
           </form>}
-          {!taskGroups.length && <p className="meeting-empty">No action items have been assigned yet.</p>}
-          {taskGroups.map((group, groupIndex) => <details className="managed-task-member-group" key={group.id} open={groupIndex === 0}>
-            <summary><b>{group.name}</b><span>{group.tasks.length} task{group.tasks.length === 1 ? "" : "s"}</span></summary>
-            <div>{group.tasks.map((task) => <article className="managed-task" key={task.id}>
-              <div className="managed-task-title"><b>Task</b><p>{task.title}</p>{canEditTask(task) && <label>Edit title<input aria-label="Task title" maxLength="300" value={task.title} onChange={(event) => setSelected({ ...selected, tasks: selected.tasks.map((item) => item.id === task.id ? { ...item, title: event.target.value } : item) })} /></label>}</div>
-              <div className="managed-task-fields">{canEditTask(task) || task.assigneeId === me?.id
-                ? <select aria-label="Task status" disabled={busy} value={task.status} onChange={(event) => canEditTask(task)
-                  ? setSelected({ ...selected, tasks: selected.tasks.map((item) => item.id === task.id ? { ...item, status: event.target.value } : item) })
-                  : updateTaskStatus(task, event.target.value)}><option>Open</option><option>In Progress</option><option>Completed</option></select>
-                : <span className={"pill st " + task.status.replace(" ", "")}>{task.status}</span>}
-                {canEditTask(task) && <>
-                  <select aria-label="Task priority" value={task.priority || "Medium"} onChange={(event) => setSelected({ ...selected, tasks: selected.tasks.map((item) => item.id === task.id ? { ...item, priority: event.target.value } : item) })}><option>High</option><option>Medium</option><option>Low</option></select>
-                  {canManageContent && <select aria-label="Task assignee" value={task.assigneeId || ""} onChange={(event) => setSelected({ ...selected, tasks: selected.tasks.map((item) => item.id === task.id ? { ...item, assigneeId: event.target.value } : item) })}><option value="">Unassigned</option>{members.filter((member) => member.role !== "Client" && member.status === "active").map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select>}
-                  <input aria-label="Task deadline" type="datetime-local" value={localDateTime(task.dueDate)} onChange={(event) => setSelected({ ...selected, tasks: selected.tasks.map((item) => item.id === task.id ? { ...item, dueDate: event.target.value ? new Date(event.target.value).toISOString() : "" } : item) })} />
-                  {canManageContent && <button type="button" className="ic dl" onClick={() => setSelected({ ...selected, tasks: selected.tasks.filter((item) => item.id !== task.id) })}>Remove</button>}
-                </>}
+          {!taskGroups.length && <div className="mn-empty-list"><b>No action items yet</b><span>{canManageContent ? "Add the first one above." : "Tasks assigned in this meeting will appear here."}</span></div>}
+          {taskGroups.map((group) => <section className="mn-task-group" key={group.id}>
+            <h4><i style={{ "--av": avatarColor(group.id) }}>{group.id === "unassigned" ? "?" : initials(group.name)}</i>{group.name}<small>{group.tasks.filter((task) => task.status === "Completed").length}/{group.tasks.length} done</small></h4>
+            <div className="mn-tasks">{group.tasks.map((task) => <article className={"mn-task st-" + String(task.status || "Open").replace(" ", "") + (isOverdue(task) ? " overdue" : "")} key={task.id}>
+              <div className="mn-task-top">
+                {canEditTask(task) ? <input className="mn-task-title" aria-label="Task title" maxLength="300" value={task.title} onChange={(event) => setSelected({ ...selected, tasks: selected.tasks.map((item) => item.id === task.id ? { ...item, title: event.target.value } : item) })} /> : <p className="mn-task-title">{task.title}</p>}
+                <span className={"pill " + (task.priority || "Medium")}>{task.priority || "Medium"}</span>
               </div>
-              {task.description && <div className="managed-task-description"><b>Task description from meeting notes</b><p>{task.description}</p></div>}
-              {(canManageContent || (editAccess && task.assigneeId === me?.id)) && <div className="managed-comments">{(task.comments || []).map((comment) => <p key={comment.id}><b>{comment.by}</b> · {dateLabel(comment.createdAt.slice(0, 10))}<br />{comment.text}</p>)}
-                <div><input maxLength="2000" placeholder="Add a comment…" value={commentDrafts[task.id] || ""} onChange={(event) => setCommentDrafts({ ...commentDrafts, [task.id]: event.target.value })} /><button type="button" className="btn alt" disabled={busy} onClick={() => addComment(task)}>Comment</button></div>
+              <div className="mn-task-meta">
+                {canEditTask(task) || task.assigneeId === me?.id
+                  ? <select className={"mn-status st " + String(task.status || "Open").replace(" ", "")} aria-label="Task status" disabled={busy} value={task.status} onChange={(event) => canEditTask(task)
+                    ? setSelected({ ...selected, tasks: selected.tasks.map((item) => item.id === task.id ? { ...item, status: event.target.value } : item) })
+                    : updateTaskStatus(task, event.target.value)}><option>Open</option><option>In Progress</option><option>Completed</option></select>
+                  : <span className={"pill st " + String(task.status || "Open").replace(" ", "")}>{task.status}</span>}
+                <span className={"mn-due" + (isOverdue(task) ? " bad" : "")}>⏰ {isOverdue(task) ? "Overdue · " : ""}{dueLabel(task.dueDate)}</span>
+                {memberOf(task.assigneeId) && <span className="mn-assignee"><i style={{ "--av": avatarColor(task.assigneeId) }}>{initials(memberOf(task.assigneeId).name)}</i>{memberOf(task.assigneeId).name}</span>}
+              </div>
+              {canEditTask(task) && <details className="mn-task-edit"><summary>Edit details</summary><div>
+                <label>Priority<select value={task.priority || "Medium"} onChange={(event) => setSelected({ ...selected, tasks: selected.tasks.map((item) => item.id === task.id ? { ...item, priority: event.target.value } : item) })}><option>High</option><option>Medium</option><option>Low</option></select></label>
+                {canManageContent && <label>Assignee<select value={task.assigneeId || ""} onChange={(event) => setSelected({ ...selected, tasks: selected.tasks.map((item) => item.id === task.id ? { ...item, assigneeId: event.target.value } : item) })}><option value="">Unassigned</option>{members.filter((member) => member.role !== "Client" && member.status === "active").map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>}
+                <label>Deadline<input type="datetime-local" value={localDateTime(task.dueDate)} onChange={(event) => setSelected({ ...selected, tasks: selected.tasks.map((item) => item.id === task.id ? { ...item, dueDate: event.target.value ? new Date(event.target.value).toISOString() : "" } : item) })} /></label>
+                {canManageContent && <button type="button" className="ic dl" onClick={() => setSelected({ ...selected, tasks: selected.tasks.filter((item) => item.id !== task.id) })}>Remove task</button>}
+              </div></details>}
+              {task.description && <details className="mn-task-desc"><summary>Context from the meeting</summary><p>{task.description}</p></details>}
+              {(canManageContent || (editAccess && task.assigneeId === me?.id)) && <div className="mn-comments">
+                {(task.comments || []).map((comment) => <p key={comment.id}><b>{comment.by}</b><small>{dateLabel(comment.createdAt.slice(0, 10))}</small><br />{comment.text}</p>)}
+                <div><input maxLength="2000" placeholder="Write a comment…" value={commentDrafts[task.id] || ""} onChange={(event) => setCommentDrafts({ ...commentDrafts, [task.id]: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addComment(task); } }} /><button type="button" className="btn alt" disabled={busy || !(commentDrafts[task.id] || "").trim()} onClick={() => addComment(task)}>Comment</button></div>
               </div>}
             </article>)}</div>
-          </details>)}
-        </section>
-        {editAccess && <div className="acts end"><button className="btn" disabled={busy} onClick={save}>{busy ? "Saving…" : "Save changes"}</button></div>}
-      </div>}
+          </section>)}
+        </div>}
+
+        {tab === "transcript" && <div className="mn-pane">
+          {!!recordingUrls.length && <section className="mn-block"><h3>Recording clips <small>{recordingUrls.length}</small></h3><div className="mn-audio">{recordingUrls.map((url, index) => <label key={url}>Clip {index + 1}<audio controls preload="metadata" src={url}>Recording playback is unavailable in this browser.</audio></label>)}</div></section>}
+          <section className="mn-block"><h3>Transcript</h3><textarea disabled={!canManageContent} rows="14" maxLength="50000" value={selected.transcript || ""} onChange={(event) => setSelected({ ...selected, transcript: event.target.value })} placeholder="No transcript was saved with this note." /></section>
+        </div>}
+
+        {editAccess && <footer className="mn-save">
+          <span>{JSON.stringify(selected) !== baselineRef.current ? "You have unsaved changes" : "All changes saved"}</span>
+          <button className="btn" disabled={busy || JSON.stringify(selected) === baselineRef.current} onClick={save}>{busy ? "Saving…" : "Save changes"}</button>
+        </footer>}
+      </article>}
     </div>
   </section>;
 }

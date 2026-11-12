@@ -1505,3 +1505,54 @@ grant execute on function public.apply_workspace_changes(jsonb) to service_role;
 insert into storage.buckets (id, name, public)
 values ('uploads', 'uploads', false)
 on conflict (id) do nothing;
+
+-- ---------------------------------------------------------------------------------------------
+-- Live updates and team chat (added later; safe to re-run).
+-- project_pulse holds one version number per project that the app bumps after every change, so
+-- open browsers refresh automatically. chat_channels / chat_messages hold the team chat.
+-- ---------------------------------------------------------------------------------------------
+create table if not exists public.project_pulse (
+  project_id text primary key references public.projects(id) on delete cascade,
+  version bigint not null default 0
+);
+
+create table if not exists public.chat_channels (
+  id text primary key,
+  project_id text not null references public.projects(id) on delete cascade,
+  name text not null,
+  topic text not null default '',
+  kind text not null default 'channel',
+  is_private boolean not null default false,
+  member_ids text[] not null default '{}',
+  created_by text not null default '',
+  created_at bigint not null default 0,
+  last_message_at bigint not null default 0,
+  last_author_id text not null default ''
+);
+create index if not exists chat_channels_project_idx on public.chat_channels (project_id);
+
+create table if not exists public.chat_messages (
+  id text primary key,
+  channel_id text not null references public.chat_channels(id) on delete cascade,
+  project_id text not null references public.projects(id) on delete cascade,
+  author_id text not null,
+  body text not null default '',
+  reactions jsonb not null default '{}'::jsonb,
+  deleted boolean not null default false,
+  created_at bigint not null default 0,
+  edited_at bigint,
+  updated_at bigint not null default 0
+);
+create index if not exists chat_messages_channel_created_idx on public.chat_messages (channel_id, created_at desc);
+create index if not exists chat_messages_channel_updated_idx on public.chat_messages (channel_id, updated_at);
+
+do $$
+declare
+  table_name text;
+begin
+  foreach table_name in array array['project_pulse', 'chat_channels', 'chat_messages'] loop
+    execute format('alter table public.%I enable row level security', table_name);
+    execute format('revoke all on public.%I from anon, authenticated', table_name);
+    execute format('grant all on public.%I to service_role', table_name);
+  end loop;
+end $$;
