@@ -386,11 +386,20 @@ export default function Page() {
       setKey("");
       return setScreen("login");
     }
-    if (!r.ok && r.status === 403 && selectedProject) {
-      const fallback = await api("db", null, k);
-      if (fallback.ok) return applyDb(fallback);
-    }
     if (r.suspended) { setMsg(r.error); return setScreen("suspended"); }
+    if (!r.ok && r.status === 403) {
+      // The remembered project belongs to someone else (for example a shared computer, or a project
+      // this person was removed from): forget it and open their own project instead.
+      localStorage.removeItem("rw-project");
+      const fallback = selectedProject ? await api("db", null, k) : r;
+      if (fallback.ok) return applyDb(fallback);
+      if (fallback.suspended) { setMsg(fallback.error); return setScreen("suspended"); }
+      // This login has no project at all: show the sign-in / sign-up screen, never a dead-end popup.
+      localStorage.removeItem("rw-key");
+      setKey("");
+      setMsg("This account is not part of any project yet. Sign in with another account, ask your admin for an invitation, or create your own company workspace.");
+      return setScreen("login");
+    }
     if (!r.ok) { if (r.status === 401) setScreen("login"); else alert(r.error || "Unable to load project"); return; }
     applyDb(r);
     function applyDb(data) {
