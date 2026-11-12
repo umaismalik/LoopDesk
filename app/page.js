@@ -262,6 +262,7 @@ export default function Page() {
   const [signup, setSignup] = useState({ companyName: "", name: "", email: "", password: "", projectName: "", accept: false });
   const [signupBusy, setSignupBusy] = useState(false);
   const [signupSentTo, setSignupSentTo] = useState("");
+  const [showSignupPassword, setShowSignupPassword] = useState(false);
   const [projectOrganizationId, setProjectOrganizationId] = useState("");
   const [projectName, setProjectName] = useState("");
   const [tickets, setTickets] = useState([]);
@@ -410,6 +411,8 @@ export default function Page() {
   useEffect(() => {
     const sp = new URLSearchParams(location.search), t = sp.get("invite");
     if (sp.get("reset")) { setScreen("reset"); return; }
+    // A direct sign-up link to send to new companies: https://your-site/?start
+    if (sp.has("start") && !localStorage.getItem("rw-key")) { setScreen("signup"); return; }
     if (sp.get("signup")) {
       setScreen("verifying");
       api("signup", { action: "verify", token: sp.get("signup") }).then((r) => {
@@ -1267,26 +1270,93 @@ export default function Page() {
     if (!r.ok) { setMsg(r.error || "Sign-up failed"); return; }
     setSignupSentTo(r.email); setScreen("signupSent");
   };
+  // Password strength for the sign-up form: 0 (empty) to 4 (strong).
+  const passwordScore = (() => {
+    const p = signup.password || "";
+    if (!p) return 0;
+    let score = p.length >= 8 ? 1 : 0;
+    if (/[a-z]/i.test(p) && /\d/.test(p)) score += 1;
+    if (p.length >= 12) score += 1;
+    if (/[^a-z0-9]/i.test(p) && /[A-Z]/.test(p)) score += 1;
+    return Math.max(1, score);
+  })();
+  if (screen === "signup") return (
+    <div className="su">
+      <aside className="su-brand">
+        <div className="su-brand-top">
+          <span className="brand-mark"><img src="/loopdesk-mark.svg" alt="" /></span>
+          <div><b>LoopDesk</b><small>Team &amp; project management</small></div>
+        </div>
+        <div className="su-pitch">
+          <h1>Run every project, team and client in one place.</h1>
+          <p>Create your company workspace in a minute. Free to start, no card needed.</p>
+        </div>
+        <ul className="su-features">
+          {[["🎫", "Issues & features", "Track tickets with clients, deadlines and live updates"],
+            ["💬", "Team chat", "Channels and direct messages with read receipts"],
+            ["🎙️", "Meetings & notes", "Urdu / English recordings turned into English notes and tasks"],
+            ["🏢", "Departments & sub-companies", "Organize your company the way it really works"]].map(([icon, title, text], index) =>
+            <li key={title} style={{ animationDelay: `${120 + index * 70}ms` }}><span>{icon}</span><div><b>{title}</b><small>{text}</small></div></li>)}
+        </ul>
+        <p className="su-brand-foot">Your data stays private to your company.</p>
+      </aside>
+
+      <main className="su-main">
+        <form className="su-card" onSubmit={submitSignup} noValidate={false}>
+          <div className="su-mobile-brand"><span className="brand-mark"><img src="/loopdesk-mark.svg" alt="" /></span><b>LoopDesk</b></div>
+          <header className="su-head">
+            <h2>Create your company workspace</h2>
+            <p>You become the owner and admin. Invite your team and clients afterwards.</p>
+          </header>
+
+          <div className="su-grid">
+            <label className="su-field su-full">
+              <span className="su-label">Company name</span>
+              <input required maxLength={80} autoComplete="organization" placeholder="e.g. Acme Technologies" {...S("companyName")} />
+            </label>
+            <label className="su-field">
+              <span className="su-label">Your name</span>
+              <input required maxLength={80} autoComplete="name" placeholder="Full name" {...S("name")} />
+            </label>
+            <label className="su-field">
+              <span className="su-label">Work email</span>
+              <input required type="email" autoComplete="email" inputMode="email" placeholder="you@company.com" {...S("email")} />
+            </label>
+            <label className="su-field">
+              <span className="su-label">Password</span>
+              <span className="su-password">
+                <input required type={showSignupPassword ? "text" : "password"} minLength={8} autoComplete="new-password" placeholder="8+ characters" {...S("password")} />
+                <button type="button" onClick={() => setShowSignupPassword((v) => !v)} aria-label={showSignupPassword ? "Hide password" : "Show password"}>{showSignupPassword ? "Hide" : "Show"}</button>
+              </span>
+              <span className={"su-strength s" + passwordScore} aria-live="polite"><i /><i /><i /><i /><em>{["Use a letter and a number", "Weak", "Fair", "Good", "Strong"][passwordScore]}</em></span>
+            </label>
+            <label className="su-field">
+              <span className="su-label">First project <em>Optional</em></span>
+              <input maxLength={60} placeholder="My first project" {...S("projectName")} />
+            </label>
+          </div>
+
+          <label className="su-check">
+            <input type="checkbox" checked={signup.accept} onChange={(e) => setSignup({ ...signup, accept: e.target.checked })} />
+            <span>I have read and agree to the <b>Terms of Service</b> and <b>Privacy Policy</b>.</span>
+          </label>
+
+          {msg && <p className="su-error" role="alert">{msg}</p>}
+
+          <button className="btn su-submit" disabled={signupBusy || !signup.accept}>{signupBusy ? <><span className="su-spin" />Sending confirmation…</> : "Create workspace"}</button>
+
+          <p className="su-hint">Already use LoopDesk with this email (for example, invited by another company)? Enter that account's password and the new company is added to your existing login.</p>
+          <p className="su-switch">Already have an account? <button type="button" onClick={() => { setMsg(""); setScreen("login"); }}>Sign in</button></p>
+        </form>
+      </main>
+    </div>
+  );
   if (screen !== "app") return (
-    <div className="gate"><div className={"modal" + (screen === "signup" ? " gate-wide" : "")}>
+    <div className="gate"><div className="modal">
       <div className="brand dk"><span className="brand-mark"><img src="/loopdesk-mark.svg" alt="" /></span><div><b>LoopDesk</b><small>Team &amp; project management</small></div></div>
       {screen === "loading" && <p>Loading...</p>}
       {screen === "suspended" && <div className="signup-sent"><span className="signup-mail" aria-hidden="true">⏸</span><h2>Workspace paused</h2><p>{msg || "This company workspace is suspended."}</p><div className="acts end"><button type="button" className="btn alt" onClick={async () => { await api("logout", {}, key); localStorage.removeItem("rw-key"); location.reload(); }}>Sign out</button></div></div>}
       {screen === "verifying" && <div className="signup-wait"><span className="signup-spinner" /><p>Confirming your email and creating your workspace…</p></div>}
-      {screen === "signup" && (<form className="signup" onSubmit={submitSignup}>
-        <h2>Create your company workspace</h2>
-        <p className="note">Free to start. You become the owner and admin of your company; invite your team and clients afterwards.</p>
-        <div className="g">
-          <label className="full">Company name<input required maxLength={80} autoComplete="organization" placeholder="e.g. Acme Technologies" {...S("companyName")} /></label>
-          <label>Your name<input required maxLength={80} autoComplete="name" {...S("name")} /></label>
-          <label>Work email<input required type="email" autoComplete="email" {...S("email")} /></label>
-          <label>Password<input required type="password" minLength={8} autoComplete="new-password" placeholder="8+ characters, letter and number" {...S("password")} /></label>
-          <label>First project <small>(optional)</small><input maxLength={60} placeholder="My first project" {...S("projectName")} /></label>
-          <label className="full signup-terms"><input type="checkbox" checked={signup.accept} onChange={(e) => setSignup({ ...signup, accept: e.target.checked })} /> <span>I agree to the Terms of Service and Privacy Policy.</span></label>
-        </div>
-        <p className="note">Already use LoopDesk with this email (for example, invited by another company)? Enter that account's password and the new company is added to your existing login.</p>
-        <div className="acts end"><button type="button" className="ic" onClick={() => { setMsg(""); setScreen("login"); }}>I already have an account</button><button className="btn" disabled={signupBusy || !signup.accept}>{signupBusy ? "Sending…" : "Create workspace"}</button></div>
-      </form>)}
       {screen === "signupSent" && (<div className="signup-sent">
         <span className="signup-mail" aria-hidden="true">✉</span>
         <h2>Check your inbox</h2>
