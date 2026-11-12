@@ -1308,7 +1308,18 @@ export default function Page() {
         <div className="g"><label className="full">New password (8+ characters, letter and number)<input required type="password" minLength={8} autoComplete="new-password" {...L("password")} /></label></div>
         <div className="acts end"><button className="btn">Update password</button></div></form>)}
       {screen === "setup" && <p>No admin account exists yet. Set ADMIN_EMAIL and ADMIN_PASSWORD in the .env.local file, restart the server, then sign in.</p>}
-      {screen === "accept" && inv && (<form onSubmit={acceptInvite}><h2>Join {inv.projectName} as {inv.role}</h2><p>{inv.email}</p>
+      {screen === "accept" && inv && (<form onSubmit={acceptInvite}><div className="invite-card">
+          <span className="invite-from">Invitation from {inv.companyName || "your team"}</span>
+          <h2>Join {inv.unitName ? `${inv.companyName} · ${inv.unitName}` : inv.companyName || inv.projectName}</h2>
+          <dl>
+            {inv.companyName && <><dt>Company</dt><dd>{inv.companyName}</dd></>}
+            {inv.unitName && <><dt>{inv.unitKind === "subsidiary" ? "Sub-company" : "Department"}</dt><dd>{inv.unitName}</dd></>}
+            <dt>Project</dt><dd>{inv.projectName}</dd>
+            <dt>Your role</dt><dd>{inv.role}</dd>
+            {inv.invitedBy && <><dt>Invited by</dt><dd>{inv.invitedBy}</dd></>}
+            <dt>Email</dt><dd>{inv.email}</dd>
+          </dl>
+        </div>
         <div className="g">{inv.existing ? <label className="full">Enter your existing account password<input required type="password" autoComplete="current-password" value={invPassword} onChange={(e) => setInvPassword(e.target.value)} /></label> : <>
           <label className="full">Your name<input required {...L("name")} /></label>
           <label className="full">Create password (8+ characters, letter and number)<input required type="password" minLength={8} autoComplete="new-password" {...L("password")} /></label></>}

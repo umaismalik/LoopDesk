@@ -6,7 +6,7 @@ import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, loadPro
 import { check } from "../../../lib/reminders";
 import { liveRequest, bumpProjectVersion } from "../../../lib/live-api";
 import { signupRequest } from "../../../lib/signup-api";
-import { CHILD_KINDS, loadOrgMeta, saveOrgMeta, tenantSuspended } from "../../../lib/tenant-store";
+import { CHILD_KINDS, loadOrgMeta, organizationPath, saveOrgMeta, tenantSuspended } from "../../../lib/tenant-store";
 import { isPlatformAdmin, platformRequest } from "../../../lib/platform-api";
 import { attachmentError, attachmentKind, descriptionError } from "../../../lib/limits";
 
@@ -371,7 +371,30 @@ async function emailAssignedTasks(d, { tasks, previousTasks = [], title, project
     return { sent: result.sent, error: result.error, skipped: false };
   }));
 }
-const mail = (to, link, role, projectName) => send(to, "Project invitation: " + projectName, `<p>You have been invited as <b>${emailHtml(role)}</b> to the <b>${emailHtml(projectName)}</b> project on LoopDesk.</p><p><a href="${link}">Accept invitation</a></p>`);
+// Invitation email: says clearly which company (and department / sub-company) is inviting, to which
+// project, in which role, and who sent it.
+const ROLE_ABOUT = {
+  Admin: "manage the project, its team, tickets and settings",
+  Collaborator: "work on every ticket and manage meeting notes",
+  Developer: "work on the tickets assigned to you",
+  Client: "raise and follow your own tickets and requests",
+};
+const UNIT_LABEL = { department: "Department", subsidiary: "Sub-company" };
+const mail = (to, link, role, projectName, org = {}, inviter = null) => {
+  const company = org.companyName || "Your team";
+  const from = org.unitName ? `${company} · ${org.unitName}` : company;
+  const row = (label, value) => `<tr><td style="padding:7px 14px 7px 0;color:#64748b;font-size:13px;white-space:nowrap;vertical-align:top">${label}</td><td style="padding:7px 0;font-size:14px;color:#0f172a;font-weight:600">${value}</td></tr>`;
+  const subject = `${inviter?.name ? inviter.name + " from " : ""}${from} invited you to ${projectName} on LoopDesk`;
+  const html = `<p style="margin:0 0 6px;font-size:13px;color:#4f46e5;font-weight:700;letter-spacing:.04em;text-transform:uppercase">Invitation from ${emailHtml(company)}</p>
+<h2 style="margin:0 0 14px;font-size:20px;color:#0f172a">${emailHtml(from)} has invited you to join LoopDesk</h2>
+<p style="margin:0 0 16px">${inviter?.name ? `<b>${emailHtml(inviter.name)}</b>${inviter.email ? ` (${emailHtml(inviter.email)})` : ""} has` : "You have been"} invited you to collaborate with <b>${emailHtml(company)}</b>${org.unitName ? `'s <b>${emailHtml(org.unitName)}</b> ${UNIT_LABEL[org.unitKind]?.toLowerCase() || "team"}` : ""} on LoopDesk, their team and project management workspace.</p>
+<table role="presentation" style="border-collapse:collapse;margin:0 0 18px;padding:12px 16px;background:#f8f9fd;border:1px solid #e5e8f0;border-radius:10px;width:100%">
+${row("Company", emailHtml(company))}${org.unitName ? row(UNIT_LABEL[org.unitKind] || "Team", emailHtml(org.unitName)) : ""}${row("Project", emailHtml(projectName))}${row("Your role", `${emailHtml(role)}<div style="font-weight:400;font-size:12.5px;color:#64748b;margin-top:2px">You will be able to ${ROLE_ABOUT[role] || "work on this project"}.</div>`)}${inviter?.name ? row("Invited by", emailHtml(inviter.name)) : ""}
+</table>
+<p style="margin:0 0 18px"><a href="${link}" style="display:inline-block;padding:12px 22px;background:#4f46e5;color:#ffffff;border-radius:8px;text-decoration:none;font-weight:700">Accept invitation</a></p>
+<p style="margin:0;color:#64748b;font-size:12px">This invitation gives access to the ${emailHtml(projectName)} project of ${emailHtml(from)} only. If you were not expecting it, you can ignore this email.</p>`;
+  return send(to, subject, html);
+};
 async function resetLink(d, m, origin) {
   const token = uid();
   d.resets = d.resets.filter((x) => x.id !== m.id).concat({ id: m.id, token, at: Date.now() });
@@ -769,7 +792,9 @@ async function h(req, p, m) {
     if (m === "GET" && r === "invite") {
       const i = d.invites.find((x) => x.token === u.searchParams.get("t"));
       const inviteProject = i && d.projects.find((x) => x.id === i.projectId);
-      return i && inviteProject ? J({ email: i.email, role: i.role, projectId: inviteProject.id, projectName: inviteProject.name, existing: d.members.some((x) => x.email === i.email) }) : J({ error: "Invalid or expired invite" }, 404);
+      if (!i || !inviteProject) return J({ error: "Invalid or expired invite" }, 404);
+      const org = await organizationPath(d.organizations, inviteProject.organizationId);
+      return J({ email: i.email, role: i.role, projectId: inviteProject.id, projectName: inviteProject.name, ...org, invitedBy: i.invitedByName || "", existing: d.members.some((x) => x.email === i.email) });
     }
     if (m === "GET" && r === "file") {
       if (!me) return J({ error: account ? "You are not a member of this project" : "denied" }, account ? 403 : 401);
@@ -1822,9 +1847,9 @@ async function h(req, p, m) {
       if (existing && project.members.some((x) => x.memberId === existing.id)) return J({ error: "Already a member of " + project.name }, 400);
       if (d.invites.some((x) => x.projectId === project.id && x.email === b.email)) return J({ error: "An invitation is already pending for this project" }, 400);
       const token = uid(), link = browserSiteUrl(u.origin) + "/?invite=" + token;
-      d.invites.push({ token, email: b.email, role: b.role, projectId: project.id }); await save(d);
+      d.invites.push({ token, email: b.email, role: b.role, projectId: project.id, invitedByName: me.name, invitedByEmail: me.email }); await save(d);
       log(d, me.name, "Invited member", b.email + " to " + project.name + " as " + b.role); await save(d);
-      const result = await mail(b.email, link, b.role, project.name);
+      const result = await mail(b.email, link, b.role, project.name, await organizationPath(d.organizations, project.organizationId), { name: me.name, email: me.email });
       return J({ link, sent: result.sent, emailError: result.error });
     }
     if (r === "adminreset") {
