@@ -1443,7 +1443,7 @@ export default function Page() {
         <button className={"nav ghost " + (view === "account" ? "on" : "")} onClick={() => { setAmsg(""); setView("account"); }}>My account</button>
         <button className="nav ghost" onClick={async () => { await api("logout", {}, key); localStorage.removeItem("rw-key"); location.reload(); }}>Sign out</button>
       </aside>
-      <main className="main">
+      <main className={"main" + (view === "chat" ? " chat-mode" : "")}>
         <div className="mobile-bar">
           <button type="button" className="menu-btn" aria-label="Open menu" aria-expanded={navOpen} onClick={() => setNavOpen(true)}>
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
@@ -1451,7 +1451,7 @@ export default function Page() {
           <span className="brand-mark"><img src="/loopdesk-mark.svg" alt="" /></span><b>LoopDesk</b>
           <span className="mobile-view">{activeProject?.name}</span>
         </div>
-        <header className="top">
+        {view !== "chat" && <header className="top">
           <div><h1>{{ all: "Support Dashboard", issue: "Issues Log", feature: "Features Log", team: "Team & Roles", meetings: "Meeting Calendar", "meeting-notes": "Meeting Notes & Tasks", activity: "Activity Log", files: "Attachments", account: "My Account", portal: "My Tickets", chat: "Team Chat", platform: "Platform Admin" }[view]}</h1><p><b>{activeOrganization?.name}</b> · <b>{activeProject?.name}</b> · Signed in as <b>{me.name}</b> <span className={"pill r" + me.role}>{me.role}</span></p></div>
           <div className="top-actions">
             {["issue", "feature", "portal"].includes(view) && <div className="acts">
@@ -1461,7 +1461,7 @@ export default function Page() {
             <span className="live-dot" title="Live: changes from your team appear automatically">Live</span>
             {!client && <NotificationBell requests={meetingEditRequests.filter((item) => item.projectId === projectId)} isAdmin={!!admin} meId={me.id} notice={dashboardNotice} onReview={reviewMeetingEditRequest} />}
           </div>
-        </header>
+        </header>}
 
         {view === "meetings" ? (<section className="meeting-page">
           {!meetingSelected && <>
