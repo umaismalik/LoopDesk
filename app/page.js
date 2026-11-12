@@ -419,7 +419,7 @@ export default function Page() {
   // Every 5 seconds (while the tab is visible) ask the server for the project's change version. When
   // someone changes anything, quietly reload what is on screen; nobody has to press refresh.
   const liveRef = useRef({});
-  liveRef.current = { key, projectId, view, ticketOffset, fileOffset, auditOffset, meetingOffset, meetingMonth, meetingSelected, role: me?.role };
+  liveRef.current = { key, projectId, view, ticketOffset, fileOffset, auditOffset, meetingOffset, meetingMonth, meetingSelected, role: me?.role, meId: me?.id, members };
   const silentRefresh = useCallback(async () => {
     const c = liveRef.current;
     if (!c.key || !c.projectId) return;
@@ -450,7 +450,10 @@ export default function Page() {
         busy = false;
         if (stopped) return;
         if (r.ok) {
-          if (r.channels) setPulseChannels((previous) => JSON.stringify(previous) === JSON.stringify(r.channels) ? previous : r.channels);
+          if (r.channels) {
+            notifyNewMessages(r.channels);
+            setPulseChannels((previous) => JSON.stringify(previous) === JSON.stringify(r.channels) ? previous : r.channels);
+          }
           if (last && r.v !== last) { setLiveVersion(r.v); silentRefresh(); }
           last = r.v;
         }
@@ -462,6 +465,27 @@ export default function Page() {
     document.addEventListener("visibilitychange", onVisible);
     return () => { stopped = true; clearTimeout(timer); document.removeEventListener("visibilitychange", onVisible); };
   }, [screen, key, projectId, silentRefresh]);
+  // Desktop notification for a chat message from someone else while the chat is not on screen
+  // (only after the person turned notifications on in Team Chat).
+  const chatSeenRef = useRef({});
+  const notifyNewMessages = (channels) => {
+    const c = liveRef.current, seen = chatSeenRef.current, first = !seen.__init;
+    seen.__init = true;
+    channels.forEach((channel) => {
+      const before = seen[channel.id];
+      seen[channel.id] = channel.lastMessageAt;
+      if (first || before === undefined || channel.lastMessageAt <= before || channel.lastAuthorId === c.meId) return;
+      if (!document.hidden && c.view === "chat") return;
+      let enabled = false;
+      try { enabled = typeof Notification !== "undefined" && Notification.permission === "granted" && localStorage.getItem("rw-chat-notify") !== "off"; } catch {}
+      if (!enabled) return;
+      const author = c.members.find((m) => m.id === channel.lastAuthorId)?.name || "A teammate";
+      try {
+        const note = new Notification(channel.kind === "dm" ? `${author} sent you a message` : `New message in #${channel.name}`, { body: channel.kind === "dm" ? "Open Team Chat to reply." : `${author} posted in #${channel.name}`, icon: "/loopdesk-mark.svg", tag: "chat-" + channel.id });
+        note.onclick = () => { window.focus(); setView("chat"); note.close(); };
+      } catch {}
+    });
+  };
   // Chat "last read" times live in this browser, per project and person.
   const chatReadKey = me && projectId ? `rw-chat-read:${projectId}:${me.id}` : "";
   useEffect(() => {
@@ -627,9 +651,16 @@ export default function Page() {
   const activeOrganization = organizations.find((organization) => organization.id === activeProject?.organizationId);
   const canDel = () => manager;
   // Dashboard lists cover the whole project; a ticket outside the loaded page opens via its log search.
-  const openTicket = (id) => {
-    if (tickets.some((t) => t.id === id)) { setDetail(id); return; }
-    setView(id.startsWith("FTR-") ? "feature" : "issue"); setQ(id);
+  // Opens a ticket from anywhere (dashboard, chat links like "ISS-01", "iss-1" or "FTR 3"): goes to the
+  // Issues or Features page with filters cleared and opens that ticket's details.
+  const openTicket = (raw) => {
+    const match = String(raw || "").trim().toUpperCase().match(/^(ISS|FTR)[- ]?0*(\d+)$/);
+    if (!match) return;
+    const type = match[1] === "FTR" ? "feature" : "issue", number = Number(match[2]);
+    const found = tickets.find((t) => t.type === type && ticketNumber(t) === number);
+    setView(type); setFs(""); setFp(""); setFa(""); setFm(""); setNavOpen(false);
+    if (found) { setQ(""); setDetail(found.id); }
+    else setQ(`${match[1]}-${String(number).padStart(2, "0")}`);
   };
   const base = useMemo(() => tickets.filter((t) => view === "all" || t.type === view), [tickets, view]);
   const months = useMemo(() => [...new Set(base.map((t) => (t.date || "").slice(0, 7)).filter(Boolean))].sort(), [base]);

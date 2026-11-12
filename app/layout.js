@@ -1,5 +1,6 @@
 import "./globals.css";
 import "./workspace.css";
+import "./chat-bubbles.css";
 
 export const metadata = {
   applicationName: "LoopDesk",
