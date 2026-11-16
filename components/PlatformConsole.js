@@ -9,9 +9,23 @@ const PLAN_LABEL = { trial: "Trial", starter: "Starter", business: "Business", e
 const initials = (name) => String(name || "?").split(/\s+/).map((p) => p[0]).join("").slice(0, 2).toUpperCase();
 const dateLabel = (ms) => ms ? new Date(ms).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }) : "—";
 
+// The last list this browser loaded is shown at once while the fresh one loads. It belongs to the
+// session that loaded it and is removed at sign-out (see clearSession in app/page.js).
+export const PLATFORM_CACHE = "rw-platform-cache";
+const readCache = (keyValue) => {
+  try {
+    const cached = JSON.parse(localStorage.getItem(PLATFORM_CACHE) || "null");
+    return cached?.sessionKey === keyValue && Array.isArray(cached.data?.tenants) ? cached.data : null;
+  } catch { return null; }
+};
+const writeCache = (keyValue, data) => {
+  try { localStorage.setItem(PLATFORM_CACHE, JSON.stringify({ sessionKey: keyValue, data })); } catch {}
+};
+
 export default function PlatformConsole({ keyValue }) {
-  const [data, setData] = useState({ tenants: [], plans: [], signupsOpen: true });
-  const [loading, setLoading] = useState(true);
+  const [cached] = useState(() => readCache(keyValue));
+  const [data, setData] = useState(cached || { tenants: [], plans: [], signupsOpen: true });
+  const [loading, setLoading] = useState(!cached);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [query, setQuery] = useState("");
@@ -31,14 +45,16 @@ export default function PlatformConsole({ keyValue }) {
       return { ok: false, error: "Unable to reach the server" };
     }
   }, [keyValue]);
-  const refresh = useCallback(async () => {
-    setLoading(true);
+  const refresh = useCallback(async ({ quiet = false } = {}) => {
+    if (!quiet) setLoading(true);
     const result = await call();
     setLoading(false);
     if (!result.ok) { setError(result.error || "Could not load companies"); return; }
-    setError(""); setData(result);
-  }, [call]);
-  useEffect(() => { refresh(); }, [refresh]);
+    const { ok, ...fresh } = result;
+    setError(""); setData(fresh); writeCache(keyValue, fresh);
+  }, [call, keyValue]);
+  // With a saved list on screen, the refresh happens without a loading state.
+  useEffect(() => { refresh({ quiet: !!cached }); }, [refresh]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const change = async (tenant, body, message) => {
     if (body.status === "suspended" && !confirm(`Suspend ${tenant.name}? Its members will not be able to use LoopDesk until you reactivate it. No data is deleted.`)) return;
@@ -46,7 +62,11 @@ export default function PlatformConsole({ keyValue }) {
     const result = await call({ organizationId: tenant.id, ...body });
     setBusyId("");
     if (!result.ok) { setError(result.error || "Could not save"); return; }
-    setData((d) => ({ ...d, tenants: d.tenants.map((t) => t.id === tenant.id ? { ...t, ...("status" in body ? { status: body.status } : {}), ...("plan" in body ? { plan: body.plan } : {}) } : t) }));
+    setData((d) => {
+      const next = { ...d, tenants: d.tenants.map((t) => t.id === tenant.id ? { ...t, ...("status" in body ? { status: body.status } : {}), ...("plan" in body ? { plan: body.plan } : {}) } : t) };
+      writeCache(keyValue, next);
+      return next;
+    });
     setNotice(message);
   };
 

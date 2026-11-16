@@ -51,6 +51,7 @@ const clearSession = () => {
   try {
     localStorage.removeItem("rw-key");
     localStorage.removeItem(WORKSPACE_CACHE);
+    localStorage.removeItem("rw-platform-cache");
     Object.keys(localStorage).filter((name) => name.startsWith("rw-chat-cache:")).forEach((name) => localStorage.removeItem(name));
   } catch {}
 };
@@ -75,11 +76,12 @@ const writeWorkspaceCache = (sessionKey, data) => {
 };
 // Screens that load on demand, fetched in the background once the app is idle so that opening them
 // later is instant instead of showing a loading placeholder.
-const preloadScreens = () => {
+const preloadScreens = (platformAdmin) => {
   const run = () => {
     import("../components/TeamChat");
     import("../components/MeetingNotes");
     import("../components/ActivityLog");
+    if (platformAdmin) import("../components/PlatformConsole");
   };
   if (typeof requestIdleCallback === "function") requestIdleCallback(run, { timeout: 4000 });
   else setTimeout(run, 1500);
@@ -461,7 +463,7 @@ export default function Page() {
     }
     applyDb(r);
     function applyDb(data, { fromCache = false } = {}) {
-      if (!fromCache) { writeWorkspaceCache(k, data); preloadScreens(); }
+      if (!fromCache) { writeWorkspaceCache(k, data); preloadScreens(!!data.isPlatformAdmin); }
       applyWorkspace(data);
       setView((v) => data.me.role === "Client" && v !== "account" ? "portal" : v); setAcct({ name: data.me.name, phone: data.me.phone || "", current: "", password: "", confirm: "" }); setAudit(data.audit || []); setAuditOffset(0); setAuditTotal(data.audit.length); setAuditHasMore(false); setFiles(data.files || []); setFileOffset(0); setFileTotal(data.files.length); setFileHasMore(false); setScreen("app");
     }
