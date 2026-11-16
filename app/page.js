@@ -50,8 +50,39 @@ const MEMBER_CARD_COLORS = ["#2563eb", "#0f9f8f", "#d97706", "#7c3aed", "#db2777
 const clearSession = () => {
   try {
     localStorage.removeItem("rw-key");
+    localStorage.removeItem(WORKSPACE_CACHE);
     Object.keys(localStorage).filter((name) => name.startsWith("rw-chat-cache:")).forEach((name) => localStorage.removeItem(name));
   } catch {}
+};
+// Instant start: the last workspace this browser loaded is shown at once on the next visit, then
+// replaced by the fresh copy from the server a moment later. It belongs to the session that loaded
+// it (a different sign-in on this computer never sees it) and is removed at sign-out.
+const WORKSPACE_CACHE = "rw-workspace-cache";
+const readWorkspaceCache = (sessionKey, projectId) => {
+  try {
+    const cached = JSON.parse(localStorage.getItem(WORKSPACE_CACHE) || "null");
+    if (!cached || cached.sessionKey !== sessionKey || !cached.data?.me) return null;
+    if (projectId && cached.data.projectId !== projectId) return null;
+    return cached.data;
+  } catch { return null; }
+};
+const writeWorkspaceCache = (sessionKey, data) => {
+  try {
+    // The activity log is large and has its own screen, so it is not kept.
+    const { ok, status, audit, ...rest } = data;
+    localStorage.setItem(WORKSPACE_CACHE, JSON.stringify({ sessionKey, data: { ...rest, audit: [] } }));
+  } catch {}
+};
+// Screens that load on demand, fetched in the background once the app is idle so that opening them
+// later is instant instead of showing a loading placeholder.
+const preloadScreens = () => {
+  const run = () => {
+    import("../components/TeamChat");
+    import("../components/MeetingNotes");
+    import("../components/ActivityLog");
+  };
+  if (typeof requestIdleCallback === "function") requestIdleCallback(run, { timeout: 4000 });
+  else setTimeout(run, 1500);
 };
 const mergeVoiceCards = (existing, incoming) => {
   const cards = new Map(existing.map((card) => [card.memberId, card]));
@@ -397,8 +428,10 @@ export default function Page() {
     const selectedProject = requestedProject || localStorage.getItem("rw-project") || "";
     localStorage.setItem("rw-ticket-offset", "0");
     setMeetingOffset(0);
+    const cached = k ? readWorkspaceCache(k, requestedProject) : null;
+    if (cached) applyDb(cached, { fromCache: true });
     const r = await api("db", null, k, selectedProject);
-    if (r.loginRequired) return setScreen("login");
+    if (r.loginRequired) { clearSession(); return setScreen("login"); }
     if (r.setup) return setScreen("setup");
     if (r.status === 401) {
       clearSession();
@@ -419,9 +452,16 @@ export default function Page() {
       setMsg("This account is not part of any project yet. Sign in with another account, ask your admin for an invitation, or create your own company workspace.");
       return setScreen("login");
     }
-    if (!r.ok) { if (r.status === 401) setScreen("login"); else alert(r.error || "Unable to load project"); return; }
+    if (!r.ok) {
+      if (r.status === 401) setScreen("login");
+      // With the saved copy on screen, a brief network problem is not worth a popup: the live pulse
+      // refreshes the workspace as soon as the server answers again.
+      else if (!cached) alert(r.error || "Unable to load project");
+      return;
+    }
     applyDb(r);
-    function applyDb(data) {
+    function applyDb(data, { fromCache = false } = {}) {
+      if (!fromCache) { writeWorkspaceCache(k, data); preloadScreens(); }
       applyWorkspace(data);
       setView((v) => data.me.role === "Client" && v !== "account" ? "portal" : v); setAcct({ name: data.me.name, phone: data.me.phone || "", current: "", password: "", confirm: "" }); setAudit(data.audit || []); setAuditOffset(0); setAuditTotal(data.audit.length); setAuditHasMore(false); setFiles(data.files || []); setFileOffset(0); setFileTotal(data.files.length); setFileHasMore(false); setScreen("app");
     }
@@ -473,6 +513,7 @@ export default function Page() {
     if (!c.key || !c.projectId) return;
     const r = await api(`db?ticketOffset=${c.ticketOffset || 0}`, null, c.key, c.projectId);
     if (!r.ok || !r.me || r.projectId !== c.projectId || liveRef.current.projectId !== c.projectId) return;
+    writeWorkspaceCache(c.key, r);
     applyWorkspace(r);
     if (c.view === "files") {
       const f = await api(`files?offset=${c.fileOffset}&limit=100`, null, c.key, c.projectId);
