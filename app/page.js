@@ -310,6 +310,7 @@ export default function Page() {
   // Self sign-up: a new company creates its own workspace (confirmed by email).
   const [signup, setSignup] = useState({ companyName: "", name: "", email: "", password: "", projectName: "", accept: false });
   const [signupBusy, setSignupBusy] = useState(false);
+  const [signInBusy, setSignInBusy] = useState(false);
   const [signupSentTo, setSignupSentTo] = useState("");
   const [showSignupPassword, setShowSignupPassword] = useState(false);
   const [projectOrganizationId, setProjectOrganizationId] = useState("");
@@ -430,10 +431,13 @@ export default function Page() {
     const selectedProject = requestedProject || localStorage.getItem("rw-project") || "";
     localStorage.setItem("rw-ticket-offset", "0");
     setMeetingOffset(0);
+    // Nobody is signed in on this browser: show the sign-in form at once. The server check below
+    // still runs and switches to first-time setup when the workspace has no accounts yet.
+    if (!k) setScreen((current) => current === "loading" ? "login" : current);
     const cached = k ? readWorkspaceCache(k, requestedProject) : null;
     if (cached) applyDb(cached, { fromCache: true });
     const r = await api("db", null, k, selectedProject);
-    if (r.loginRequired) { clearSession(); return setScreen("login"); }
+    if (r.loginRequired) { if (k) clearSession(); return setScreen((current) => ["loading", "app"].includes(current) ? "login" : current); }
     if (r.setup) return setScreen("setup");
     if (r.status === 401) {
       clearSession();
@@ -637,10 +641,14 @@ export default function Page() {
   }, [view, key, projectId, meetingMonth]);
 
   const join = async (path, body) => {
-    setMsg("");
-    const r = await api(path, body);
-    if (!r.key) return setMsg(r.error || "Failed");
-    localStorage.setItem("rw-key", r.key); setKey(r.key); history.replaceState(null, "", "/"); load(r.key, r.projectId);
+    if (signInBusy) return;
+    setMsg(""); setSignInBusy(true);
+    try {
+      const r = await api(path, body);
+      if (!r.key) return setMsg(r.error || "Failed");
+      localStorage.setItem("rw-key", r.key); setKey(r.key); history.replaceState(null, "", "/");
+      await load(r.key, r.projectId);
+    } finally { setSignInBusy(false); }
   };
   const acceptInvite = async (e) => {
     e.preventDefault();
@@ -1416,7 +1424,7 @@ export default function Page() {
       {screen === "login" && (<form onSubmit={(e) => { e.preventDefault(); join("login", { id: lf.id, password: lf.password }); }}><h2>Sign in</h2>
         <div className="g"><label className="full">Email or phone number<input required autoComplete="username" {...L("id")} /></label>
           <label className="full">Password<input required type="password" autoComplete="current-password" {...L("password")} /></label></div>
-        <div className="acts end"><button type="button" className="ic" onClick={() => { setMsg(""); setScreen("forgot"); }}>Forgot password?</button><button className="btn">Sign in</button></div>
+        <div className="acts end"><button type="button" className="ic" onClick={() => { setMsg(""); setScreen("forgot"); }}>Forgot password?</button><button className="btn" disabled={signInBusy} aria-busy={signInBusy}>{signInBusy ? <><span className="su-spin" />Signing in…</> : "Sign in"}</button></div>
         <div className="signup-cta"><span>New to LoopDesk?</span><button type="button" className="ic" onClick={() => { setMsg(""); setScreen("signup"); }}>Create your company workspace →</button></div></form>)}
       {screen === "forgot" && (<form onSubmit={async (e) => { e.preventDefault(); await api("forgot", { id: lf.id }); setMsg("If an account exists for that email or phone, a reset link has been sent."); }}><h2>Forgot password</h2>
         <div className="g"><label className="full">Email or phone number<input required {...L("id")} /></label></div>

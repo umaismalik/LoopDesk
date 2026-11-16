@@ -11,6 +11,7 @@ import { CHILD_KINDS, loadOrgMeta, organizationPath, saveOrgMeta, tenantSuspende
 import { isPlatformAdmin, platformRequest } from "../../../lib/platform-api";
 import { attachmentError, attachmentKind, descriptionError } from "../../../lib/limits";
 import { publicErrorMessage } from "../../../lib/http-error";
+import { verifyPassword } from "../../../lib/passwords";
 
 export const dynamic = "force-dynamic";
 // Meeting transcription and AI notes can take up to a minute for long recordings.
@@ -174,12 +175,6 @@ async function migrate(d) {
 }
 const np = (v) => String(v || "").replace(/[^\d+]/g, "");
 const hash = (p) => { const s = crypto.randomBytes(16).toString("hex"); return s + ":" + crypto.scryptSync(p, s, 64).toString("hex"); };
-// A missing or malformed stored hash is a failed sign-in, never a server error.
-const verify = (p, h) => {
-  const [s, x] = String(h || "").split(":");
-  if (!s || !/^[0-9a-f]{128}$/i.test(x || "")) return false;
-  return crypto.timingSafeEqual(crypto.scryptSync(p, s, 64), Buffer.from(x, "hex"));
-};
 const fails = new Map();
 const SESSION = 30 * 864e5, CONFIGURED_SITE = process.env.APP_URL || "";
 // Next ticket id of a type ("ISS-07", "FTR-12") after the highest number already in `ids`.
@@ -459,7 +454,7 @@ async function h(req, p, m) {
     const phone = id.includes("@") ? "" : np(id);
     const d = await loadLoginDb(id.includes("@") ? id : "", phone, () => ({ tickets: SEED, members: [], invites: [], meetings: [] }));
     const member = d.members.find((item) => item.email === id || (phone && np(item.phone) === phone));
-    if (!member || !verify(String(body.password || ""), member.pw)) {
+    if (!member || !(await verifyPassword(String(body.password || ""), member.pw))) {
       // Keep the lockout table bounded so a flood of made-up identifiers cannot exhaust memory.
       if (fails.size > 5000) for (const [entry, value] of fails) if (Date.now() - value.t > 300000) fails.delete(entry);
       fails.set(id, { n: failure.n + 1, t: Date.now() });
@@ -1020,7 +1015,7 @@ async function h(req, p, m) {
       let member = d.members.find((x) => x.email === i.email);
       if (member) {
         if (member.status === "disabled") return J({ error: "This account is disabled. Contact an administrator." }, 403);
-        if (!verify(String(b.password || ""), member.pw)) return J({ error: "Incorrect account password" }, 403);
+        if (!(await verifyPassword(String(b.password || ""), member.pw))) return J({ error: "Incorrect account password" }, 403);
       } else {
         const e = chk(b); if (e) return J({ error: e }, 400);
         member = { id: uid().slice(0, 8), name: String(b.name).trim(), email: i.email.toLowerCase(), phone: np(b.phone), pw: hash(b.password), role: i.role, sessions: [] };
@@ -1053,7 +1048,7 @@ async function h(req, p, m) {
       const b = await req.json(), id = String(b.id || "").trim().toLowerCase(), f = fails.get(id) || { n: 0, t: 0 };
       if (f.n >= 5 && Date.now() - f.t < 300000) return J({ error: "Too many attempts. Try again in 5 minutes." }, 429);
       const m = d.members.find((x) => x.email === id || (!id.includes("@") && np(x.phone) && np(x.phone) === np(id)));
-      if (!m || !verify(String(b.password || ""), m.pw)) { fails.set(id, { n: f.n + 1, t: Date.now() }); log(d, id, "Failed sign-in"); await save(d); return J({ error: "Invalid email/phone or password" }, 401); }
+      if (!m || !(await verifyPassword(String(b.password || ""), m.pw))) { fails.set(id, { n: f.n + 1, t: Date.now() }); log(d, id, "Failed sign-in"); await save(d); return J({ error: "Invalid email/phone or password" }, 401); }
       if (m.status === "disabled") return J({ error: "This account is disabled. Please contact an admin." }, 403);
       fails.delete(id); log(d, m.name, "Signed in");
       const k = uid() + "." + Date.now(); m.sessions = [...(m.sessions || []), k].slice(-5); await save(d);
@@ -1611,7 +1606,7 @@ async function h(req, p, m) {
     if (r === "logout") { account.sessions = (account.sessions || []).filter((x) => x !== key); await save(d); return J({ ok: true }); }
     if (r === "account") {
       const b = await req.json();
-      if (b.password && me.pw && !verify(String(b.current || ""), me.pw)) return J({ error: "Current password is incorrect" }, 403);
+      if (b.password && me.pw && !(await verifyPassword(String(b.current || ""), me.pw))) return J({ error: "Current password is incorrect" }, 403);
       if (b.phone) {
         if (d.members.some((x) => x !== account && np(x.phone) === np(b.phone))) return J({ error: "Phone number already in use" }, 400);
         account.phone = np(b.phone);
