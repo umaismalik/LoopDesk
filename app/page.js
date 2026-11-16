@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import dynamic from "next/dynamic";
 import { correctTurnNames, generateEnglishKeyPoints, generateMeetingParticipantCards } from "../lib/local-transcription";
+import { formatAiNotes } from "../lib/cloud-transcription";
 import MeetingNotes from "../components/MeetingNotes";
 import ActivityLog from "../components/ActivityLog";
 import TeamChat from "../components/TeamChat";
@@ -42,11 +43,23 @@ const meetingVoiceAttendees = (members, me) => {
   return activeTeam;
 };
 const MEMBER_CARD_COLORS = ["#2563eb", "#0f9f8f", "#d97706", "#7c3aed", "#db2777", "#0891b2", "#4f46e5", "#65a30d"];
+// Signing out forgets the login and this member's saved chat copies on this browser.
+const clearSession = () => {
+  try {
+    localStorage.removeItem("rw-key");
+    Object.keys(localStorage).filter((name) => name.startsWith("rw-chat-cache:")).forEach((name) => localStorage.removeItem(name));
+  } catch {}
+};
 const mergeVoiceCards = (existing, incoming) => {
   const cards = new Map(existing.map((card) => [card.memberId, card]));
   incoming.forEach((card) => {
     const previous = cards.get(card.memberId);
-    cards.set(card.memberId, { ...previous, ...card, priority: previous?.priority || card.priority || "Medium" });
+    cards.set(card.memberId, {
+      ...previous, ...card,
+      points: [...new Set([...(previous?.points || []), ...(card.points || [])])].slice(0, 10),
+      tasks: [...new Set([...(previous?.tasks || []), ...(card.tasks || [])])].slice(0, 10),
+      priority: card.priority || previous?.priority || "Medium",
+    });
   });
   return [...cards.values()];
 };
@@ -361,6 +374,8 @@ export default function Page() {
   }, []);
   const recordingClipsRef = useRef([]);
   const recordingNotesStartRef = useRef(null);
+  // Shared notes written by the AI for this recording session (empty when the on-device model was used).
+  const aiNotesRef = useRef("");
   useEffect(() => { recordingClipsRef.current = recordingClips; }, [recordingClips]);
   useEffect(() => () => recordingClipsRef.current.forEach((clip) => URL.revokeObjectURL(clip.url)), []);
   useEffect(() => () => {
@@ -383,7 +398,7 @@ export default function Page() {
     if (r.loginRequired) return setScreen("login");
     if (r.setup) return setScreen("setup");
     if (r.status === 401) {
-      localStorage.removeItem("rw-key");
+      clearSession();
       setKey("");
       return setScreen("login");
     }
@@ -396,7 +411,7 @@ export default function Page() {
       if (fallback.ok) return applyDb(fallback);
       if (fallback.suspended) { setMsg(fallback.error); return setScreen("suspended"); }
       // This login has no project at all: show the sign-in / sign-up screen, never a dead-end popup.
-      localStorage.removeItem("rw-key");
+      clearSession();
       setKey("");
       setMsg("This account is not part of any project yet. Sign in with another account, ask your admin for an invitation, or create your own company workspace.");
       return setScreen("login");
@@ -947,6 +962,7 @@ export default function Page() {
       setRecordingCards([]);
       setRecordingSaved(false);
       setRecordingNoteId("");
+      aiNotesRef.current = "";
     }
     if (!window.isSecureContext) {
       setMeetingVoiceError("Microphone recording requires a secure connection (HTTPS). Open the portal using HTTPS, or use localhost for local development.");
@@ -987,7 +1003,7 @@ export default function Page() {
         setRecordingClips((clips) => [...clips, clip]);
         setHasRecordedVoiceNote(true);
         setFailedRecording(null);
-        setRecordingState("transcribing"); setTranscriptionProgress("Preparing on-device transcription…"); setMeetingVoiceError("");
+        setRecordingState("transcribing"); setTranscriptionProgress("Preparing transcription…"); setMeetingVoiceError("");
         setPendingRecording(audio);
       };
       if (recordingSaved || !recordingClips.length) recordingNotesStartRef.current = meetingDraft;
@@ -1026,14 +1042,17 @@ export default function Page() {
   };
   // Team members with their extra name spellings, for the speech model and card routing.
   const voiceAttendees = useMemo(() => meetingVoiceAttendees(members, me).map((member) => ({ ...member, aliases: nameAliases[member.id] || [] })), [members, me, nameAliases]);
-  const onTranscriptionComplete = useCallback((text) => {
+  const onTranscriptionComplete = useCallback((text, ai) => {
     const attendees = voiceAttendees;
-    const correctedText = correctTurnNames(text, attendees);
+    // The AI already spells names from the roster; the on-device text gets the phonetic name fix.
+    const correctedText = ai ? text : correctTurnNames(text, attendees);
     setMeetingVoiceError("");
     setRecordingTranscript((transcript) => transcript ? `${transcript}\n\n${correctedText}` : correctedText);
-    const keyPoints = generateEnglishKeyPoints(correctedText);
+    const aiNotes = ai ? formatAiNotes(ai.notes) : "";
+    if (aiNotes) aiNotesRef.current = aiNotesRef.current ? `${aiNotesRef.current}\n\n${aiNotes}` : aiNotes;
+    const keyPoints = aiNotes || generateEnglishKeyPoints(correctedText);
     if (keyPoints) setMeetingDraft((notes) => notes.trim() ? `${notes.trimEnd()}\n\n${keyPoints}` : keyPoints);
-    const cards = generateMeetingParticipantCards(correctedText, attendees, selectedMeetingMemberId);
+    const cards = ai ? ai.cards : generateMeetingParticipantCards(correctedText, attendees, selectedMeetingMemberId);
     if (cards.length) {
       setParticipantSummaries((previous) => mergeVoiceCards(previous, cards));
       setSelectedMeetingMemberId(cards[0].memberId);
@@ -1047,7 +1066,7 @@ export default function Page() {
           ...card,
           points: [...new Set([...earlier.points, ...card.points])].slice(0, 20),
           tasks: [...new Set([...earlier.tasks, ...card.tasks])].slice(0, 30),
-          priority: earlier.priority || "Medium",
+          priority: card.priority || earlier.priority || "Medium",
         });
       });
       return [...merged.values()];
@@ -1057,7 +1076,7 @@ export default function Page() {
       setMeetingVoiceError("");
       setMeetingNotice("Transcript added to shared meeting notes. To fill a member's card automatically, address them by name (for example \"Ali, tell me about your tasks\") or select their card before recording.");
     } else {
-      setMeetingNotice(`English notes ready. Filled ${cards.length === 1 ? "the card" : "cards"} for ${cards.map((card) => card.name).join(", ")} from the names heard in the recording — review them before sharing.`);
+      setMeetingNotice(`English notes ready. Filled ${cards.length === 1 ? "the card" : "cards"} for ${cards.map((card) => card.name).join(", ")}${ai ? "" : " from the names heard in the recording"}. Review them, then save: each filled card is emailed to its member.`);
     }
     setRecordingState("idle");
     setTranscriptionProgress("");
@@ -1075,7 +1094,7 @@ export default function Page() {
     if (!failedRecording) return;
     setMeetingVoiceError("");
     setFailedRecording(null);
-    setTranscriptionProgress("Retrying on-device transcription…");
+    setTranscriptionProgress("Retrying transcription…");
     setRecordingState("transcribing");
     setPendingRecording(failedRecording);
   };
@@ -1118,6 +1137,7 @@ export default function Page() {
     recordingClips.forEach((clip) => URL.revokeObjectURL(clip.url));
     if (recordingNotesStartRef.current !== null) setMeetingDraft(recordingNotesStartRef.current);
     recordingNotesStartRef.current = null;
+    aiNotesRef.current = "";
     setRecordingClips([]);
     setRecordingTranscript("");
     setRecordingCards([]);
@@ -1136,7 +1156,7 @@ export default function Page() {
       let noteId = recordingNoteId;
       let result = { summaryEmailsFailed: 0, taskEmailsFailed: 0, summaryEmailsSent: 0, taskEmailsSent: 0 };
       if (!noteId) {
-        const summary = generateEnglishKeyPoints(recordingTranscript);
+        const summary = aiNotesRef.current || generateEnglishKeyPoints(recordingTranscript);
         const cards = recordingCards.map((card) => ({ ...card, points: card.points || [], tasks: card.tasks || [] }));
         const tasks = cards.flatMap((card) => card.tasks.map((title) => ({
           id: crypto.randomUUID(), title, description: (card.description || "").slice(0, 2000), assigneeId: card.memberId, dueDate: "", status: "Open", comments: [], priority: card.priority || "Medium",
@@ -1355,7 +1375,7 @@ export default function Page() {
     <div className="gate"><div className="modal">
       <div className="brand dk"><span className="brand-mark"><img src="/loopdesk-mark.svg" alt="" /></span><div><b>LoopDesk</b><small>Team &amp; project management</small></div></div>
       {screen === "loading" && <p>Loading...</p>}
-      {screen === "suspended" && <div className="signup-sent"><span className="signup-mail" aria-hidden="true">⏸</span><h2>Workspace paused</h2><p>{msg || "This company workspace is suspended."}</p><div className="acts end"><button type="button" className="btn alt" onClick={async () => { await api("logout", {}, key); localStorage.removeItem("rw-key"); location.reload(); }}>Sign out</button></div></div>}
+      {screen === "suspended" && <div className="signup-sent"><span className="signup-mail" aria-hidden="true">⏸</span><h2>Workspace paused</h2><p>{msg || "This company workspace is suspended."}</p><div className="acts end"><button type="button" className="btn alt" onClick={async () => { await api("logout", {}, key); clearSession(); location.reload(); }}>Sign out</button></div></div>}
       {screen === "verifying" && <div className="signup-wait"><span className="signup-spinner" /><p>Confirming your email and creating your workspace…</p></div>}
       {screen === "signupSent" && (<div className="signup-sent">
         <span className="signup-mail" aria-hidden="true">✉</span>
@@ -1441,7 +1461,7 @@ export default function Page() {
           setView(k);
         }}>{l}{k === "platform" ? null : k === "chat" ? chatUnread > 0 && <em className="nav-unread">{chatUnread > 9 ? "9+" : chatUnread}</em> : k !== "meeting-notes" && <em>{k === "files" ? fileTotal : k === "activity" ? auditTotal : k === "team" ? members.length : k === "meetings" ? meetingTotal : tickets.filter((t) => k === "all" || k === "portal" || t.type === k).length}</em>}</button>))}
         <button className={"nav ghost " + (view === "account" ? "on" : "")} onClick={() => { setAmsg(""); setView("account"); }}>My account</button>
-        <button className="nav ghost" onClick={async () => { await api("logout", {}, key); localStorage.removeItem("rw-key"); location.reload(); }}>Sign out</button>
+        <button className="nav ghost" onClick={async () => { await api("logout", {}, key); clearSession(); location.reload(); }}>Sign out</button>
       </aside>
       <main className={"main" + (view === "chat" ? " chat-mode" : "")}>
         <div className="mobile-bar">
@@ -1570,7 +1590,7 @@ export default function Page() {
           </div>
           </>}
           {meetingSelected && <div className="meeting-workspace">
-            {pendingRecording && <LocalTranscriber audio={pendingRecording} names={voiceAttendees} model="best" onProgress={setTranscriptionProgress} onComplete={onTranscriptionComplete} onError={onTranscriptionError} />}
+            {pendingRecording && <LocalTranscriber audio={pendingRecording} names={voiceAttendees} model="best" keyValue={key} projectId={projectId} selectedMemberId={selectedMeetingMemberId} onProgress={setTranscriptionProgress} onComplete={onTranscriptionComplete} onError={onTranscriptionError} />}
             <header className="panel meeting-workspace-head">
               <button type="button" className="btn alt meeting-back" disabled={meetingLocked} title={meetingLocked ? "Finish or save the recording first" : undefined} onClick={closeMeeting}>← Calendar</button>
               <div className="meeting-workspace-title">
@@ -1588,6 +1608,7 @@ export default function Page() {
                 {!!recordingTranscript && <label className="meeting-transcript-review">English transcript (AI-generated; review and correct before sharing)<textarea disabled={!canEditMeetingContent} rows="6" value={recordingTranscript} onChange={(event) => {
                   const transcript = event.target.value;
                   setRecordingTranscript(transcript);
+                  if (aiNotesRef.current) return;
                   const keyPoints = generateEnglishKeyPoints(transcript);
                   const baseNotes = recordingNotesStartRef.current || "";
                   setMeetingDraft(keyPoints ? (baseNotes.trim() ? `${baseNotes.trimEnd()}\n\n` : "") + keyPoints : baseNotes);
@@ -1716,7 +1737,7 @@ export default function Page() {
               <label>Confirm new password<input required type="password" minLength={8} autoComplete="new-password" {...A("confirm")} /></label></div>
               <p className="note">8+ characters with at least one letter and one number.</p>
               <div className="acts end"><button type="button" className="btn alt" onClick={() => { setPwOpen(false); setAmsg(""); }}>Cancel</button><button className="btn">Update password</button></div></form>}
-            <div className="acts"><button className="btn alt" onClick={async () => { if (confirm("Sign out of all devices?")) { await api("logoutall", {}, key); localStorage.removeItem("rw-key"); location.reload(); } }}>Sign out of all devices</button></div>
+            <div className="acts"><button className="btn alt" onClick={async () => { if (confirm("Sign out of all devices?")) { await api("logoutall", {}, key); clearSession(); location.reload(); } }}>Sign out of all devices</button></div>
             {amsg && <p className="err">{amsg}</p>}</div>
         </section>) : view === "files" ? (<section className="panel files-page">
           <div className="subtabs" role="tablist">{CATS.map((c, i) => (<button key={c} role="tab" aria-selected={fc === i} className={"tab " + (fc === i ? "on" : "")} onClick={() => setFc(i)}>{c}<em>{files.filter((x) => x.cat === c).length}</em></button>))}</div>

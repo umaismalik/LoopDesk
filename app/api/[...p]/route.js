@@ -5,12 +5,15 @@ import { sendEmail } from "../../../lib/email";
 import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, loadProjectTicketIds, loadClientTickets, deleteTicketFiles, loadTicketSummaries, loadTicketAccess, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
 import { check } from "../../../lib/reminders";
 import { liveRequest, bumpProjectVersion } from "../../../lib/live-api";
+import { meetingAiRequest } from "../../../lib/meeting-ai";
 import { signupRequest } from "../../../lib/signup-api";
 import { CHILD_KINDS, loadOrgMeta, organizationPath, saveOrgMeta, tenantSuspended } from "../../../lib/tenant-store";
 import { isPlatformAdmin, platformRequest } from "../../../lib/platform-api";
 import { attachmentError, attachmentKind, descriptionError } from "../../../lib/limits";
 
 export const dynamic = "force-dynamic";
+// Meeting transcription and AI notes can take up to a minute for long recordings.
+export const maxDuration = 60;
 const load = (scope) => loadDb(() => ({ tickets: SEED, members: [], invites: [], meetings: [] }), scope);
 const save = async (d) => {
   const activeProject = d._activeProject;
@@ -351,6 +354,28 @@ async function send(to, subject, html, calendar) {
   if (!result.sent) console.error(`Email delivery failed for ${to} (${subject}): ${result.error}`);
   return result;
 }
+// One email per filled member card: that member's key points and action items together. With
+// `sentSummaries`, a card whose content was already emailed is not sent again.
+async function emailMemberCards(d, { cards, title, projectName, date, summary = "", sentSummaries = null, by = "" }) {
+  return Promise.all(cards.map(async (card) => {
+    const points = card.points || [], tasks = card.tasks || [];
+    if (!points.length && !tasks.length) return { memberId: card.memberId, sent: false, skipped: true };
+    const content = JSON.stringify({ points, tasks, priority: card.priority || "Medium" });
+    if (sentSummaries && sentSummaries[card.memberId] === content) return { memberId: card.memberId, sent: false, skipped: true };
+    const member = d.members.find((item) => item.id === card.memberId && item.status !== "disabled");
+    if (!member?.email) return { memberId: card.memberId, sent: false, skipped: true };
+    const list = (items) => `<ul style="margin:6px 0 14px;padding-left:20px">${items.map((line) => `<li style="margin:4px 0">${emailHtml(line)}</li>`).join("")}</ul>`;
+    const html = `<div style="font-family:Arial,sans-serif;color:#1f2937;line-height:1.5"><p>Hello ${emailHtml(member.name)},</p>`
+      + `<p>Here are your notes from <b>${emailHtml(title)}</b>${projectName ? ` in <b>${emailHtml(projectName)}</b>` : ""}${date ? ` on ${emailHtml(date)}` : ""}.</p>`
+      + (points.length ? `<p style="margin:0"><b>Your key points</b></p>${list(points)}` : "")
+      + (tasks.length ? `<p style="margin:0"><b>Your action items</b> · ${emailHtml(card.priority || "Medium")} priority</p>${list(tasks)}` : "")
+      + (summary ? `<p style="margin:0"><b>Shared meeting notes</b></p><p style="margin:6px 0 14px">${emailHtml(summary).replace(/\n/g, "<br>")}</p>` : "")
+      + `<p>Open LoopDesk → Meeting Notes to update the status of your action items or comment on them.${by ? ` Shared by ${emailHtml(by)}.` : ""}</p></div>`;
+    const result = await send(member.email, `Your meeting notes: ${title}`, html);
+    if (result.sent && sentSummaries) sentSummaries[card.memberId] = content;
+    return { memberId: card.memberId, sent: result.sent, error: result.error, skipped: false };
+  }));
+}
 async function emailAssignedTasks(d, { tasks, previousTasks = [], title, projectName }) {
   const previousById = new Map(previousTasks.map((task) => [task.id, task]));
   const assignedByMember = new Map();
@@ -413,6 +438,8 @@ async function h(req, p, m) {
   const key = req.headers.get("x-key");
   // Live-update polling and team chat use a lightweight session check, not the workspace load.
   if (r === "pulse" || r === "chat") return liveRequest(req, r, m, key, u);
+  // Cloud meeting transcription and AI-filled member cards (see lib/meeting-ai.js).
+  if (r === "meeting-ai") return meetingAiRequest(req, m, key, u);
   // Public self sign-up creates a new company workspace (see lib/signup-api.js).
   if (r === "signup") return signupRequest(req, m, u);
   // Platform Admin console: every company on LoopDesk, for the operator only (see lib/platform-api.js).
@@ -1248,16 +1275,9 @@ async function h(req, p, m) {
             : previousCards;
         }
         const sentSummaries = previous.sentSummaries || {};
-        const mailResults = await Promise.all(participantSummaries.map(async (summary) => {
-          const lines = summary.points.map((line) => `<li>${emailHtml(line)}</li>`);
-          if (!lines.length) return { id: summary.memberId, sent: false, skipped: true };
-          const content = JSON.stringify({ points: summary.points });
-          if (sentSummaries[summary.memberId] === content) return { id: summary.memberId, sent: false, skipped: true };
-          const attendee = attendees.find((member) => member.id === summary.memberId);
-          const result = await send(attendee.email, `Meeting notes: ${meeting.title}`, `<p>Hello ${emailHtml(attendee.name)},</p><p>Here are your key points and action items from <b>${emailHtml(meeting.title)}</b> on ${emailHtml(occurrenceDate)}:</p><ul>${lines.join("")}</ul><p>Please reply to the meeting organizer if anything needs correcting.</p>`);
-          if (result.sent) sentSummaries[summary.memberId] = content;
-          return { id: summary.memberId, sent: result.sent, error: result.error, skipped: false };
-        }));
+        // Every filled card is emailed to its member (once per change).
+        const mailResults = await emailMemberCards(d, { cards: participantSummaries, title: meeting.title, projectName: project.name, date: occurrenceDate, sentSummaries, by: me.name });
+        const cardEmailed = new Set(mailResults.filter((result) => !result.skipped).map((result) => result.memberId));
         meeting.occurrences[occurrenceDate] = {
           ...previous,
           notes,
@@ -1291,7 +1311,7 @@ async function h(req, p, m) {
         if (!managedNote) d.meetingNotes.push(savedNote);
         await save(d);
         const taskEmailResults = await emailAssignedTasks(d, {
-          tasks: generatedTasks,
+          tasks: generatedTasks.filter((task) => !cardEmailed.has(task.assigneeId)),
           previousTasks: managedNote?.tasks || [],
           title: meeting.title,
           projectName: project.name,
@@ -1465,17 +1485,13 @@ async function h(req, p, m) {
           createdBy: account.id, createdByName: me.name, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
         };
         d.meetingNotes.push(note); await save(d);
-        const summaryResults = b.deferEmails ? [] : await Promise.all(participantSummaries.map(async (card) => {
-          const member = activeMembers.find((item) => item.id === card.memberId);
-          const lines = card.points.map((line) => `<li>${emailHtml(line)}</li>`);
-          if (!member || !lines.length) return { sent: false, skipped: true };
-          const result = await send(member.email, `Meeting notes for you: ${title}`, `<p>Hello ${emailHtml(member.name)},</p><p>Here are the notes assigned to you from <b>${emailHtml(project.name)}</b> on ${emailHtml(date)}.</p><p><b>Shared key points:</b><br>${emailHtml(summary).replace(/\n/g, "<br>")}</p><ul>${lines.join("")}</ul><p>Open the project portal and select Meeting Notes to review or comment on action items.</p>`);
-          return { sent: result.sent, error: result.error, skipped: false };
-        }));
+        // Every filled card is emailed to its member, with their key points, action items and the shared notes.
+        const summaryResults = b.deferEmails ? [] : await emailMemberCards(d, { cards: participantSummaries, title, projectName: project.name, date, summary, by: me.name });
+        const cardEmailed = new Set(summaryResults.filter((result) => !result.skipped).map((result) => result.memberId));
         const alreadyEmailedTasks = meeting?.occurrences?.[date]?.emailedTasks || {};
         const emailedTaskKeys = new Set(Object.entries(alreadyEmailedTasks).flatMap(([memberId, titles]) => titles.map((taskTitle) => `${memberId}:${taskTitle}`)));
         const taskEmailResults = b.deferEmails ? [] : await emailAssignedTasks(d, {
-          tasks: tasks.filter((task) => !emailedTaskKeys.has(`${task.assigneeId}:${task.title.toLowerCase()}`)),
+          tasks: tasks.filter((task) => !cardEmailed.has(task.assigneeId) && !emailedTaskKeys.has(`${task.assigneeId}:${task.title.toLowerCase()}`)),
           title,
           projectName: project.name,
         });
@@ -1900,7 +1916,7 @@ async function h(req, p, m) {
 }
 // Writes that do not change what other people see in the project; everything else bumps the
 // project's version so open browsers refresh automatically.
-const NO_PULSE = new Set(["pulse", "chat", "login", "logout", "logoutall", "forgot", "reset", "accept", "cron"]);
+const NO_PULSE = new Set(["pulse", "chat", "meeting-ai", "login", "logout", "logoutall", "forgot", "reset", "accept", "cron"]);
 const handle = async (req, { params }, method) => {
   try {
     const response = await h(req, params.p, method);

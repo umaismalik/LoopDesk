@@ -36,10 +36,38 @@ const parseBody = (body) => {
 };
 const Svg = ({ d, size = 16 }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={d} /></svg>;
 
+// Instant start: the channel list and recent messages are kept in memory while the app is open (so
+// leaving and reopening Team Chat shows them at once) and the last-open conversation is also kept in
+// this browser, so even a fresh page load paints immediately and then fetches only what changed.
+// The stored copy belongs to the signed-in member and is removed at sign-out.
+const memoryCache = new Map();
+const storeKey = (projectId, memberId) => `rw-chat-cache:${projectId}:${memberId}`;
+function chatCache(projectId, memberId) {
+  const id = projectId + "|" + memberId;
+  if (!memoryCache.has(id)) {
+    let stored = null;
+    try { stored = JSON.parse(localStorage.getItem(storeKey(projectId, memberId)) || "null"); } catch {}
+    const byChannel = new Map();
+    if (stored?.active?.id && Array.isArray(stored.active.messages)) byChannel.set(stored.active.id, { messages: stored.active.messages, updated: stored.active.updated || 0, hasOlder: !!stored.active.hasOlder });
+    memoryCache.set(id, { channels: Array.isArray(stored?.channels) ? stored.channels : [], team: Array.isArray(stored?.team) ? stored.team : [], reactions: stored?.reactions || null, byChannel });
+  }
+  return memoryCache.get(id);
+}
+function persistChat(projectId, memberId, activeId) {
+  const cache = chatCache(projectId, memberId), active = cache.byChannel.get(activeId);
+  try {
+    localStorage.setItem(storeKey(projectId, memberId), JSON.stringify({
+      channels: cache.channels, team: cache.team, reactions: cache.reactions,
+      active: active ? { id: activeId, messages: active.messages.slice(-60), updated: active.updated, hasOlder: active.hasOlder || active.messages.length > 60 } : null,
+    }));
+  } catch {}
+}
+
 export default function TeamChat({ projectId, keyValue, me, members, projectName, organizationName, pulseChannels, lastRead, onRead, onOpenTicket }) {
-  const [channels, setChannels] = useState([]);
-  const [teamIds, setTeamIds] = useState([]);
-  const [reactionSet, setReactionSet] = useState(["👍", "✅", "🎉", "👀"]);
+  const cache = chatCache(projectId, me.id);
+  const [channels, setChannels] = useState(cache.channels);
+  const [teamIds, setTeamIds] = useState(cache.team);
+  const [reactionSet, setReactionSet] = useState(cache.reactions || ["👍", "✅", "🎉", "👀"]);
   const [activeId, setActiveId] = useState(() => { try { return localStorage.getItem(`rw-chat-active:${projectId}`) || ""; } catch { return ""; } });
   const [messages, setMessages] = useState([]);
   const [hasOlder, setHasOlder] = useState(false);
@@ -75,7 +103,7 @@ export default function TeamChat({ projectId, keyValue, me, members, projectName
   const [notify, setNotify] = useState(() => typeof Notification !== "undefined" && Notification.permission === "granted" && (() => { try { return localStorage.getItem("rw-chat-notify") !== "off"; } catch { return true; } })());
   const messagesRef = useRef([]);
   // Messages already loaded per conversation, so switching back to one is instant.
-  const channelCacheRef = useRef(new Map());
+  const channelCacheRef = useRef(cache.byChannel);
   const listRef = useRef(null);
   const composerRef = useRef(null);
   const updatedRef = useRef(0);
@@ -111,6 +139,7 @@ export default function TeamChat({ projectId, keyValue, me, members, projectName
     setChannels(result.channels || []);
     setTeamIds(result.team || []);
     if (result.reactions?.length) setReactionSet(result.reactions);
+    Object.assign(cache, { channels: result.channels || [], team: result.team || [], reactions: result.reactions?.length ? result.reactions : cache.reactions });
     setActiveId((current) => (result.channels || []).some((c) => c.id === current) ? current : (result.channels || []).find((c) => c.name === "general")?.id || result.channels?.[0]?.id || "");
   }, [call]);
   useEffect(() => { loadChannels(); }, [loadChannels]);
@@ -192,6 +221,17 @@ export default function TeamChat({ projectId, keyValue, me, members, projectName
     window.addEventListener("focus", onVisible);
     return () => { clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); window.removeEventListener("focus", onVisible); };
   }, [activeId, call, loadChannels]);
+
+  useEffect(() => {
+    if (!activeId || loadingMessages) return;
+    const timer = setTimeout(() => {
+      const loaded = messages.filter((m) => !m.pending && m.channelId === activeId);
+      if (!loaded.length) return;
+      channelCacheRef.current.set(activeId, { messages: loaded, updated: updatedRef.current, hasOlder: hasOlderRef.current });
+      persistChat(projectId, me.id, activeId);
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [messages, activeId, loadingMessages]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Everything visible in the open conversation counts as read.
   const newest = messages.reduce((latest, m) => m.pending ? latest : Math.max(latest, m.createdAt), 0);
