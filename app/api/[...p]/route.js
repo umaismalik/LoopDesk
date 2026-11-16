@@ -10,6 +10,7 @@ import { signupRequest } from "../../../lib/signup-api";
 import { CHILD_KINDS, loadOrgMeta, organizationPath, saveOrgMeta, tenantSuspended } from "../../../lib/tenant-store";
 import { isPlatformAdmin, platformRequest } from "../../../lib/platform-api";
 import { attachmentError, attachmentKind, descriptionError } from "../../../lib/limits";
+import { publicErrorMessage } from "../../../lib/http-error";
 
 export const dynamic = "force-dynamic";
 // Meeting transcription and AI notes can take up to a minute for long recordings.
@@ -27,7 +28,8 @@ const save = async (d) => {
   await saveDb(data, d);
 };
 const uid = () => crypto.randomBytes(16).toString("hex");
-const J = (o, s = 200, headers = {}) => Response.json(o, { status: s, headers });
+// API responses carry session data, so no browser or proxy may cache them.
+const J = (o, s = 200, headers = {}) => Response.json(o, { status: s, headers: { "Cache-Control": "no-store", ...headers } });
 const isWorkspaceWriteBusy = (error) => {
   const message = String(error?.message || error);
   return /"code"\s*:\s*"55P03"/.test(message) || message.includes("Workspace write is busy; retry shortly.");
@@ -172,7 +174,12 @@ async function migrate(d) {
 }
 const np = (v) => String(v || "").replace(/[^\d+]/g, "");
 const hash = (p) => { const s = crypto.randomBytes(16).toString("hex"); return s + ":" + crypto.scryptSync(p, s, 64).toString("hex"); };
-const verify = (p, h) => { if (!h) return false; const [s, x] = h.split(":"); return crypto.timingSafeEqual(crypto.scryptSync(p, s, 64), Buffer.from(x, "hex")); };
+// A missing or malformed stored hash is a failed sign-in, never a server error.
+const verify = (p, h) => {
+  const [s, x] = String(h || "").split(":");
+  if (!s || !/^[0-9a-f]{128}$/i.test(x || "")) return false;
+  return crypto.timingSafeEqual(crypto.scryptSync(p, s, 64), Buffer.from(x, "hex"));
+};
 const fails = new Map();
 const SESSION = 30 * 864e5, CONFIGURED_SITE = process.env.APP_URL || "";
 // Next ticket id of a type ("ISS-07", "FTR-12") after the highest number already in `ids`.
@@ -453,6 +460,8 @@ async function h(req, p, m) {
     const d = await loadLoginDb(id.includes("@") ? id : "", phone, () => ({ tickets: SEED, members: [], invites: [], meetings: [] }));
     const member = d.members.find((item) => item.email === id || (phone && np(item.phone) === phone));
     if (!member || !verify(String(body.password || ""), member.pw)) {
+      // Keep the lockout table bounded so a flood of made-up identifiers cannot exhaust memory.
+      if (fails.size > 5000) for (const [entry, value] of fails) if (Date.now() - value.t > 300000) fails.delete(entry);
       fails.set(id, { n: failure.n + 1, t: Date.now() });
       return J({ error: "Invalid email/phone or password" }, 401);
     }
@@ -1910,7 +1919,7 @@ async function h(req, p, m) {
       return J({ error: "Another workspace update is being processed. Please retry shortly." }, 503, { "Retry-After": "1" });
     }
     const conflict = message.includes("Concurrent update detected") || message.includes("A record was created by another request");
-    return J({ error: conflict ? "This record changed in another request. Reload the page and retry." : message }, conflict ? 409 : 500);
+    return J({ error: conflict ? "This record changed in another request. Reload the page and retry." : publicErrorMessage(e, "API request") }, conflict ? 409 : 500);
   }
   return J({ error: "not found" }, 404);
 }
@@ -1925,12 +1934,11 @@ const handle = async (req, { params }, method) => {
     }
     return response;
   } catch (error) {
-    console.error("API request failed:", error);
     if (isWorkspaceWriteBusy(error)) {
       return J({ error: "Another workspace update is being processed. Please retry shortly." }, 503, { "Retry-After": "1" });
     }
     const conflict = String(error.message).includes("Concurrent update detected") || String(error.message).includes("A record was created by another request");
-    return J({ error: conflict ? "This record changed in another request. Reload the page and retry." : `API request failed: ${error.message}` }, conflict ? 409 : 500);
+    return J({ error: conflict ? "This record changed in another request. Reload the page and retry." : publicErrorMessage(error, "API request") }, conflict ? 409 : 500);
   }
 };
 export const GET = (req, context) => handle(req, context, "GET");

@@ -4,14 +4,17 @@ import { createPortal } from "react-dom";
 import dynamic from "next/dynamic";
 import { correctTurnNames, generateEnglishKeyPoints, generateMeetingParticipantCards } from "../lib/local-transcription";
 import { formatAiNotes } from "../lib/cloud-transcription";
-import MeetingNotes from "../components/MeetingNotes";
-import ActivityLog from "../components/ActivityLog";
-import TeamChat from "../components/TeamChat";
-import PlatformConsole from "../components/PlatformConsole";
 import Dashboard from "./dashboard";
 import { ATTACHMENT_ACCEPT, ATTACHMENT_HINT, attachmentError, DESCRIPTION_CHAR_LIMIT, DESCRIPTION_WORD_LIMIT, descriptionError, wordCount } from "../lib/limits";
 
+// Each screen's code downloads only when that screen is first opened, so sign-in and the dashboard
+// start with a much smaller bundle.
+const screenLoading = () => <div className="screen-loading" aria-busy="true" />;
 const LocalTranscriber = dynamic(() => import("../components/LocalTranscriber"), { ssr: false });
+const MeetingNotes = dynamic(() => import("../components/MeetingNotes"), { ssr: false, loading: screenLoading });
+const ActivityLog = dynamic(() => import("../components/ActivityLog"), { ssr: false, loading: screenLoading });
+const TeamChat = dynamic(() => import("../components/TeamChat"), { ssr: false, loading: screenLoading });
+const PlatformConsole = dynamic(() => import("../components/PlatformConsole"), { ssr: false, loading: screenLoading });
 
 const STATUS = ["Open", "In Progress", "Testing", "Completed", "Reopened"], PRIO = ["High", "Medium", "Low"], ROLES = ["Admin", "Developer", "Collaborator", "Client"];
 const CATS = ["Requirements & Design", "Reports & Releases", "Guides & Communication", "Other"];
@@ -568,28 +571,9 @@ export default function Page() {
     setMeetingError("");
     setMeetingNotice("");
   }, [view, recordingState, meetingSelected]);
-  useEffect(() => {
-    const pending = meetingEditRequests.some((item) => item.projectId === projectId && item.memberId === me?.id && item.status === "pending");
-    if (!pending || !key || !projectId) return;
-    const timer = setInterval(async () => {
-      const result = await api("meeting-notes?month=" + monthKey(meetingMonth), null, key, projectId);
-      if (!result.ok) return;
-      setMeetingEditAccess(!!result.canEdit);
-      setMeetingEditAccessExpiresAt(result.expiresAt || null);
-      setMeetingEditRequests(result.requests || []);
-    }, 15000);
-    return () => clearInterval(timer);
-  }, [meetingEditRequests, me, key, projectId, meetingMonth]);
-  useEffect(() => {
-    // Admins get new access requests in the header bell on every page, not only on the dashboard.
-    if (me?.role !== "Admin" || !key || !projectId) return;
-    const timer = setInterval(async () => {
-      if (document.hidden) return;
-      const result = await api("meeting-notes?month=" + monthKey(meetingMonth), null, key, projectId);
-      if (result.ok) setMeetingEditRequests(result.requests || []);
-    }, 20000);
-    return () => clearInterval(timer);
-  }, [me, key, projectId, meetingMonth]);
+  // Meeting edit-access requests and approvals need no polling of their own: every request or
+  // approval changes the project version, and the 5-second live pulse then refreshes the workspace,
+  // which carries the requests, the grant and its expiry.
   useEffect(() => {
     if (view !== "meetings" || !key || !projectId) return;
     let cancelled = false;
