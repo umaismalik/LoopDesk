@@ -12,6 +12,7 @@ import { isPlatformAdmin, platformRequest } from "../../../lib/platform-api";
 import { attachmentError, attachmentKind, descriptionError } from "../../../lib/limits";
 import { publicErrorMessage } from "../../../lib/http-error";
 import { verifyPassword } from "../../../lib/passwords";
+import { deliverDocutectOutbox, docutectEventsForEdit, docutectProjectId, docutectWebhook, keepDocutectFields, queueDocutectEvents, replyToDocutectCustomer } from "../../../lib/docutect-sync";
 
 export const dynamic = "force-dynamic";
 // Meeting transcription and AI notes can take up to a minute for long recordings.
@@ -435,8 +436,13 @@ async function h(req, p, m) {
   const u = new URL(req.url), r = p[0];
   if (r === "cron") {
     if (!process.env.CRON_SECRET || req.headers.get("authorization") !== "Bearer " + process.env.CRON_SECRET) return J({ error: "denied" }, 401);
-    await check(); return J({ ok: true });
+    await check();
+    // DocuTect sync events that could not be delivered earlier are retried here as well.
+    await deliverDocutectOutbox().catch((error) => console.warn("DocuTect sync retry failed:", error?.message || error));
+    return J({ ok: true });
   }
+  // DocuTect ticket sync: signed server-to-server calls, no user session (see lib/docutect-sync.js).
+  if (r === "integrations" && p[1] === "docutect" && m === "POST") return docutectWebhook(req);
   const key = req.headers.get("x-key");
   // Live-update polling and team chat use a lightweight session check, not the workspace load.
   if (r === "pulse" || r === "chat") return liveRequest(req, r, m, key, u);
@@ -1661,6 +1667,20 @@ async function h(req, p, m) {
       d.projects.push(created); await save(d);
       return J({ ok: true, project: { id: created.id, name: created.name, organizationId: created.organizationId } });
     }
+    if (r === "docutect-reply") {
+      // "Reply to customer" on a ticket raised in DocuTect: it appears in the customer's DocuTect thread.
+      if (me.role === "Client") return J({ error: "Not allowed" }, 403);
+      const b = await req.json(), ticketId = String(b.id || ""), text = String(b.text || "").trim();
+      if (project.id !== docutectProjectId()) return J({ error: "This project is not connected to DocuTect" }, 400);
+      if (!text) return J({ error: "Write a reply first" }, 400);
+      if (text.length > 5000) return J({ error: "Replies must be 5,000 characters or fewer" }, 400);
+      const access = await loadTicketAccess(project.id, ticketId, d.tickets);
+      if (!access) return J({ error: "Ticket not found" }, 404);
+      if (!canManageTickets(me) && !ownsTicket(access, me.id)) return J({ error: "You can only reply on tickets assigned to you" }, 403);
+      const ticket = await replyToDocutectCustomer(project.id, ticketId, me, text);
+      if (!ticket) return J({ error: "This ticket did not come from DocuTect" }, 400);
+      return J({ ok: true, ticket });
+    }
     if (r === "tickets") {
       if (me.role === "Client") return J({ error: "Not allowed" }, 403);
       const b = await req.json();
@@ -1678,6 +1698,9 @@ async function h(req, p, m) {
       }
       const gone = d.tickets.filter((t) => !hiddenTickets.includes(t) && !b.tickets.some((x) => x.id === t.id));
       const old = Object.fromEntries(d.tickets.map((t) => [t.id, t]));
+      // The DocuTect link is server-owned, and customer messages that arrived after this browser loaded
+      // the ticket must survive its save.
+      b.tickets.forEach((t) => keepDocutectFields(old[t.id], t));
       // Admins and Collaborators manage every ticket. Other team members may raise tickets and update
       // the ones that are theirs (assigned to them or raised by them), but not reassign or delete.
       const manager = canManageTickets(me);
@@ -1739,6 +1762,9 @@ async function h(req, p, m) {
         }
       });
       gone.forEach((t) => log(d, me.name, "Deleted " + t.id, t.title));
+      // Status, priority and resolution changes of DocuTect tickets go back to DocuTect.
+      const docutectEvents = project.id === docutectProjectId() ? b.tickets.flatMap((t) => docutectEventsForEdit(old[t.id], t)) : [];
+      if (docutectEvents.length) jobs.push(() => queueDocutectEvents(docutectEvents).catch((error) => console.warn("DocuTect sync queue failed:", error?.message || error)));
       const goneIds = gone.map((t) => t.id);
       if (goneIds.length && !remote) d.files = d.files.filter((file) => !goneIds.includes(file.ticket));
       d.tickets = [...hiddenTickets, ...b.tickets]; await save(d);
@@ -1920,7 +1946,7 @@ async function h(req, p, m) {
 }
 // Writes that do not change what other people see in the project; everything else bumps the
 // project's version so open browsers refresh automatically.
-const NO_PULSE = new Set(["pulse", "chat", "meeting-ai", "login", "logout", "logoutall", "forgot", "reset", "accept", "cron"]);
+const NO_PULSE = new Set(["pulse", "chat", "meeting-ai", "login", "logout", "logoutall", "forgot", "reset", "accept", "cron", "integrations"]);
 const handle = async (req, { params }, method) => {
   try {
     const response = await h(req, params.p, method);

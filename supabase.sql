@@ -1600,3 +1600,26 @@ begin
     execute format('grant all on public.%I to service_role', table_name);
   end loop;
 end $$;
+
+-- ---------------------------------------------------------------------------------------------
+-- DocuTect ticket sync (added later; safe to re-run). See lib/docutect-sync.js.
+-- integration_outbox: ticket changes made in LoopDesk waiting to be delivered to DocuTect. A row is
+--   deleted once DocuTect accepts it; until then it is retried with backoff (also by /api/cron).
+-- tickets_docutect_id_idx: finds the LoopDesk ticket of a DocuTect ticket id.
+-- ---------------------------------------------------------------------------------------------
+create table if not exists public.integration_outbox (
+  id text primary key,
+  target text not null,
+  ticket_ref text not null default '',
+  payload jsonb not null,
+  attempts integer not null default 0,
+  next_attempt_at bigint not null default 0,
+  last_error text not null default '',
+  created_at bigint not null default 0
+);
+create index if not exists integration_outbox_due_idx on public.integration_outbox (target, next_attempt_at);
+create index if not exists tickets_docutect_id_idx on public.tickets ((payload -> 'docutect' ->> 'id'));
+
+alter table public.integration_outbox enable row level security;
+revoke all on public.integration_outbox from anon, authenticated;
+grant all on public.integration_outbox to service_role;

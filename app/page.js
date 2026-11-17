@@ -345,6 +345,8 @@ export default function Page() {
   const [q, setQ] = useState(""), [fs, setFs] = useState(""), [fp, setFp] = useState(""), [fm, setFm] = useState("");
   const [modal, setModal] = useState(null);
   const [detail, setDetail] = useState(null);
+  const [customerReply, setCustomerReply] = useState("");
+  const [customerReplyBusy, setCustomerReplyBusy] = useState(false);
   const [ucat, setUcat] = useState(CATS[0]);
   const [form, setForm] = useState({ name: "", email: "", role: "Developer" });
   const [msg, setMsg] = useState("");
@@ -821,6 +823,18 @@ export default function Page() {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
   const dt = tickets.find((t) => t.id === detail);
+  // "Reply to customer" on a DocuTect ticket: it is posted to the customer's DocuTect thread.
+  const sendCustomerReply = async () => {
+    const text = customerReply.trim();
+    if (!dt || !text || customerReplyBusy) return;
+    setCustomerReplyBusy(true);
+    try {
+      const r = await api("docutect-reply", { id: dt.id, text }, key, projectId);
+      if (!r.ok) return alert(r.error || "Could not send the reply");
+      setTickets((list) => list.map((t) => t.id === r.ticket.id ? r.ticket : t));
+      setCustomerReply("");
+    } finally { setCustomerReplyBusy(false); }
+  };
   // Used by both the file picker and drag-and-drop on the Attachments page.
   const uploadOne = async (f) => {
     const problem = attachmentError(f);
@@ -1838,7 +1852,7 @@ export default function Page() {
               <tbody>
                 {rows.map((t) => (<tr key={t.id}>
                     <td><b className={"id " + t.type}>{t.id}</b></td>
-                    <td><div className="tt">{t.title}</div></td>
+                    <td><div className="tt">{t.title}</div>{t.docutect && <div className="dt-tags"><span className="dt-badge" title={t.docutect.email ? `Raised in DocuTect by ${t.docutect.user || t.docutect.email} (${t.docutect.email})` : "Raised in DocuTect"}>DocuTect{t.docutect.org ? " · " + t.docutect.org : ""}</span>{t.docutect.label && <span className="dt-label">{t.docutect.label}</span>}{t.docutect.blocking && <span className="dt-label block">Blocking</span>}</div>}</td>
                     <td className="nw">{fmt(t.date)}<div className="dd">{t.by}</div></td>
                     <td>{t.by === "Client" ? <select className={"psel " + (t.priority || "none")} disabled={!canEditTicket(t)} value={t.priority || ""} onChange={(e) => patch(t.id, { priority: e.target.value })}><option value="">Set priority</option>{PRIO.map((x) => <option key={x}>{x}</option>)}</select> : <span className={"pill " + t.priority}>{t.priority}</span>}</td>
                     <td><Assign t={t} members={members.filter((x) => x.role !== "Client")} can={manager} onChange={(v) => patch(t.id, { assignees: v })} /></td>
@@ -1913,17 +1927,32 @@ export default function Page() {
         <div className="acts end"><button type="button" className="btn alt" onClick={() => setOrganizationModal(false)}>Cancel</button><button className="btn">Create {organizationKind === "subsidiary" ? "sub-company" : "department"}</button></div>
       </form></div>)}
 
-      {dt && (<div className="ov" onClick={() => setDetail(null)}><div className="modal" onClick={(e) => e.stopPropagation()}>
+      {dt && (<div className="ov" onClick={() => { setDetail(null); setCustomerReply(""); }}><div className="modal" onClick={(e) => e.stopPropagation()}>
         <h2><b className={"id " + dt.type}>{client ? dt.clientRef || dt.id : dt.id}</b> {dt.title}{!client && dt.clientRef && <small className="muted"> (client's {dt.clientRef})</small>}</h2>
         <div className="meta">{!client && <span className={"pill " + dt.priority}>{dt.priority}</span>}<span className={"pill st " + dt.status.replace(" ", "")}>{dt.status}</span>
           <span>Raised {fmt(dt.date)} by {dt.by}</span>{!client && <span>Assignees: {anames(dt.assignees)}</span>}{dt.deadline && <span>Deadline: {fmt(dt.deadline)}</span>}{dt.owner && !client && <span>Worked by: {dt.owner}</span>}</div>
         <h4>Description</h4><p className="desc">{dt.details || "No description."}</p>
         {dt.resolution && <><h4>Resolution</h4><p className="desc">{dt.resolution}</p></>}
-        {(dt.notes || []).length > 0 && <><h4>History</h4>{dt.notes.map((n, i) => <p key={i} className="dd">{fmt(n.at)} - {n.by}: {n.text}</p>)}</>}
+        {!client && dt.docutect && <section className="dt-panel" aria-label="DocuTect customer">
+          <h4>DocuTect customer</h4>
+          <p className="dt-who"><b>{dt.docutect.org || "Organization"}</b>{dt.docutect.user && <> · {dt.docutect.user}</>}{dt.docutect.email && <> · <a href={"mailto:" + dt.docutect.email}>{dt.docutect.email}</a></>}</p>
+          <div className="dt-tags">{dt.docutect.label && <span className="dt-label">{dt.docutect.label}</span>}{dt.docutect.blocking && <span className="dt-label block">Blocking</span>}{dt.docutect.priority && <span className="dt-label">DocuTect priority: {dt.docutect.priority}</span>}{dt.docutect.status && <span className="dt-label">DocuTect status: {dt.docutect.status.replace("_", " ")}</span>}</div>
+          {dt.docutect.adminNotes && <p className="dd">DocuTect internal note: {dt.docutect.adminNotes}</p>}
+          <h4>Conversation with the customer</h4>
+          <div className="dt-thread">
+            {(dt.notes || []).filter((n) => n.role).map((n) => <div key={n.id} className={"dt-msg " + n.role}><small>{n.by} · {n.time ? new Date(n.time).toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : fmt(n.at)}</small><p>{n.text}</p></div>)}
+            {!(dt.notes || []).some((n) => n.role) && <small className="muted">No messages yet.</small>}
+          </div>
+          {canEditTicket(dt) && <div className="dt-reply">
+            <textarea rows="3" maxLength={5000} value={customerReply} onChange={(e) => setCustomerReply(e.target.value)} placeholder="Reply to the customer. It appears in their DocuTect ticket and they are emailed." aria-label="Reply to the customer" />
+            <button type="button" className="btn" disabled={customerReplyBusy || !customerReply.trim()} onClick={sendCustomerReply}>{customerReplyBusy ? "Sending…" : "Reply to customer"}</button>
+          </div>}
+        </section>}
+        {(dt.notes || []).some((n) => client || !dt.docutect || !n.role) && <><h4>History</h4>{dt.notes.filter((n) => client || !dt.docutect || !n.role).map((n, i) => <p key={n.id || i} className="dd">{fmt(n.at)} - {n.by}: {n.text}</p>)}</>}
         <h4>Attachments</h4>
         {files.filter((x) => x.ticket === dt.id).map((a) => (<div className="att" key={a.id}>{a.url ? <a href={fh(a)} target="_blank" rel="noreferrer"><Ic d={CLIP} /> {a.name}</a> : <button type="button" className="att-link" onClick={() => openFile(a)}><Ic d={CLIP} /> {a.name}</button>}<small>{a.cat}{a.url ? ", link" : ""}</small></div>))}
         {!files.some((x) => x.ticket === dt.id) && <small>No attachments</small>}
-        <div className="acts end">{client && dt.status === "Completed" && <button className="btn" onClick={() => reopen(dt)}>Not satisfied? Reopen</button>}<button className="btn alt" onClick={() => setDetail(null)}>Close</button></div>
+        <div className="acts end">{client && dt.status === "Completed" && <button className="btn" onClick={() => reopen(dt)}>Not satisfied? Reopen</button>}<button className="btn alt" onClick={() => { setDetail(null); setCustomerReply(""); }}>Close</button></div>
       </div></div>)}
     </div>
   );
