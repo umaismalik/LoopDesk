@@ -167,20 +167,32 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
     setNotice(result.taskEmailsFailed ? `Saved, but ${result.taskEmailsFailed} task assignment email(s) failed: ${result.emailErrors?.[0] || "check email settings"}` : `Note and tasks saved.${result.taskEmailsSent ? ` Assignment notification sent to ${result.taskEmailsSent} team member(s).` : ""}`);
   };
 
-  const addTask = async (event) => {
-    event.preventDefault();
-    if (!selected || !editAccess || !taskTitle.trim()) return;
-    const task = { id: crypto.randomUUID(), title: taskTitle.trim(), description: selected.summary || "", assigneeId: taskAssignee, dueDate: taskDeadline ? new Date(taskDeadline).toISOString() : "", status: "Open", priority: taskPriority, comments: [] };
-    const updated = { ...selected, tasks: [...(selected.tasks || []), task] };
-    setBusy(true); setError("");
+  // Saves new action items on the open note (with any unsaved edits); assignees are emailed by the server.
+  const createTasks = async (tasks) => {
+    if (!selected || !editAccess || !tasks.length) return false;
+    const updated = { ...selected, tasks: [...(selected.tasks || []), ...tasks] };
+    setBusy(true); setError(""); setNotice("");
     const result = await request({ action: "update", noteId: updated.id, title: updated.title, summary: updated.summary, transcript: updated.transcript, participantSummaries: updated.participantSummaries, tasks: updated.tasks });
     setBusy(false);
-    if (!result.ok) { setError(result.error || "Could not add task"); return; }
+    if (!result.ok) { setError(result.error || "Could not add task"); return false; }
     openNote(result.note); setNotes((items) => items.map((item) => item.id === result.note.id ? result.note : item));
-    setTaskTitle(""); setTaskAssignee(""); setTaskDeadline(""); setTaskPriority("Medium");
-    if (result.taskEmailsFailed) setError(`Task saved, but assignment email failed: ${result.emailErrors?.[0] || "check email settings"}`);
-    else if (result.taskEmailsSent) setNotice(`Task saved and emailed to ${result.taskEmailsSent} assigned team member(s).`);
+    const what = tasks.length === 1 ? "Task" : `${tasks.length} tasks`;
+    if (result.taskEmailsFailed) setError(`${what} saved, but assignment email failed: ${result.emailErrors?.[0] || "check email settings"}`);
+    else setNotice(`${what} assigned${result.taskEmailsSent ? ` and emailed to ${result.taskEmailsSent} team member(s)` : ""}.`);
+    return true;
   };
+  const newTask = (title, assigneeId, extra = {}) => ({ id: crypto.randomUUID(), title, description: selected?.summary || "", assigneeId, dueDate: "", status: "Open", priority: "Medium", comments: [], ...extra });
+  const addTask = async (event) => {
+    event.preventDefault();
+    if (!taskTitle.trim()) return;
+    const saved = await createTasks([newTask(taskTitle.trim(), taskAssignee, { dueDate: taskDeadline ? new Date(taskDeadline).toISOString() : "", priority: taskPriority })]);
+    if (saved) { setTaskTitle(""); setTaskAssignee(""); setTaskDeadline(""); setTaskPriority("Medium"); }
+  };
+  // A member card's "Next tasks" lines that are not yet action items assigned to that member.
+  const unassignedNextTasks = (card) => (card.tasks || []).map((line) => String(line).trim()).filter(Boolean)
+    .filter((line) => !(selected?.tasks || []).some((task) => task.assigneeId === card.memberId && task.title.trim() === line));
+  const assignNextTasks = (card) => createTasks(unassignedNextTasks(card).map((line) => newTask(line.slice(0, 300), card.memberId, { priority: card.priority || "Medium", description: card.description || selected?.summary || "" })));
+  const taskFormRef = useRef(null);
 
   const addComment = async (task) => {
     const text = (commentDrafts[task.id] || "").trim();
@@ -401,6 +413,15 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
           </nav>
         </header>
 
+        {canManageContent && <form className="mn-add-task" ref={taskFormRef} onSubmit={addTask} aria-label="Assign a task">
+          <b className="mn-add-task-label">Assign a task</b>
+          <input required maxLength="300" placeholder="What needs to be done…" value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)} />
+          <select aria-label="Assignee" value={taskAssignee} onChange={(event) => setTaskAssignee(event.target.value)}><option value="">Unassigned</option>{members.filter((member) => member.role !== "Client" && member.status === "active").map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select>
+          <select aria-label="Task priority" value={taskPriority} onChange={(event) => setTaskPriority(event.target.value)}><option>High</option><option>Medium</option><option>Low</option></select>
+          <input aria-label="Deadline" type="datetime-local" value={taskDeadline} onChange={(event) => setTaskDeadline(event.target.value)} />
+          <button className="btn" disabled={busy}>{busy ? "Saving…" : "Assign task"}</button>
+        </form>}
+
         {tab === "overview" && <div className="mn-pane">
           <section className="mn-block">
             <h3>Key points</h3>
@@ -415,19 +436,18 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
                   <label>Updates (done / in progress / blockers)<textarea disabled={!canEditMember(card.memberId)} rows="3" value={(card.points || []).join("\n")} onChange={(event) => setSelected({ ...selected, participantSummaries: selected.participantSummaries.map((item) => item.memberId === card.memberId ? { ...item, points: event.target.value.split("\n") } : item) })} /></label>
                   <label>Next tasks<textarea disabled={!canEditMember(card.memberId)} rows="3" value={(card.tasks || []).join("\n")} onChange={(event) => setSelected({ ...selected, participantSummaries: selected.participantSummaries.map((item) => item.memberId === card.memberId ? { ...item, tasks: event.target.value.split("\n") } : item) })} /></label>
                 </div>
+                {canManageContent && <div className="mn-member-assign">
+                  {unassignedNextTasks(card).length
+                    ? <button type="button" className="btn alt" disabled={busy} onClick={() => assignNextTasks(card)}>Assign {unassignedNextTasks(card).length === 1 ? "this next task" : `these ${unassignedNextTasks(card).length} next tasks`} to {card.name}</button>
+                    : <small>{(card.tasks || []).some((line) => String(line).trim()) ? `Next tasks are assigned to ${card.name}.` : `Add next tasks above to assign them to ${card.name}.`}</small>}
+                  <button type="button" className="ic" onClick={() => { setTaskAssignee(card.memberId); taskFormRef.current?.querySelector("input")?.focus(); taskFormRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }); }}>Assign another task</button>
+                </div>}
               </details>)}
             </div>
           </section>}
         </div>}
 
         {tab === "tasks" && <div className="mn-pane">
-          {canManageContent && <form className="mn-add-task" onSubmit={addTask}>
-            <input required maxLength="300" placeholder="Add an action item…" value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)} />
-            <select aria-label="Assignee" value={taskAssignee} onChange={(event) => setTaskAssignee(event.target.value)}><option value="">Unassigned</option>{members.filter((member) => member.role !== "Client" && member.status === "active").map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select>
-            <select aria-label="Task priority" value={taskPriority} onChange={(event) => setTaskPriority(event.target.value)}><option>High</option><option>Medium</option><option>Low</option></select>
-            <input aria-label="Deadline" type="datetime-local" value={taskDeadline} onChange={(event) => setTaskDeadline(event.target.value)} />
-            <button className="btn" disabled={busy}>Add task</button>
-          </form>}
           {!taskGroups.length && <div className="mn-empty-list"><b>No action items yet</b><span>{canManageContent ? "Add the first one above." : "Tasks assigned in this meeting will appear here."}</span></div>}
           {taskGroups.map((group) => <section className="mn-task-group" key={group.id}>
             <h4><i style={{ "--av": avatarColor(group.id) }}>{group.id === "unassigned" ? "?" : initials(group.name)}</i>{group.name}<small>{group.tasks.filter((task) => task.status === "Completed").length}/{group.tasks.length} done</small></h4>

@@ -51,6 +51,7 @@ const clearSession = () => {
   try {
     localStorage.removeItem("rw-key");
     localStorage.removeItem(WORKSPACE_CACHE);
+    localStorage.removeItem(NAV_COUNTS);
     localStorage.removeItem("rw-platform-cache");
     Object.keys(localStorage).filter((name) => name.startsWith("rw-chat-cache:")).forEach((name) => localStorage.removeItem(name));
   } catch {}
@@ -73,6 +74,18 @@ const writeWorkspaceCache = (sessionKey, data) => {
     const { ok, status, audit, ...rest } = data;
     localStorage.setItem(WORKSPACE_CACHE, JSON.stringify({ sessionKey, data: { ...rest, audit: [] } }));
   } catch {}
+};
+// The sidebar counts (meetings this month, attachments, activity, tickets by type) as last seen, so a
+// fresh visit shows them at once instead of 0 until each screen has been opened.
+const NAV_COUNTS = "rw-nav-counts";
+const readNavCounts = (sessionKey, projectId) => {
+  try {
+    const cached = JSON.parse(localStorage.getItem(NAV_COUNTS) || "null");
+    return cached && cached.sessionKey === sessionKey && cached.projectId === projectId ? cached.counts : null;
+  } catch { return null; }
+};
+const writeNavCounts = (sessionKey, projectId, counts) => {
+  try { localStorage.setItem(NAV_COUNTS, JSON.stringify({ sessionKey, projectId, counts })); } catch {}
 };
 // Screens that load on demand, fetched in the background once the app is idle so that opening them
 // later is instant instead of showing a loading placeholder.
@@ -318,6 +331,8 @@ export default function Page() {
   const [tickets, setTickets] = useState([]);
   const [ticketOffset, setTicketOffset] = useState(0);
   const [ticketTotal, setTicketTotal] = useState(0);
+  // Issues / features across every ticket page; null while all tickets are loaded (counted locally).
+  const [ticketTypeTotals, setTicketTypeTotals] = useState(null);
   const [ticketHasMore, setTicketHasMore] = useState(false);
   const [ticketPageLoading, setTicketPageLoading] = useState(false);
   const [members, setMembers] = useState([]);
@@ -429,6 +444,22 @@ export default function Page() {
       setMe(data.me); setIsPlatformAdmin(!!data.isPlatformAdmin); setCanUseMeetings(data.canUseMeetings === undefined ? data.me.role !== "Client" : data.canUseMeetings); setCanManageMeetings(!!data.canManageMeetings); setMeetingEditAccess(!!data.meetingEditAccess); setMeetingEditAccessExpiresAt(data.meetingEditAccessExpiresAt || null); setMeetingEditRequests(data.meetingEditRequests || []); setGoogleCalendarConfigured(!!data.googleCalendarConfigured); setGoogleCalendarConnected(!!data.googleCalendarConnected); setGoogleCalendarEmail(data.googleCalendarEmail || ""); setNameAliases(data.nameAliases || {}); setProjects(data.projects || []); setOrganizations(data.organizations || []); setProjectId(data.projectId); localStorage.setItem("rw-project", data.projectId);
       setTickets(data.tickets); setTicketOffset(data.ticketPagination?.offset || 0); setTicketTotal(data.ticketPagination?.total ?? data.tickets.length); setTicketHasMore(!!data.ticketPagination?.hasMore); setMembers(data.members); setInvites(data.invites || []);
   }, []);
+  // The real totals behind the sidebar counts, read in the background. The screens themselves load
+  // only one page (or one month), so counting what is loaded would show 0 or at most a page.
+  const refreshNavCounts = useCallback(async (k, pid, { role, canMeet, allTicketsLoaded }) => {
+    if (!k || !pid || role === "Client") return;
+    const month = monthKey(liveRef.current?.meetingMonth || new Date());
+    const total = (r) => r.pagination?.total ?? 0;
+    await Promise.all([
+      api("files?offset=0&limit=1", null, k, pid).then((r) => { if (r.ok) setFileTotal(total(r)); }),
+      role === "Admin" ? api("activity?offset=0&limit=1", null, k, pid).then((r) => { if (r.ok) setAuditTotal(total(r)); }) : null,
+      canMeet ? api(`meetings?month=${month}&offset=0&limit=1`, null, k, pid).then((r) => { if (r.ok) setMeetingTotal(total(r)); }) : null,
+      allTicketsLoaded ? setTicketTypeTotals(null) : api("analytics", null, k, pid).then((r) => {
+        if (!Array.isArray(r.tickets)) return;
+        setTicketTypeTotals({ issue: r.tickets.filter((t) => t.type === "issue").length, feature: r.tickets.filter((t) => t.type === "feature").length });
+      }),
+    ].filter(Boolean)).catch(() => {});
+  }, []);
   const load = useCallback(async (k, requestedProject) => {
     const selectedProject = requestedProject || localStorage.getItem("rw-project") || "";
     localStorage.setItem("rw-ticket-offset", "0");
@@ -471,9 +502,18 @@ export default function Page() {
     function applyDb(data, { fromCache = false } = {}) {
       if (!fromCache) { writeWorkspaceCache(k, data); preloadScreens(!!data.isPlatformAdmin); }
       applyWorkspace(data);
-      setView((v) => data.me.role === "Client" && v !== "account" ? "portal" : v); setAcct({ name: data.me.name, phone: data.me.phone || "", current: "", password: "", confirm: "" }); setAudit(data.audit || []); setAuditOffset(0); setAuditTotal(data.audit.length); setAuditHasMore(false); setFiles(data.files || []); setFileOffset(0); setFileTotal(data.files.length); setFileHasMore(false); setScreen("app");
+      const counts = readNavCounts(k, data.projectId);
+      setView((v) => data.me.role === "Client" && v !== "account" ? "portal" : v); setAcct({ name: data.me.name, phone: data.me.phone || "", current: "", password: "", confirm: "" }); setAudit(data.audit || []); setAuditOffset(0); setAuditTotal(counts?.audit ?? data.audit.length); setAuditHasMore(false); setFiles(data.files || []); setFileOffset(0); setFileTotal(counts?.files ?? data.files.length); setFileHasMore(false); setScreen("app");
+      setMeetingTotal(counts?.meetings ?? 0); setTicketTypeTotals(counts?.ticketTypes ?? null);
+      if (!fromCache) refreshNavCounts(k, data.projectId, {
+        role: data.me.role, canMeet: data.canUseMeetings === undefined ? data.me.role !== "Client" : !!data.canUseMeetings,
+        allTicketsLoaded: (data.ticketPagination?.total ?? data.tickets.length) <= data.tickets.length,
+      });
     }
-  }, []);
+  }, [refreshNavCounts]);
+  useEffect(() => {
+    if (screen === "app" && key && projectId) writeNavCounts(key, projectId, { files: fileTotal, audit: auditTotal, meetings: meetingTotal, ticketTypes: ticketTypeTotals });
+  }, [screen, key, projectId, fileTotal, auditTotal, meetingTotal, ticketTypeTotals]);
   useEffect(() => {
     const sp = new URLSearchParams(location.search), t = sp.get("invite");
     if (sp.get("reset")) { setScreen("reset"); return; }
@@ -515,7 +555,7 @@ export default function Page() {
   // Every 5 seconds (while the tab is visible) ask the server for the project's change version. When
   // someone changes anything, quietly reload what is on screen; nobody has to press refresh.
   const liveRef = useRef({});
-  liveRef.current = { key, projectId, view, ticketOffset, fileOffset, auditOffset, meetingOffset, meetingMonth, meetingSelected, role: me?.role, meId: me?.id, members };
+  liveRef.current = { key, projectId, view, ticketOffset, fileOffset, auditOffset, meetingOffset, meetingMonth, meetingSelected, role: me?.role, meId: me?.id, members, canUseMeetings };
   const silentRefresh = useCallback(async () => {
     const c = liveRef.current;
     if (!c.key || !c.projectId) return;
@@ -523,6 +563,8 @@ export default function Page() {
     if (!r.ok || !r.me || r.projectId !== c.projectId || liveRef.current.projectId !== c.projectId) return;
     writeWorkspaceCache(c.key, r);
     applyWorkspace(r);
+    // Someone added a meeting, file or ticket: keep the sidebar counts right on every screen.
+    refreshNavCounts(c.key, c.projectId, { role: c.role, canMeet: c.canUseMeetings, allTicketsLoaded: (r.ticketPagination?.total ?? r.tickets.length) <= r.tickets.length });
     if (c.view === "files") {
       const f = await api(`files?offset=${c.fileOffset}&limit=100`, null, c.key, c.projectId);
       if (f.ok) { setFiles(f.files || []); setFileTotal(f.pagination?.total ?? (f.files || []).length); setFileHasMore(!!f.pagination?.hasMore); }
@@ -535,7 +577,7 @@ export default function Page() {
       const m = await api(`meetings?month=${monthKey(c.meetingMonth)}&offset=${c.meetingOffset}&limit=100`, null, c.key, c.projectId);
       if (m.ok && !liveRef.current.meetingSelected) { setMeetings(m.meetings || []); setMeetingTotal(m.pagination?.total ?? (m.meetings || []).length); setMeetingHasMore(!!m.pagination?.hasMore); }
     }
-  }, [applyWorkspace]);
+  }, [applyWorkspace, refreshNavCounts]);
   useEffect(() => {
     if (screen !== "app" || !key || !projectId) return;
     let stopped = false, busy = false, last = "", timer;
@@ -1508,7 +1550,7 @@ export default function Page() {
             setRecordingTranscript(""); setRecordingCards([]); setRecordingNoteId(""); setRecordingSaved(false); setMeetingError(""); setMeetingNotice("");
           }
           setView(k);
-        }}>{l}{k === "platform" ? null : k === "chat" ? chatUnread > 0 && <em className="nav-unread">{chatUnread > 9 ? "9+" : chatUnread}</em> : k !== "meeting-notes" && <em>{k === "files" ? fileTotal : k === "activity" ? auditTotal : k === "team" ? members.length : k === "meetings" ? meetingTotal : tickets.filter((t) => k === "all" || k === "portal" || t.type === k).length}</em>}</button>))}
+        }}>{l}{k === "platform" ? null : k === "chat" ? chatUnread > 0 && <em className="nav-unread">{chatUnread > 9 ? "9+" : chatUnread}</em> : k !== "meeting-notes" && <em>{k === "files" ? fileTotal : k === "activity" ? auditTotal : k === "team" ? members.length : k === "meetings" ? meetingTotal : k === "all" ? (ticketTypeTotals ? ticketTotal : tickets.length) : ticketTypeTotals && (k === "issue" || k === "feature") ? ticketTypeTotals[k] : tickets.filter((t) => k === "portal" || t.type === k).length}</em>}</button>))}
         <button className={"nav ghost " + (view === "account" ? "on" : "")} onClick={() => { setAmsg(""); setView("account"); }}>My account</button>
         <button className="nav ghost" onClick={async () => { await api("logout", {}, key); clearSession(); location.reload(); }}>Sign out</button>
       </aside>

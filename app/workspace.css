@@ -156,6 +156,10 @@ th.ra-h{text-align:right}
 .mn-member-fields label{display:grid;gap:5px;font-size:12px;font-weight:600;color:var(--ink-2)}
 .mn-member-fields textarea{width:100%;resize:vertical;font-size:13px}
 .mn-add-task{display:grid;grid-template-columns:minmax(0,2fr) repeat(2,minmax(0,1fr)) minmax(0,1.3fr) auto;gap:8px;padding:12px;border-radius:12px;background:var(--card-2);border:1px dashed var(--line-2)}
+.mn-detail>.mn-add-task{margin:12px 0 4px}
+.mn-add-task-label{grid-column:1/-1;font-size:12.5px;color:var(--ink-2)}
+.mn-member-assign{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:0 12px 12px}
+.mn-member-assign small{color:var(--mut);font-size:12px}
 .mn-task-group{display:grid;gap:8px}
 .mn-task-group h4{display:flex;align-items:center;gap:8px;margin:4px 0 0}
 .mn-task-group h4 small{margin-left:auto;color:var(--mut);font-size:11.5px;font-weight:600}
@@ -198,7 +202,7 @@ input.mn-task-title:focus{border-color:var(--pri)!important;background:#fff!impo
   .mn-back{display:inline-flex}
   .mn-layout:not(.has-selection) .mn-placeholder{display:none}
   .mn-add-task{grid-template-columns:repeat(2,minmax(0,1fr))}
-  .mn-add-task>input:first-child{grid-column:1/-1}
+  .mn-add-task>input:first-of-type{grid-column:1/-1}
   .mn-member-fields{grid-template-columns:minmax(0,1fr)}
 }
 @media(max-width:480px){.mn-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.mn-month label{min-width:0;flex:1}}
