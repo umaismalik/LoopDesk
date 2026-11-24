@@ -2,15 +2,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import dynamic from "next/dynamic";
-import { correctTurnNames, generateEnglishKeyPoints, generateMeetingParticipantCards } from "../lib/local-transcription";
-import { formatAiNotes } from "../lib/cloud-transcription";
+import { generateEnglishKeyPoints, generateMeetingParticipantCards } from "../lib/local-transcription";
+import { cloudTranscriptionStatus } from "../lib/cloud-transcription";
+import { LiveTranscription, mergeCards } from "../lib/live-transcription";
+import { deleteSession, listSessions } from "../lib/recording-store";
 import Dashboard from "./dashboard";
 import { ATTACHMENT_ACCEPT, ATTACHMENT_HINT, attachmentError, DESCRIPTION_CHAR_LIMIT, DESCRIPTION_WORD_LIMIT, descriptionError, wordCount } from "../lib/limits";
 
 // Each screen's code downloads only when that screen is first opened, so sign-in and the dashboard
 // start with a much smaller bundle.
 const screenLoading = () => <div className="screen-loading" aria-busy="true" />;
-const LocalTranscriber = dynamic(() => import("../components/LocalTranscriber"), { ssr: false });
 const MeetingNotes = dynamic(() => import("../components/MeetingNotes"), { ssr: false, loading: screenLoading });
 const ActivityLog = dynamic(() => import("../components/ActivityLog"), { ssr: false, loading: screenLoading });
 const TeamChat = dynamic(() => import("../components/TeamChat"), { ssr: false, loading: screenLoading });
@@ -99,14 +100,16 @@ const preloadScreens = (platformAdmin) => {
   if (typeof requestIdleCallback === "function") requestIdleCallback(run, { timeout: 4000 });
   else setTimeout(run, 1500);
 };
+// A recording clip's preview URLs (one per recording file).
+const revokeClip = (clip) => (clip.urls || (clip.url ? [clip.url] : [])).forEach((url) => URL.revokeObjectURL(url));
 const mergeVoiceCards = (existing, incoming) => {
   const cards = new Map(existing.map((card) => [card.memberId, card]));
   incoming.forEach((card) => {
     const previous = cards.get(card.memberId);
     cards.set(card.memberId, {
       ...previous, ...card,
-      points: [...new Set([...(previous?.points || []), ...(card.points || [])])].slice(0, 10),
-      tasks: [...new Set([...(previous?.tasks || []), ...(card.tasks || [])])].slice(0, 10),
+      points: [...new Set([...(previous?.points || []), ...(card.points || [])])].slice(0, 20),
+      tasks: [...new Set([...(previous?.tasks || []), ...(card.tasks || [])])].slice(0, 20),
       priority: card.priority || previous?.priority || "Medium",
     });
   });
@@ -408,8 +411,10 @@ export default function Page() {
   const [isPlatformAdmin, setIsPlatformAdmin] = useState(false);
   const [hasRecordedVoiceNote, setHasRecordedVoiceNote] = useState(false);
   const [transcriptionProgress, setTranscriptionProgress] = useState("");
-  const [pendingRecording, setPendingRecording] = useState(null);
-  const [failedRecording, setFailedRecording] = useState(null);
+  // How this project transcribes ({ mode: "cloud" | "device", ai, offline }) and recordings saved in this
+  // browser that were never finished or saved (closed tab, crash), which can be recovered.
+  const [transcriptionInfo, setTranscriptionInfo] = useState(null);
+  const [savedRecordings, setSavedRecordings] = useState([]);
   const [recordingClips, setRecordingClips] = useState([]);
   const [recordingTranscript, setRecordingTranscript] = useState("");
   const [recordingSaved, setRecordingSaved] = useState(false);
@@ -418,7 +423,6 @@ export default function Page() {
   const [conferenceJoined, setConferenceJoined] = useState(false);
   // Shared notes stay out of the way until the meeting actually starts (join or record) or already has notes.
   const [meetingNotesOpen, setMeetingNotesOpen] = useState(false);
-  const recorderRef = useRef(null);
   const recordingStreamRef = useRef(null);
   const recordingTimerRef = useRef(null);
   const handleMeetingAccessChange = useCallback((canEdit, expiresAt, requests) => {
@@ -430,11 +434,19 @@ export default function Page() {
   const recordingNotesStartRef = useRef(null);
   // Shared notes written by the AI for this recording session (empty when the on-device model was used).
   const aiNotesRef = useRef("");
+  // The live transcription of the clip being recorded (lib/live-transcription.js).
+  const liveRecordingRef = useRef(null);
+  // The card the recorder last clicked: speech goes to that member until someone else is addressed.
+  const manualFocusRef = useRef("");
+  // What the live transcription last put into the cards and shared notes, so each update replaces it
+  // without touching what people typed themselves.
+  const liveAppliedRef = useRef({ transcriptBase: "", cardsBase: [], aiBase: "", cards: [], notes: "" });
   useEffect(() => { recordingClipsRef.current = recordingClips; }, [recordingClips]);
-  useEffect(() => () => recordingClipsRef.current.forEach((clip) => URL.revokeObjectURL(clip.url)), []);
+  useEffect(() => () => recordingClipsRef.current.forEach(revokeClip), []);
   useEffect(() => () => {
     clearInterval(recordingTimerRef.current);
-    if (recorderRef.current && recorderRef.current.state !== "inactive") recorderRef.current.stop();
+    // The recording stays saved in this browser and can be recovered from the Meetings screen.
+    liveRecordingRef.current?.stream?.getTracks().forEach((track) => track.stop());
     recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
   }, []);
 
@@ -652,7 +664,7 @@ export default function Page() {
     return () => clearTimeout(timer);
   }, [meetingEditAccessExpiresAt]);
   useEffect(() => {
-    if (view === "meetings" || recordingState !== "idle" || !meetingSelected) return;
+    if (view === "meetings" || recordingState !== "idle" || !meetingSelected || (recordingClips.length && !recordingSaved)) return;
     setMeetingSelected(null);
     setMeetingDraft("");
     setParticipantSummaries([]);
@@ -661,7 +673,7 @@ export default function Page() {
     setRecordingCards([]);
     setMeetingError("");
     setMeetingNotice("");
-  }, [view, recordingState, meetingSelected]);
+  }, [view, recordingState, meetingSelected, recordingClips.length, recordingSaved]);
   // Meeting edit-access requests and approvals need no polling of their own: every request or
   // approval changes the project version, and the 5-second live pulse then refreshes the workspace,
   // which carries the requests, the grant and its expiry.
@@ -997,10 +1009,10 @@ export default function Page() {
   // Recording or unsaved clips pin the user to the open meeting so captured audio is not lost.
   const meetingLocked = recordingState !== "idle" || (!!recordingClips.length && !recordingSaved);
   const resetMeetingSession = () => {
-    setRecordingTranscript(""); recordingClips.forEach((clip) => URL.revokeObjectURL(clip.url)); setRecordingClips([]);
+    setRecordingTranscript(""); recordingClips.forEach(revokeClip); setRecordingClips([]);
     setRecordingSaved(false); setRecordingNoteId(""); setRecordingCards([]); setConferenceJoined(false);
     setMeetingError(""); setMeetingNotice(""); setMeetingVoiceError(""); setHasRecordedVoiceNote(false);
-    setRecordingSeconds(0); setFailedRecording(null);
+    setRecordingSeconds(0); aiNotesRef.current = "";
   };
   const openMeeting = (meeting) => {
     if (meetingLocked) return;
@@ -1008,6 +1020,7 @@ export default function Page() {
     const cards = meetingCards(meeting, members);
     setMeetingSelected(meeting); setMeetingDraft(meeting.notes || ""); setParticipantSummaries(cards);
     setSelectedMeetingMemberId(cards[0]?.memberId || ""); setMeetingCardView("selected");
+    manualFocusRef.current = cards[0]?.memberId || "";
     setMeetingNotesOpen(!!String(meeting.notes || "").trim());
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
@@ -1024,18 +1037,95 @@ export default function Page() {
     else if (meeting.googleCalendarEventId) setMeetingNotice("Meeting deleted and removed from Google Calendar; participants were notified of the cancellation.");
     setMeetingSelected(null); setMeetingDraft(""); await refreshMeetings();
   };
-  const runRecordingClock = (recorder) => {
+  const MAX_RECORDING_SECONDS = 2 * 3600;
+  const runRecordingClock = () => {
     clearInterval(recordingTimerRef.current);
     recordingTimerRef.current = setInterval(() => {
-      setRecordingSeconds((seconds) => {
-        if (seconds + 1 >= 3600) {
-          clearInterval(recordingTimerRef.current);
-          if (recorder.state !== "inactive") recorder.stop();
-          return 3600;
-        }
-        return seconds + 1;
-      });
+      const live = liveRecordingRef.current;
+      if (!live || live.paused) return;
+      setRecordingSeconds(live.seconds);
+      if (live.seconds >= MAX_RECORDING_SECONDS) finishMeetingRecording("The recording reached the 2-hour limit and was finished. Start another clip to keep recording.");
     }, 1000);
+  };
+  // Team members with their extra name spellings, for the speech model and card routing.
+  const voiceAttendees = useMemo(() => meetingVoiceAttendees(members, me).map((member) => ({ ...member, aliases: nameAliases[member.id] || [] })), [members, me, nameAliases]);
+  // Shows a member's card because their name was heard; unlike a click it does not change who the
+  // recorder says is speaking.
+  const showMemberTurn = useCallback((memberId) => {
+    if (!memberId) return;
+    const member = members.find((item) => item.id === memberId) || (me?.id === memberId ? me : null);
+    if (!member) return;
+    setParticipantSummaries((items) => items.some((item) => item.memberId === memberId)
+      ? items
+      : [...items, { memberId, name: member.name, points: [], tasks: [], description: "", priority: "Medium" }]);
+    setSelectedMeetingMemberId(memberId);
+    setMeetingCardView("selected");
+  }, [members, me]);
+  // Puts the live transcript, notes and cards on screen. Each update replaces the previous update's
+  // lines; anything people typed into the cards or notes meanwhile is kept.
+  const applyLiveView = useCallback((view) => {
+    const applied = liveAppliedRef.current;
+    const previousCards = applied.cards, previousNotes = applied.notes;
+    applied.cards = view.cards; applied.notes = view.notes;
+    setRecordingTranscript([applied.transcriptBase, view.transcript].filter(Boolean).join("\n\n"));
+    setRecordingCards(mergeCards([applied.cardsBase, view.cards]));
+    setParticipantSummaries((items) => mergeVoiceCards(items.map((card) => {
+      const old = previousCards.find((item) => item.memberId === card.memberId);
+      return old ? { ...card, points: (card.points || []).filter((line) => !old.points.includes(line)), tasks: (card.tasks || []).filter((line) => !old.tasks.includes(line)) } : card;
+    }), view.cards.map((card) => ({ ...card, priority: card.priority || "Medium" }))));
+    setMeetingDraft((draft) => {
+      const base = previousNotes && draft.includes(previousNotes) ? draft.replace(previousNotes, "").replace(/\n{3,}/g, "\n\n").trim() : draft.trimEnd();
+      return view.notes ? `${base ? `${base}\n\n` : ""}${view.notes}` : base;
+    });
+  }, []);
+  const liveOptions = () => ({
+    key, projectId, attendees: voiceAttendees,
+    focus: () => manualFocusRef.current,
+    onUpdate: applyLiveView,
+    onStatus: (text, info) => { setTranscriptionProgress(text); setTranscriptionInfo(info); },
+    onTurn: showMemberTurn,
+    onMicLost: () => finishMeetingRecording("The microphone stopped (for example the computer went to sleep). Everything recorded until then is being finished."),
+  });
+  // A new clip adds to the unsaved recording set; after a saved set it starts afresh.
+  const beginLiveClip = (fresh) => {
+    liveAppliedRef.current = fresh
+      ? { transcriptBase: "", cardsBase: [], aiBase: "", cards: [], notes: "" }
+      : { transcriptBase: recordingTranscript, cardsBase: recordingCards, aiBase: aiNotesRef.current, cards: [], notes: "" };
+  };
+  // A clip is finished: keep its recording files and final notes with the unsaved recording set.
+  const completeLiveClip = (live, result) => {
+    applyLiveView(result);
+    const applied = liveAppliedRef.current;
+    if (result.ai && result.notes) aiNotesRef.current = [applied.aiBase, result.notes].filter(Boolean).join("\n\n");
+    const clip = { id: live.id, audioFiles: result.audioFiles, urls: result.audioFiles.map((blob) => URL.createObjectURL(blob)), transcript: result.transcript || " " };
+    setRecordingClips((clips) => [...clips.filter((item) => item.id !== clip.id), clip]);
+    setHasRecordedVoiceNote(true);
+    setRecordingState("idle");
+    setTranscriptionProgress("");
+    liveRecordingRef.current = null;
+    if (!result.transcript.trim()) {
+      setMeetingVoiceError("No speech was recognised in this recording. Check that the microphone can hear the speakers, then record again.");
+    } else if (!result.cards.length) {
+      setMeetingNotice("Transcript added to shared meeting notes. To fill a member's card automatically, address them by name (for example \"Ali, tell me about your tasks\") or click their card while they speak.");
+    } else {
+      setMeetingNotice(`English notes ready. Filled ${result.cards.length === 1 ? "the card" : "cards"} for ${result.cards.map((card) => card.name).join(", ")}. Review them, then save: each filled card is emailed to its member.`);
+    }
+  };
+  const finishMeetingRecording = async (notice = "") => {
+    const live = liveRecordingRef.current;
+    if (!live || live.finishing) return;
+    clearInterval(recordingTimerRef.current);
+    setRecordingState("transcribing");
+    if (notice) setMeetingNotice(notice);
+    try {
+      completeLiveClip(live, await live.finish());
+    } catch (error) {
+      liveRecordingRef.current = null;
+      setRecordingState("idle");
+      setTranscriptionProgress("");
+      setMeetingVoiceError(`${error.message || "The recording could not be finished."} It is saved in this browser: use "Recover" above the calendar to finish it.`);
+      refreshSavedRecordings();
+    }
   };
   const startMeetingRecording = async () => {
     setMeetingNotesOpen(true);
@@ -1045,9 +1135,8 @@ export default function Page() {
     }
     setMeetingVoiceError("");
     setMeetingError("");
-    setFailedRecording(null);
     if (recordingSaved) {
-      recordingClips.forEach((clip) => URL.revokeObjectURL(clip.url));
+      recordingClips.forEach(revokeClip);
       setRecordingClips([]);
       setRecordingTranscript("");
       setRecordingCards([]);
@@ -1068,40 +1157,22 @@ export default function Page() {
       setMeetingVoiceError("Audio recording is not supported by this browser. Use an up-to-date browser such as Chrome or Edge.");
       return;
     }
+    let stream = null;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: { ideal: 1 }, echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: { ideal: 1 }, echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
       recordingStreamRef.current = stream;
-      const cleanup = () => {
-        stream.getTracks().forEach((track) => track.stop());
-        recorderRef.current = null;
-        recordingStreamRef.current = null;
-      };
-      const mime = ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/webm", "audio/mp4"].find((type) => MediaRecorder.isTypeSupported(type));
-      const recorder = new MediaRecorder(stream, { ...(mime ? { mimeType: mime } : {}), audioBitsPerSecond: 48000 }), chunks = [];
-      recorderRef.current = recorder;
-      recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
-      recorder.onerror = () => {
-        clearInterval(recordingTimerRef.current);
-        cleanup();
-        setRecordingState("idle"); setMeetingVoiceError("The browser could not record audio. Please try again.");
-      };
-      recorder.onstop = async () => {
-        clearInterval(recordingTimerRef.current);
-        cleanup();
-        const audio = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
-        if (!audio.size) { setRecordingState("idle"); setMeetingVoiceError("No audio was recorded."); return; }
-        const clip = { id: crypto.randomUUID(), audio, url: URL.createObjectURL(audio), transcript: "" };
-        setRecordingClips((clips) => [...clips, clip]);
-        setHasRecordedVoiceNote(true);
-        setFailedRecording(null);
-        setRecordingState("transcribing"); setTranscriptionProgress("Preparing transcription…"); setMeetingVoiceError("");
-        setPendingRecording(audio);
-      };
       if (recordingSaved || !recordingClips.length) recordingNotesStartRef.current = meetingDraft;
-      recorder.start(1000); setRecordingSeconds(0); setRecordingState("recording");
-      runRecordingClock(recorder);
+      manualFocusRef.current = selectedMeetingMemberId;
+      beginLiveClip(recordingSaved);
+      const live = new LiveTranscription({ ...liveOptions(), meeting: meetingSelected });
+      liveRecordingRef.current = live;
+      setTranscriptionProgress("Starting…");
+      await live.start(stream);
+      setRecordingSeconds(0); setRecordingState("recording");
+      runRecordingClock();
     } catch (error) {
-      recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+      liveRecordingRef.current = null;
+      stream?.getTracks().forEach((track) => track.stop());
       recordingStreamRef.current = null;
       const message = error.name === "NotAllowedError"
         ? "Microphone access was blocked. Allow microphone access for this site in your browser's address-bar settings, then try again. If the page is embedded, its host must also grant microphone access."
@@ -1115,79 +1186,67 @@ export default function Page() {
     }
   };
   const pauseMeetingRecording = () => {
-    if (recorderRef.current?.state !== "recording") return;
-    recorderRef.current.pause();
-    clearInterval(recordingTimerRef.current);
+    if (recordingState !== "recording" || !liveRecordingRef.current) return;
+    liveRecordingRef.current.pause();
     setRecordingState("paused");
   };
   const resumeMeetingRecording = () => {
-    if (recorderRef.current?.state !== "paused") return;
-    recorderRef.current.resume();
+    if (recordingState !== "paused" || !liveRecordingRef.current) return;
+    liveRecordingRef.current.resume();
     setRecordingState("recording");
-    runRecordingClock(recorderRef.current);
   };
-  const stopMeetingRecording = () => {
-    if (!recorderRef.current || recorderRef.current.state === "inactive") return;
-    clearInterval(recordingTimerRef.current);
-    recorderRef.current.stop();
-  };
-  // Team members with their extra name spellings, for the speech model and card routing.
-  const voiceAttendees = useMemo(() => meetingVoiceAttendees(members, me).map((member) => ({ ...member, aliases: nameAliases[member.id] || [] })), [members, me, nameAliases]);
-  const onTranscriptionComplete = useCallback((text, ai) => {
-    const attendees = voiceAttendees;
-    // The AI already spells names from the roster; the on-device text gets the phonetic name fix.
-    const correctedText = ai ? text : correctTurnNames(text, attendees);
-    setMeetingVoiceError("");
-    setRecordingTranscript((transcript) => transcript ? `${transcript}\n\n${correctedText}` : correctedText);
-    const aiNotes = ai ? formatAiNotes(ai.notes) : "";
-    if (aiNotes) aiNotesRef.current = aiNotesRef.current ? `${aiNotesRef.current}\n\n${aiNotes}` : aiNotes;
-    const keyPoints = aiNotes || generateEnglishKeyPoints(correctedText);
-    if (keyPoints) setMeetingDraft((notes) => notes.trim() ? `${notes.trimEnd()}\n\n${keyPoints}` : keyPoints);
-    const cards = ai ? ai.cards : generateMeetingParticipantCards(correctedText, attendees, selectedMeetingMemberId);
-    if (cards.length) {
-      setParticipantSummaries((previous) => mergeVoiceCards(previous, cards));
-      setSelectedMeetingMemberId(cards[0].memberId);
-      setMeetingCardView("selected");
-    }
-    setRecordingCards((previous) => {
-      const merged = new Map(previous.map((card) => [card.memberId, card]));
-      cards.forEach((card) => {
-        const earlier = merged.get(card.memberId) || { ...card, points: [], tasks: [], priority: "Medium" };
-        merged.set(card.memberId, {
-          ...card,
-          points: [...new Set([...earlier.points, ...card.points])].slice(0, 20),
-          tasks: [...new Set([...earlier.tasks, ...card.tasks])].slice(0, 30),
-          priority: card.priority || earlier.priority || "Medium",
-        });
-      });
-      return [...merged.values()];
-    });
-    setRecordingClips((clips) => clips.map((clip) => clip.audio === pendingRecording ? { ...clip, transcript: correctedText } : clip));
-    if (!cards.length) {
-      setMeetingVoiceError("");
-      setMeetingNotice("Transcript added to shared meeting notes. To fill a member's card automatically, address them by name (for example \"Ali, tell me about your tasks\") or select their card before recording.");
-    } else {
-      setMeetingNotice(`English notes ready. Filled ${cards.length === 1 ? "the card" : "cards"} for ${cards.map((card) => card.name).join(", ")}${ai ? "" : " from the names heard in the recording"}. Review them, then save: each filled card is emailed to its member.`);
-    }
-    setRecordingState("idle");
-    setTranscriptionProgress("");
-    setFailedRecording(null);
-    setPendingRecording(null);
-  }, [key, meetingSelected, pendingRecording, projectId, voiceAttendees, selectedMeetingMemberId]);
-  const onTranscriptionError = useCallback((message) => {
-    setMeetingVoiceError(message);
-    setRecordingState("idle");
-    setTranscriptionProgress("");
-    setFailedRecording(pendingRecording);
-    setPendingRecording(null);
-  }, [pendingRecording]);
-  const retryLastTranscription = () => {
-    if (!failedRecording) return;
-    setMeetingVoiceError("");
-    setFailedRecording(null);
-    setTranscriptionProgress("Retrying transcription…");
+  const stopMeetingRecording = () => finishMeetingRecording();
+  // Recordings this browser still holds for the project that were never finished or saved.
+  const refreshSavedRecordings = useCallback(() => {
+    if (!projectId) return;
+    listSessions(projectId).then((sessions) => setSavedRecordings(sessions.filter((session) =>
+      session.id !== liveRecordingRef.current?.id && !recordingClipsRef.current.some((clip) => clip.id === session.id))));
+  }, [projectId]);
+  useEffect(() => {
+    if (view === "meetings" && recordingState === "idle") refreshSavedRecordings();
+  }, [view, recordingState, projectId, refreshSavedRecordings]);
+  // Whether the server transcribes (fast, accurate) or this computer does, shown before recording.
+  useEffect(() => {
+    if (view !== "meetings" || !key || !projectId) return;
+    let cancelled = false;
+    cloudTranscriptionStatus(key, projectId).then((status) => { if (!cancelled) setTranscriptionInfo((info) => info?.offline ? info : { mode: status.speech ? "cloud" : "device", ai: status.ai, offline: false, keyError: status.speechError || status.aiError || "" }); });
+    return () => { cancelled = true; };
+  }, [view, key, projectId]);
+  // Closing or reloading the tab while recording would stop it: ask first.
+  useEffect(() => {
+    if (recordingState === "idle" && !(recordingClips.length && !recordingSaved)) return;
+    const warn = (event) => { event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [recordingState, recordingClips.length, recordingSaved]);
+  const recoverRecording = async (saved) => {
+    if (meetingLocked || liveRecordingRef.current) { setMeetingError("Save or cancel the current recording before recovering another one."); return; }
+    if (meetingSelected?.id !== saved.meeting?.id || meetingSelected?.occurrenceDate !== saved.meeting?.occurrenceDate) openMeeting(saved.meeting);
+    else resetMeetingSession();
+    setMeetingNotesOpen(true);
+    setSavedRecordings((items) => items.filter((item) => item.id !== saved.id));
+    liveAppliedRef.current = { transcriptBase: "", cardsBase: [], aiBase: "", cards: [], notes: "" };
+    recordingNotesStartRef.current = saved.meeting?.notes || "";
     setRecordingState("transcribing");
-    setPendingRecording(failedRecording);
+    setTranscriptionProgress("Recovering the saved recording…");
+    try {
+      const live = await LiveTranscription.recover(saved.id, liveOptions());
+      liveRecordingRef.current = live;
+      setRecordingSeconds(saved.seconds || 0);
+      completeLiveClip(live, await live.finish());
+      setMeetingNotice("The saved recording was recovered and transcribed. Review the notes and cards, then save the recording as a note.");
+    } catch (error) {
+      liveRecordingRef.current = null;
+      setRecordingState("idle");
+      setTranscriptionProgress("");
+      setMeetingVoiceError(error.message || "The saved recording could not be recovered.");
+      refreshSavedRecordings();
+    }
+  };
+  const discardSavedRecording = async (saved) => {
+    if (!confirm(`Delete the unsaved recording of "${saved.meeting?.title || "a meeting"}" from this browser? This cannot be undone.`)) return;
+    await deleteSession(saved.id);
+    refreshSavedRecordings();
   };
   const shareParticipantSummary = async (card) => {
     if (!meetingSelected || !canEditMeetingContent || sharingParticipantIds.includes(card.memberId)) return;
@@ -1225,7 +1284,8 @@ export default function Page() {
     }
   };
   const cancelRecordingNotes = () => {
-    recordingClips.forEach((clip) => URL.revokeObjectURL(clip.url));
+    if (!confirm("Discard this recording and its notes? This cannot be undone.")) return;
+    recordingClips.forEach((clip) => { revokeClip(clip); deleteSession(clip.id); });
     if (recordingNotesStartRef.current !== null) setMeetingDraft(recordingNotesStartRef.current);
     recordingNotesStartRef.current = null;
     aiNotesRef.current = "";
@@ -1234,8 +1294,6 @@ export default function Page() {
     setRecordingCards([]);
     setRecordingSaved(false);
     setRecordingNoteId("");
-    setFailedRecording(null);
-    setPendingRecording(null);
     setMeetingVoiceError("");
     setMeetingError("");
     setMeetingNotice("Unsaved recording notes were discarded. You can start a new recording.");
@@ -1261,17 +1319,20 @@ export default function Page() {
         noteId = result.note.id;
         setRecordingNoteId(noteId);
       }
-      for (const [clipIndex, clip] of recordingClips.entries()) {
+      // Each clip is kept as files of up to 10 minutes, uploaded one after another.
+      const files = recordingClips.flatMap((clip) => clip.audioFiles);
+      for (const [clipIndex, file] of files.entries()) {
         const formData = new FormData();
         formData.append("noteId", noteId);
         formData.append("clipIndex", String(clipIndex));
-        formData.append("file", clip.audio, `meeting-recording-${clipIndex + 1}.webm`);
+        formData.append("file", file, `meeting-recording-${clipIndex + 1}.${file.type.includes("ogg") ? "ogg" : file.type.includes("mp4") ? "mp4" : "webm"}`);
         const upload = await api("meeting-recording", formData, key, projectId);
         if (!upload.ok) {
-          setMeetingNotice(`Notes saved, but recording clip ${clipIndex + 1} could not be uploaded: ` + (upload.error || "Unknown error"));
+          setMeetingNotice(`Notes saved, but recording part ${clipIndex + 1} of ${files.length} could not be uploaded: ` + (upload.error || "Unknown error") + ". Press Save again to retry.");
           return;
         }
       }
+      recordingClips.forEach((clip) => deleteSession(clip.id));
       setRecordingSaved(true);
       const emailFailures = (result.summaryEmailsFailed || 0) + (result.taskEmailsFailed || 0);
       if (emailFailures) {
@@ -1355,6 +1416,7 @@ export default function Page() {
       : [...items, { memberId, name: member.name, points: [], tasks: [], description: "", priority: "Medium" }]);
     setSelectedMeetingMemberId(memberId);
     setMeetingCardView("selected");
+    manualFocusRef.current = memberId;
   };
   const updateRecordingCard = (card, changes) => {
     const updated = { ...card, ...changes };
@@ -1575,6 +1637,12 @@ export default function Page() {
         </header>}
 
         {view === "meetings" ? (<section className="meeting-page">
+          {!!savedRecordings.length && recordingState === "idle" && <div className="meeting-recovery" role="status">
+            {savedRecordings.map((saved) => <div key={saved.id}>
+              <div><b>Unsaved recording found</b><span>{saved.meeting?.title || "Meeting"} · {new Date(saved.startedAt).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })} · about {Math.max(1, Math.round((saved.seconds || 0) / 60))} min. It was not finished or saved (the tab was closed, the computer restarted or the connection dropped). It is still on this computer.</span></div>
+              <div><button className="btn" disabled={!["Admin", "Collaborator"].includes(me.role)} onClick={() => recoverRecording(saved)}>Recover and finish</button><button className="btn alt" onClick={() => discardSavedRecording(saved)}>Discard</button></div>
+            </div>)}
+          </div>}
           {!meetingSelected && <>
           <div className="meeting-hero">
             <div><span className="meeting-eyebrow">TEAM WORKSPACE</span><h2>One place for every team meeting</h2><p>Plan shared meetings, capture decisions, and keep follow-ups in one place across all projects.</p></div>
@@ -1681,7 +1749,6 @@ export default function Page() {
           </div>
           </>}
           {meetingSelected && <div className="meeting-workspace">
-            {pendingRecording && <LocalTranscriber audio={pendingRecording} names={voiceAttendees} model="best" keyValue={key} projectId={projectId} selectedMemberId={selectedMeetingMemberId} onProgress={setTranscriptionProgress} onComplete={onTranscriptionComplete} onError={onTranscriptionError} />}
             <header className="panel meeting-workspace-head">
               <button type="button" className="btn alt meeting-back" disabled={meetingLocked} title={meetingLocked ? "Finish or save the recording first" : undefined} onClick={closeMeeting}>← Calendar</button>
               <div className="meeting-workspace-title">
@@ -1696,7 +1763,7 @@ export default function Page() {
             {!["Admin", "Collaborator"].includes(me.role) && meetingEditAccess && meetingEditAccessExpiresAt && <div className="meeting-access-banner active"><div><b>Temporary edit access is active</b><span>Expires {new Date(meetingEditAccessExpiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.</span></div></div>}
             <div className="meeting-workspace-grid">
               <div className="meeting-workspace-main">
-                {!!recordingTranscript && <label className="meeting-transcript-review">English transcript (AI-generated; review and correct before sharing)<textarea disabled={!canEditMeetingContent} rows="6" value={recordingTranscript} onChange={(event) => {
+                {!!recordingTranscript && <label className="meeting-transcript-review">English transcript (AI-generated; review and correct before sharing)<textarea disabled={!canEditMeetingContent || recordingState !== "idle"} rows="6" value={recordingTranscript} onChange={(event) => {
                   const transcript = event.target.value;
                   setRecordingTranscript(transcript);
                   if (aiNotesRef.current) return;
@@ -1715,16 +1782,16 @@ export default function Page() {
                   <h3>Member notes from this recording <small>Check the speaker and correct these AI-generated notes before sharing. Only the card you choose is emailed to that member.</small></h3>
                   <div className="meeting-summary-grid">{recordingCards.map((card) => <article className="meeting-summary-card" key={card.memberId}>
                     <h4>{card.name}</h4>
-                    <label>Key points (one per line)<textarea disabled={!canEditMeetingContent} rows="4" value={card.points.join("\n")} onChange={(event) => updateRecordingCard(card, { points: event.target.value.split("\n") })} /></label>
-                    <label>Priority<select disabled={!canEditMeetingContent} value={card.priority || "Medium"} onChange={(event) => updateRecordingCard(card, { priority: event.target.value })}><option>High</option><option>Medium</option><option>Low</option></select></label>
-                    <label>Action items (one per line)<textarea disabled={!canEditMeetingContent} rows="3" value={card.tasks.join("\n")} onChange={(event) => updateRecordingCard(card, { tasks: event.target.value.split("\n") })} /></label>
+                    <label>Key points (one per line)<textarea disabled={!canEditMeetingContent || recordingState !== "idle"} rows="4" value={card.points.join("\n")} onChange={(event) => updateRecordingCard(card, { points: event.target.value.split("\n") })} /></label>
+                    <label>Priority<select disabled={!canEditMeetingContent || recordingState !== "idle"} value={card.priority || "Medium"} onChange={(event) => updateRecordingCard(card, { priority: event.target.value })}><option>High</option><option>Medium</option><option>Low</option></select></label>
+                    <label>Action items (one per line)<textarea disabled={!canEditMeetingContent || recordingState !== "idle"} rows="3" value={card.tasks.join("\n")} onChange={(event) => updateRecordingCard(card, { tasks: event.target.value.split("\n") })} /></label>
                     <button className="btn" disabled={!canEditMeetingContent || meetingBusy || recordingState !== "idle" || sharingParticipantIds.includes(card.memberId) || (!card.points.length && !card.tasks.length)} onClick={() => shareParticipantSummary(card)}>
                       {sharingParticipantIds.includes(card.memberId) ? "Sharing…" : `Share ${card.name}'s notes by email`}
                     </button>
                   </article>)}</div>
                 </section>}
                 <section className="meeting-summary-cards" aria-label="Team member updates and upcoming tasks">
-                  <div className="meeting-cards-heading"><h3>Team task cards <small>Say a member's name to route their update automatically, or click a card before recording to use it as the default. Clicking alone does not add or change any notes.</small></h3>
+                  <div className="meeting-cards-heading"><h3>Team task cards <small>While recording, a member's card opens and fills when their name is called ("Sami, your update?"). You can also click a member's card while they speak: what is said from then on goes to that card.</small></h3>
                     <div className="meeting-member-controls">
                       <button type="button" className="btn alt" onClick={() => moveMeetingMember(-1)} disabled={!members.some((member) => member.status === "active" && member.role !== "Client")}>‹ Previous</button>
                       <button type="button" className="btn alt" onClick={() => moveMeetingMember(1)} disabled={!members.some((member) => member.status === "active" && member.role !== "Client")}>Next member ›</button>
@@ -1743,6 +1810,7 @@ export default function Page() {
                     return <article className={"meeting-summary-card" + (selectedMeetingMemberId === card.memberId ? " selected-member-card" : "")} key={card.memberId} style={{ "--member-accent": MEMBER_CARD_COLORS[(memberIndex < 0 ? 0 : memberIndex) % MEMBER_CARD_COLORS.length] }} onClick={(event) => {
                       if (meetingCardView === "all" && !event.target.closest("input,textarea,select,button,label")) {
                         setSelectedMeetingMemberId(card.memberId);
+                        manualFocusRef.current = card.memberId;
                         setMeetingCardView("selected");
                       }
                     }}>
@@ -1781,8 +1849,11 @@ export default function Page() {
                 <section className="panel meeting-side-card meeting-recorder" aria-label="Recording">
                   <h3>Recording</h3>
                   <div className="meeting-note-tools">
-                    <p className="meeting-invite-hint">Speak in Urdu, English or a mix — notes are written in English. To fill a member's card automatically, address them by name: "Ali, apne tasks batao" / "Ali, your update".</p>
-                    {recordingState === "idle" && !failedRecording && (!recordingNoteId || recordingSaved) && <button className="btn meeting-record-button" disabled={!["Admin", "Collaborator"].includes(me.role)} onClick={startMeetingRecording}>{hasRecordedVoiceNote ? "Record another clip" : "Start microphone recording"}</button>}
+                    <p className="meeting-invite-hint">Speak in Urdu, English or a mix — notes are written in English while you speak. Call a member by name ("Ali, apne tasks batao" / "Ali, your update") or click their card, and their card fills.</p>
+                    {transcriptionInfo?.keyError && me.role === "Admin" && <p className="meeting-transcription-warning">{transcriptionInfo.keyError} Fix it in the hosting settings and redeploy.</p>}
+                    {transcriptionInfo?.mode === "device" && !transcriptionInfo.keyError && <p className="meeting-transcription-warning">{me.role === "Admin" ? "Fast cloud transcription is not set up, so this computer transcribes the meeting: slower and less accurate for Urdu. Add GROQ_API_KEY (speech) and ANTHROPIC_API_KEY (notes and cards) in the hosting settings to turn it on." : "Cloud transcription is not set up, so this computer transcribes the meeting (slower). Ask your admin to turn on cloud transcription."}</p>}
+                    {transcriptionInfo?.mode === "cloud" && !transcriptionInfo.ai && me.role === "Admin" && <p className="meeting-transcription-warning">AI notes are off: add ANTHROPIC_API_KEY in the hosting settings so Claude writes the notes and member cards.</p>}
+                    {recordingState === "idle" && (!recordingNoteId || recordingSaved) && <button className="btn meeting-record-button" disabled={!["Admin", "Collaborator"].includes(me.role)} onClick={startMeetingRecording}>{hasRecordedVoiceNote ? "Record another clip" : "Start microphone recording"}</button>}
                     {recordingState === "recording" && <>
                       <button className="btn alt meeting-record-button" onClick={pauseMeetingRecording}>Pause</button>
                       <button className="btn meeting-record-button recording" onClick={stopMeetingRecording}>Finish & transcribe</button>
@@ -1791,11 +1862,11 @@ export default function Page() {
                       <button className="btn meeting-record-button" onClick={resumeMeetingRecording}>Resume recording</button>
                       <button className="btn alt meeting-record-button" onClick={stopMeetingRecording}>Finish & transcribe</button>
                     </>}
-                    {recordingState === "transcribing" && <button className="btn meeting-record-button" disabled>Transcribing…</button>}
-                    {recordingState === "idle" && failedRecording && <button className="btn alt meeting-record-button" disabled={!["Admin", "Collaborator"].includes(me.role)} onClick={retryLastTranscription}>Retry last clip</button>}
-                    <span className={"meeting-record-status " + recordingState} aria-live="polite">{recordingState === "recording" ? `Recording · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")} · max 60 minutes` : recordingState === "paused" ? `Recording paused · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")}` : recordingState === "transcribing" ? transcriptionProgress || "Translating and preparing English key points…" : "Speak in Urdu, English or a mix. Review the transcript and member cards before saving."}</span>
+                    {recordingState === "transcribing" && <button className="btn meeting-record-button" disabled>Finishing notes…</button>}
+                    {recordingState !== "idle" && <p className="meeting-invite-hint">The recording is saved on this computer as it goes. If the internet drops it keeps recording and catches up when the connection is back. Keep this tab open until the notes are ready.</p>}
+                    <span className={"meeting-record-status " + recordingState} aria-live="polite">{recordingState === "recording" ? `Recording · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")} · ${transcriptionProgress || "Listening…"}` : recordingState === "paused" ? `Recording paused · ${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")} · ${transcriptionProgress}` : recordingState === "transcribing" ? transcriptionProgress || "Finishing the notes…" : "Speak in Urdu, English or a mix. Review the transcript and member cards before saving."}</span>
                   </div>
-                  {!!recordingClips.length && <div className="meeting-audio-preview"><span>Recording clips ({recordingClips.length})</span><div>{recordingClips.map((clip, index) => <div key={clip.id}><label>Clip {index + 1}</label><audio controls preload="metadata" src={clip.url}>Audio preview unavailable in this browser.</audio></div>)}</div></div>}
+                  {!!recordingClips.length && <div className="meeting-audio-preview"><span>Recording clips ({recordingClips.length})</span><div>{recordingClips.map((clip, index) => <div key={clip.id}><label>Clip {index + 1}</label>{clip.urls.map((url, part) => <audio key={url} controls preload="metadata" src={url} title={clip.urls.length > 1 ? `Part ${part + 1}` : undefined}>Audio preview unavailable in this browser.</audio>)}</div>)}</div></div>}
                   {!!recordingClips.length && !recordingSaved && <div className="meeting-record-save"><span>{recordingNoteId ? "The note is saved. Retry to finish uploading its clips." : `${recordingClips.filter((clip) => clip.transcript).length} of ${recordingClips.length} clip(s) transcribed. Add more clips, then save them together as one monthly note. Cancel removes this set's generated text from Shared meeting notes.`}</span><div>{!recordingNoteId && <button className="btn alt" disabled={meetingBusy || recordingState !== "idle"} onClick={cancelRecordingNotes}>Cancel recording notes</button>}{recordingNoteId || (recordingClips.every((clip) => clip.transcript) && recordingTranscript) ? <button className="btn" disabled={!["Admin", "Collaborator"].includes(me.role) || meetingBusy || recordingState !== "idle"} onClick={saveRecordingAsNote}>{meetingBusy ? "Saving…" : "Save recording as note"}</button> : null}</div></div>}
                   {meetingVoiceError && <div className="meeting-alert meeting-voice-alert" role="alert"><b>Voice note unavailable</b><span>{meetingVoiceError}</span></div>}
                 </section>

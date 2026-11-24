@@ -200,6 +200,11 @@ label .ms .msb{max-width:none;min-height:38px}
 /* ---------- Shared alerts ---------- */
 .meeting-alert{display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;margin:0 0 14px;padding:12px 14px;border:1px solid #fed7aa;border-radius:var(--radius-sm);background:var(--warn-soft);color:#9a3412;line-height:1.5;overflow-wrap:anywhere}
 .meeting-alert b{white-space:nowrap}
+.meeting-recovery{display:grid;gap:10px;margin:0 0 14px}
+.meeting-recovery>div{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap;padding:12px 14px;border:1px solid #fed7aa;border-radius:var(--radius-sm);background:var(--warn-soft);color:#9a3412;line-height:1.5}
+.meeting-recovery>div>div:first-child{display:grid;gap:2px;flex:1 1 280px;min-width:0;overflow-wrap:anywhere}
+.meeting-recovery>div>div:last-child{display:flex;gap:8px;flex-wrap:wrap}
+.meeting-transcription-warning{margin:0;padding:8px 10px;border:1px solid #fed7aa;border-radius:var(--radius-sm);background:var(--warn-soft);color:#9a3412;font-size:12.5px;line-height:1.5}
 .meeting-success{margin:0 0 14px;padding:10px 13px;border:1px solid #a7f3d0;border-radius:var(--radius-sm);background:var(--ok-soft);color:#065f46;font-size:13px;overflow-wrap:anywhere}
 .meeting-empty{text-align:center;padding:20px;color:var(--mut);font-size:13px}
 .meeting-invite-hint{color:var(--mut);font-size:12px;line-height:1.5;margin:10px 0}

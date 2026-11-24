@@ -1370,7 +1370,7 @@ async function h(req, p, m) {
       const file = formData.get("file");
       const note = d.meetingNotes.find((item) => item.id === noteId && item.projectId === project.id);
       if (!note || !file || typeof file.arrayBuffer !== "function") return J({ error: "Meeting note or recording file is missing" }, 400);
-      if (!Number.isInteger(clipIndex) || clipIndex < 0 || clipIndex >= 20) return J({ error: "Recording clip index is invalid" }, 400);
+      if (!Number.isInteger(clipIndex) || clipIndex < 0 || clipIndex >= 60) return J({ error: "Recording clip index is invalid" }, 400);
       if (!String(file.type || "").startsWith("audio/")) return J({ error: "The uploaded recording must be an audio file" }, 400);
       const maxBytes = remote ? 4e6 : 25e6;
       if (file.size < 1 || file.size > maxBytes) return J({ error: `Recording must be smaller than ${maxBytes / 1e6} MB` }, 413);
