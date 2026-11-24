@@ -512,3 +512,10 @@ input.mn-task-title:focus{border-color:var(--pri)!important;background:#fff!impo
   .su-grid{grid-template-columns:minmax(0,1fr);gap:14px}
   .su-field input{font-size:16px}
 }
+
+/* A member's own task form (no assignee column) and the "your task" tag */
+.mn-add-task.own{grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1.3fr) auto}
+.mn-add-task-label small{font-weight:400;color:var(--ink-3,#64748b);margin-left:6px}
+.mn-own-tag{font-size:11.5px;padding:2px 8px;border-radius:999px;background:var(--card-2);border:1px solid var(--line-2);color:var(--ink-2)}
+.mn-own-tag.locked{opacity:.75}
+@media (max-width:560px){.mn-add-task.own{grid-template-columns:repeat(2,minmax(0,1fr))}.mn-add-task.own>input:first-of-type,.mn-add-task.own .btn{grid-column:1/-1}}

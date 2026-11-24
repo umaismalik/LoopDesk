@@ -198,7 +198,8 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
   }, [openTarget, notes, notesLoading, notesMonth, month]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const save = async () => {
-    if (!selected || !editAccess) return;
+    if (!selected) return;
+    if (!editAccess) return saveOwnTasks();
     setBusy(true); setError(""); setNotice("");
     const result = await request({ action: "update", noteId: selected.id, title: selected.title, summary: selected.summary, transcript: selected.transcript, participantSummaries: selected.participantSummaries, tasks: selected.tasks });
     setBusy(false);
@@ -206,6 +207,47 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
     openNote(result.note);
     setNotes((items) => items.map((item) => item.id === result.note.id ? result.note : item));
     setNotice(result.taskEmailsFailed ? `Saved, but ${result.taskEmailsFailed} task assignment email(s) failed: ${result.emailErrors?.[0] || "check email settings"}` : `Note and tasks saved.${result.taskEmailsSent ? ` Assignment notification sent to ${result.taskEmailsSent} team member(s).` : ""}`);
+  };
+
+  // A member's own tasks: added by them for themselves, editable (or removable) for 24 hours after adding.
+  const OWN_TASK_EDIT_MS = 24 * 60 * 60 * 1000;
+  const ownTaskEditUntil = (task) => task?.createdBy && task.createdBy === me?.id && task.assigneeId === me?.id ? new Date(task.createdAt || 0).getTime() + OWN_TASK_EDIT_MS : 0;
+  const ownTaskEditable = (task) => ownTaskEditUntil(task) > Date.now();
+  const applyNote = (note) => { openNote(note); setNotes((items) => items.map((item) => item.id === note.id ? note : item)); };
+  const saveOwnTasks = async () => {
+    const before = JSON.parse(baselineRef.current || "{}").tasks || [];
+    const changed = (selected.tasks || []).filter((task) => ownTaskEditable(task) && JSON.stringify(task) !== JSON.stringify(before.find((item) => item.id === task.id)));
+    if (!changed.length) return;
+    setBusy(true); setError(""); setNotice("");
+    let result = null;
+    for (const task of changed) {
+      result = await request({ action: "own-task-edit", noteId: selected.id, taskId: task.id, title: task.title, description: task.description, priority: task.priority, status: task.status, dueDate: task.dueDate });
+      if (!result.ok) break;
+    }
+    setBusy(false);
+    if (!result.ok) { setError(result.error || "Could not save your task"); return; }
+    applyNote(result.note);
+    setNotice(changed.length === 1 ? "Your task was saved." : "Your tasks were saved.");
+  };
+  const addOwnTask = async (event) => {
+    event.preventDefault();
+    if (!selected || !taskTitle.trim()) return;
+    setBusy(true); setError(""); setNotice("");
+    const result = await request({ action: "own-task-add", noteId: selected.id, title: taskTitle.trim(), priority: taskPriority, dueDate: taskDeadline ? new Date(taskDeadline).toISOString() : "" });
+    setBusy(false);
+    if (!result.ok) { setError(result.error || "Could not add your task"); return; }
+    applyNote(result.note);
+    setTaskTitle(""); setTaskDeadline(""); setTaskPriority("Medium"); setTab("tasks");
+    setNotice("Task added. You can edit it for the next 24 hours; after that you can update its status.");
+  };
+  const removeOwnTask = async (task) => {
+    if (!selected || !window.confirm(`Remove "${task.title}"?`)) return;
+    setBusy(true); setError(""); setNotice("");
+    const result = await request({ action: "own-task-remove", noteId: selected.id, taskId: task.id });
+    setBusy(false);
+    if (!result.ok) { setError(result.error || "Could not remove the task"); return; }
+    applyNote(result.note);
+    setNotice("Task removed.");
   };
 
   // Saves new action items on the open note (with any unsaved edits); assignees are emailed by the server.
@@ -343,7 +385,8 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
     return [...groups.values()];
   })() : [];
   const canEditMember = (memberId) => !!canManageContent || (editAccess && memberId === me?.id);
-  const canEditTask = (task) => !!canManageContent || (editAccess && task.assigneeId === me?.id);
+  const canEditTask = (task) => !!canManageContent || ownTaskEditable(task) || (editAccess && task.assigneeId === me?.id && !(task.createdBy === me?.id && !ownTaskEditable(task)));
+  const hasOwnEditable = !!selected?.tasks?.some(ownTaskEditable);
   const myAccessRequest = accessRequests.find((item) => item.memberId === me?.id && item.projectId === projectId && item.status === "pending");
   const pendingAccessRequests = accessRequests.filter((item) => item.status === "pending");
 
@@ -405,7 +448,7 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
     {error && <div className="meeting-alert" role="alert">{error}</div>}
     {notice && <div className="meeting-success" role="status">{notice}</div>}
     {!editAccess && <div className="meeting-access-banner">
-      <div><b>View-only meeting access</b><span>You can review notes and update the status of tasks assigned to you. Editing notes, cards, and task details requires admin approval for one hour.</span></div>
+      <div><b>View-only meeting access</b><span>You can review notes, add your own tasks (editable for 24 hours after adding), and update the status of tasks assigned to you. Editing notes, cards, and other task details requires admin approval for one hour.</span></div>
       <button type="button" className="btn" disabled={busy || !!myAccessRequest} onClick={requestEditAccess}>{busy ? "Sending…" : myAccessRequest ? "Request pending" : "Request 1-hour edit access"}</button>
     </div>}
     {editAccess && editAccessExpiresAt && <div className="meeting-access-banner active"><div><b>Temporary edit access is active</b><span>Expires {new Date(editAccessExpiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}. After expiry, you can still update statuses of your assigned tasks.</span></div></div>}
@@ -461,6 +504,13 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
           <select aria-label="Task priority" value={taskPriority} onChange={(event) => setTaskPriority(event.target.value)}><option>High</option><option>Medium</option><option>Low</option></select>
           <input aria-label="Deadline" type="datetime-local" value={taskDeadline} onChange={(event) => setTaskDeadline(event.target.value)} />
           <button className="btn" disabled={busy}>{busy ? "Saving…" : "Assign task"}</button>
+        </form>}
+        {!canManageContent && <form className="mn-add-task own" onSubmit={addOwnTask} aria-label="Add my task">
+          <b className="mn-add-task-label">Add my task <small>You can edit it for 24 hours after adding it; after that, only its status.</small></b>
+          <input required maxLength="300" placeholder="What will you work on…" value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)} />
+          <select aria-label="Task priority" value={taskPriority} onChange={(event) => setTaskPriority(event.target.value)}><option>High</option><option>Medium</option><option>Low</option></select>
+          <input aria-label="Deadline" type="datetime-local" value={taskDeadline} onChange={(event) => setTaskDeadline(event.target.value)} />
+          <button className="btn" disabled={busy}>{busy ? "Saving…" : "Add task"}</button>
         </form>}
 
         {tab === "overview" && <div className="mn-pane">
@@ -537,6 +587,11 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
                     : updateTaskStatus(task, event.target.value)}><option>Open</option><option>In Progress</option><option>Completed</option></select>
                   : <span className={"pill st " + String(task.status || "Open").replace(" ", "")}>{task.status}</span>}
                 <span className={"mn-due" + (isOverdue(task) ? " bad" : "")}>⏰ {isOverdue(task) ? "Overdue · " : ""}{dueLabel(task.dueDate)}</span>
+                {task.createdBy && task.createdBy === task.assigneeId && <span className={"mn-own-tag" + (ownTaskEditUntil(task) && !ownTaskEditable(task) ? " locked" : "")} title={task.createdAt ? `Added ${new Date(task.createdAt).toLocaleString()}` : ""}>
+                  {ownTaskEditUntil(task)
+                    ? ownTaskEditable(task) ? `Your task · editable until ${new Date(ownTaskEditUntil(task)).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}` : "Your task · locked, status only"
+                    : `Added by ${task.createdByName || memberOf(task.createdBy)?.name || "member"}`}
+                </span>}
                 {memberOf(task.assigneeId) && <span className="mn-assignee"><i style={{ "--av": avatarColor(task.assigneeId) }}>{initials(memberOf(task.assigneeId).name)}</i>{memberOf(task.assigneeId).name}</span>}
               </div>
               {panel === "edit" && editable && <div className="mn-task-panel">
@@ -546,6 +601,7 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
                   {canManageContent && <label>Assignee<select value={task.assigneeId || ""} onChange={(event) => updateTask({ assigneeId: event.target.value })}><option value="">Unassigned</option>{members.filter((member) => member.role !== "Client" && member.status === "active").map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>}
                   <label>Deadline<input type="datetime-local" value={localDateTime(task.dueDate)} onChange={(event) => updateTask({ dueDate: event.target.value ? new Date(event.target.value).toISOString() : "" })} /></label>
                   {canManageContent && <button type="button" className="ic dl" onClick={() => setSelected({ ...selected, tasks: selected.tasks.filter((item) => item.id !== task.id) })}>Remove task</button>}
+                  {!canManageContent && ownTaskEditable(task) && <button type="button" className="ic dl" disabled={busy} onClick={() => removeOwnTask(task)}>Remove task</button>}
                 </div>
               </div>}
               {panel === "context" && <div className="mn-task-panel">
@@ -569,7 +625,7 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
           <section className="mn-block"><h3>Transcript</h3><textarea disabled={!canManageContent} rows="14" maxLength="50000" value={selected.transcript || ""} onChange={(event) => setSelected({ ...selected, transcript: event.target.value })} placeholder="No transcript was saved with this note." /></section>
         </div>}
 
-        {editAccess && <footer className="mn-save">
+        {(editAccess || hasOwnEditable) && <footer className="mn-save">
           <span>{JSON.stringify(selected) !== baselineRef.current ? "You have unsaved changes" : "All changes saved"}</span>
           <button className="btn" disabled={busy || JSON.stringify(selected) === baselineRef.current} onClick={save}>{busy ? "Saving…" : "Save changes"}</button>
         </footer>}

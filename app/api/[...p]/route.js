@@ -199,6 +199,11 @@ const visibleFiles = (files, tickets, member) => !limitedToOwnTickets(member) ? 
   return !ticket || ownsTicket(ticket, member.id);
 });
 // Meeting-note action items: a Developer sees only the ones assigned to them.
+// A team member may add their own tasks to a meeting note. They can edit or remove such a task for
+// 24 hours after adding it; after that only its status, while an Admin or Collaborator can still edit it.
+const OWN_TASK_EDIT_MS = 24 * 60 * 60 * 1000;
+const ownTaskEditable = (task, memberId) => !!task && task.createdBy === memberId && task.assigneeId === memberId &&
+  Date.now() - new Date(task.createdAt || 0).getTime() < OWN_TASK_EDIT_MS;
 const visibleNote = (note, member) => limitedToOwnTickets(member) ? { ...note, tasks: (note.tasks || []).filter((task) => task.assigneeId === member.id) } : note;
 // Magic-byte check so a renamed file cannot pass as an allowed format. Text formats have no signature.
 const fileSignatureOk = (name, buf) => {
@@ -1472,7 +1477,15 @@ async function h(req, p, m) {
           const title = String(task.title || "").trim().slice(0, 300);
           const description = String(task.description || "").trim().slice(0, 2000);
           if (!title) return null;
-          return { id, title, description, assigneeId, dueDate, status, comments, priority: ["High", "Medium", "Low"].includes(task.priority) ? task.priority : "Medium", remindersSent: previous?.dueDate === dueDate ? previous.remindersSent || [] : [] };
+          return {
+            id, title, description, assigneeId, dueDate, status, comments,
+            priority: ["High", "Medium", "Low"].includes(task.priority) ? task.priority : "Medium",
+            remindersSent: previous?.dueDate === dueDate ? previous.remindersSent || [] : [],
+            // Who added the task and when come from the stored task, never from the request.
+            createdBy: previous ? previous.createdBy || "" : account.id,
+            createdByName: previous ? previous.createdByName || "" : me.name,
+            createdAt: previous ? previous.createdAt || "" : new Date().toISOString(),
+          };
         });
         return tasks.some((task) => !task) ? null : tasks;
       };
@@ -1526,6 +1539,41 @@ async function h(req, p, m) {
         await save(d);
         return J({ ok: true, note: visibleNote(note, me) });
       }
+      if (b.action === "own-task-add" || b.action === "own-task-edit") {
+        // Any team member: add a task for themselves, or change one they added in the last 24 hours.
+        const title = String(b.title || "").trim().slice(0, 300);
+        const description = String(b.description || "").trim().slice(0, 2000);
+        const priority = ["High", "Medium", "Low"].includes(b.priority) ? b.priority : "Medium";
+        const status = ["Open", "In Progress", "Completed"].includes(b.status) ? b.status : "Open";
+        const dueDate = String(b.dueDate || "");
+        if (!title) return J({ error: "Enter what needs to be done" }, 400);
+        if (dueDate && (!/^\d{4}-\d{2}-\d{2}T/.test(dueDate) || !Number.isFinite(new Date(dueDate).getTime()))) return J({ error: "Enter a valid deadline" }, 400);
+        if (b.action === "own-task-add") {
+          if ((note.tasks || []).length >= 200) return J({ error: "This meeting note already has the maximum number of tasks" }, 400);
+          note.tasks = [...(note.tasks || []), {
+            id: uid().slice(0, 12), title, description, assigneeId: account.id, dueDate, status, comments: [], priority,
+            remindersSent: [], createdBy: account.id, createdByName: me.name, createdAt: new Date().toISOString(),
+          }];
+        } else {
+          const task = (note.tasks || []).find((item) => item.id === String(b.taskId || ""));
+          if (!task) return J({ error: "Task not found" }, 404);
+          if (!ownTaskEditable(task, account.id)) return J({ error: "You can edit a task you added only within 24 hours of adding it; after that you can update its status" }, 403);
+          if (task.dueDate !== dueDate) task.remindersSent = [];
+          Object.assign(task, { title, description, priority, status, dueDate });
+        }
+        note.updatedAt = new Date().toISOString();
+        await save(d);
+        return J({ ok: true, note: visibleNote(note, me) });
+      }
+      if (b.action === "own-task-remove") {
+        const task = (note.tasks || []).find((item) => item.id === String(b.taskId || ""));
+        if (!task) return J({ error: "Task not found" }, 404);
+        if (!ownTaskEditable(task, account.id)) return J({ error: "You can remove a task you added only within 24 hours of adding it" }, 403);
+        note.tasks = note.tasks.filter((item) => item !== task);
+        note.updatedAt = new Date().toISOString();
+        await save(d);
+        return J({ ok: true, note: visibleNote(note, me) });
+      }
       if (!canEditMeetingContent) return J({ error: "Admin or Collaborator access, or a current one-hour admin approval, is required to edit meeting notes and tasks" }, 403);
       if (b.action === "update") {
         const title = String(b.title || "").trim().slice(0, 160), summary = String(b.summary || ""), transcript = String(b.transcript || "");
@@ -1553,9 +1601,10 @@ async function h(req, p, m) {
           });
           if (tasks.length !== previousTasks.length || previousTasks.some((previous) => {
             const submitted = tasks.find((task) => task.id === previous.id);
-            return !submitted || (previous.assigneeId === account.id
+            const lockedOwnTask = previous.createdBy === account.id && !ownTaskEditable(previous, account.id);
+            return !submitted || (previous.assigneeId === account.id && !lockedOwnTask
               ? submitted.assigneeId !== account.id || JSON.stringify(submitted.comments || []) !== JSON.stringify(previous.comments || [])
-              : taskSignature(submitted) !== taskSignature(previous));
+              : taskSignature({ ...submitted, status: lockedOwnTask ? previous.status : submitted.status }) !== taskSignature(previous));
           })) return J({ error: "Temporary edit access only allows changes to tasks assigned to you; you cannot add, remove, reassign, or edit another member's tasks" }, 403);
         }
         note.title = title; note.summary = summary; note.transcript = transcript;
