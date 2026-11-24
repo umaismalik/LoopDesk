@@ -359,33 +359,16 @@ async function send(to, subject, html, calendar) {
 }
 // One email per filled member card: that member's key points and action items together. With
 // `sentSummaries`, a card whose content was already emailed is not sent again.
-async function emailMemberCards(d, { cards, title, projectName, date, summary = "", sentSummaries = null, by = "" }) {
-  return Promise.all(cards.map(async (card) => {
-    const points = card.points || [], tasks = card.tasks || [];
-    if (!points.length && !tasks.length) return { memberId: card.memberId, sent: false, skipped: true };
-    const content = JSON.stringify({ points, tasks, priority: card.priority || "Medium" });
-    if (sentSummaries && sentSummaries[card.memberId] === content) return { memberId: card.memberId, sent: false, skipped: true };
-    const member = d.members.find((item) => item.id === card.memberId && item.status !== "disabled");
-    if (!member?.email) return { memberId: card.memberId, sent: false, skipped: true };
-    const list = (items) => `<ul style="margin:6px 0 14px;padding-left:20px">${items.map((line) => `<li style="margin:4px 0">${emailHtml(line)}</li>`).join("")}</ul>`;
-    const html = `<div style="font-family:Arial,sans-serif;color:#1f2937;line-height:1.5"><p>Hello ${emailHtml(member.name)},</p>`
-      + `<p>Here are your notes from <b>${emailHtml(title)}</b>${projectName ? ` in <b>${emailHtml(projectName)}</b>` : ""}${date ? ` on ${emailHtml(date)}` : ""}.</p>`
-      + (points.length ? `<p style="margin:0"><b>Your key points</b></p>${list(points)}` : "")
-      + (tasks.length ? `<p style="margin:0"><b>Your action items</b> · ${emailHtml(card.priority || "Medium")} priority</p>${list(tasks)}` : "")
-      + (summary ? `<p style="margin:0"><b>Shared meeting notes</b></p><p style="margin:6px 0 14px">${emailHtml(summary).replace(/\n/g, "<br>")}</p>` : "")
-      + `<p>Open LoopDesk → Meeting Notes to update the status of your action items or comment on them.${by ? ` Shared by ${emailHtml(by)}.` : ""}</p></div>`;
-    const result = await send(member.email, `Your meeting notes: ${title}`, html);
-    if (result.sent && sentSummaries) sentSummaries[card.memberId] = content;
-    return { memberId: card.memberId, sent: result.sent, error: result.error, skipped: false };
-  }));
-}
-async function emailAssignedTasks(d, { tasks, previousTasks = [], title, projectName }) {
+// Emails a member only when a task is newly assigned to them (a new task, or one reassigned to them),
+// never again when its title, context, priority, deadline or status is edited later. The email has
+// just the meeting title and the task, with a link that opens that task in Meeting Notes.
+async function emailAssignedTasks(d, { tasks, previousTasks = [], title, projectName, note, projectId, site }) {
   const previousById = new Map(previousTasks.map((task) => [task.id, task]));
   const assignedByMember = new Map();
   tasks.filter((task) => {
     if (!task.assigneeId) return false;
     const previous = previousById.get(task.id);
-    return !previous || previous.assigneeId !== task.assigneeId || previous.title !== task.title || previous.description !== task.description || previous.priority !== task.priority || previous.dueDate !== task.dueDate;
+    return !previous || previous.assigneeId !== task.assigneeId;
   }).forEach((task) => {
     const assigned = assignedByMember.get(task.assigneeId) || [];
     assigned.push(task);
@@ -394,8 +377,21 @@ async function emailAssignedTasks(d, { tasks, previousTasks = [], title, project
   return Promise.all([...assignedByMember.entries()].map(async ([memberId, assignedTasks]) => {
     const member = d.members.find((item) => item.id === memberId && item.status !== "disabled");
     if (!member) return { sent: false, skipped: true };
-    const lines = assignedTasks.map((task) => `<li>${emailHtml(task.title)} · ${emailHtml(task.priority || "Medium")} priority${task.description ? `<br>${emailHtml(task.description).replace(/\n/g, "<br>")}` : ""}${task.dueDate ? ` — due ${emailHtml(deadlineLabel(task.dueDate))}` : ""}</li>`).join("");
-    const result = await send(member.email, `Action items assigned: ${title}`, `<p>Hello ${emailHtml(member.name)},</p><p>These action items from <b>${emailHtml(title)}</b>${projectName ? ` in <b>${emailHtml(projectName)}</b>` : ""} were assigned to you:</p><ul>${lines}</ul><p>Open the project portal → Meeting Notes to manage deadlines, status, and comments.</p>`);
+    const taskLink = (task) => site && note?.id
+      ? `${site}/?meeting-task=${encodeURIComponent(task.id)}&note=${encodeURIComponent(note.id)}&month=${encodeURIComponent(String(note.date || "").slice(0, 7))}&project=${encodeURIComponent(projectId || "")}`
+      : "";
+    const rows = assignedTasks.map((task) => {
+      const link = taskLink(task);
+      return `<tr><td style="padding:12px 14px;border:1px solid #e5e8f0;border-radius:10px;background:#f8f9fd">
+<div style="font-size:15px;font-weight:700;color:#0f172a;margin:0 0 4px">${emailHtml(task.title)}</div>
+<div style="font-size:12.5px;color:#64748b;margin:0 0 ${link ? "10px" : "0"}">${emailHtml(task.priority || "Medium")} priority${task.dueDate ? ` · due ${emailHtml(deadlineLabel(task.dueDate))}` : ""}</div>
+${link ? `<a href="${link}" style="display:inline-block;padding:9px 16px;background:#4f46e5;color:#ffffff;border-radius:8px;text-decoration:none;font-weight:700;font-size:13px">Open task</a>` : ""}
+</td></tr><tr><td style="height:8px"></td></tr>`;
+    }).join("");
+    const subject = assignedTasks.length === 1 ? `Task assigned: ${assignedTasks[0].title} (${title})` : `${assignedTasks.length} tasks assigned: ${title}`;
+    const result = await send(member.email, subject, `<p style="margin:0 0 6px">Hello ${emailHtml(member.name)},</p>
+<p style="margin:0 0 14px">${assignedTasks.length === 1 ? "A task was" : "These tasks were"} assigned to you in the meeting <b>${emailHtml(title)}</b>${projectName ? ` (${emailHtml(projectName)})` : ""}:</p>
+<table role="presentation" style="border-collapse:separate;width:100%;margin:0 0 6px">${rows}</table>`);
     return { sent: result.sent, error: result.error, skipped: false };
   }));
 }
@@ -1285,9 +1281,10 @@ async function h(req, p, m) {
             : previousCards;
         }
         const sentSummaries = previous.sentSummaries || {};
-        // Every filled card is emailed to its member (once per change).
-        const mailResults = await emailMemberCards(d, { cards: participantSummaries, title: meeting.title, projectName: project.name, date: occurrenceDate, sentSummaries, by: me.name });
-        const cardEmailed = new Set(mailResults.filter((result) => !result.skipped).map((result) => result.memberId));
+        // Members are emailed only about tasks newly assigned to them (below), not every time a card is
+        // edited; a card is emailed only when someone presses "Share … by email".
+        const mailResults = [];
+        const cardEmailed = new Set();
         meeting.occurrences[occurrenceDate] = {
           ...previous,
           notes,
@@ -1325,6 +1322,7 @@ async function h(req, p, m) {
           previousTasks: managedNote?.tasks || [],
           title: meeting.title,
           projectName: project.name,
+          note: savedNote, projectId: project.id, site: browserSiteUrl(u.origin),
         });
         return J({
           ok: true,
@@ -1495,15 +1493,17 @@ async function h(req, p, m) {
           createdBy: account.id, createdByName: me.name, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
         };
         d.meetingNotes.push(note); await save(d);
-        // Every filled card is emailed to its member, with their key points, action items and the shared notes.
-        const summaryResults = b.deferEmails ? [] : await emailMemberCards(d, { cards: participantSummaries, title, projectName: project.name, date, summary, by: me.name });
-        const cardEmailed = new Set(summaryResults.filter((result) => !result.skipped).map((result) => result.memberId));
+        // Each assigned member gets one short email per new task (meeting title, task, link); the cards and
+        // shared notes are not emailed automatically.
+        const summaryResults = [];
+        const cardEmailed = new Set();
         const alreadyEmailedTasks = meeting?.occurrences?.[date]?.emailedTasks || {};
         const emailedTaskKeys = new Set(Object.entries(alreadyEmailedTasks).flatMap(([memberId, titles]) => titles.map((taskTitle) => `${memberId}:${taskTitle}`)));
         const taskEmailResults = b.deferEmails ? [] : await emailAssignedTasks(d, {
           tasks: tasks.filter((task) => !cardEmailed.has(task.assigneeId) && !emailedTaskKeys.has(`${task.assigneeId}:${task.title.toLowerCase()}`)),
           title,
           projectName: project.name,
+          note, projectId: project.id, site: browserSiteUrl(u.origin),
         });
         return J({
           ok: true, note,
@@ -1561,7 +1561,7 @@ async function h(req, p, m) {
         note.title = title; note.summary = summary; note.transcript = transcript;
         note.participantSummaries = participantSummaries; note.tasks = tasks; note.updatedAt = new Date().toISOString();
         await save(d);
-        const taskEmailResults = await emailAssignedTasks(d, { tasks, previousTasks, title, projectName: project.name });
+        const taskEmailResults = await emailAssignedTasks(d, { tasks, previousTasks, title, projectName: project.name, note, projectId: project.id, site: browserSiteUrl(u.origin) });
         return J({
           ok: true, note: visibleNote(note, me),
           taskEmailsSent: taskEmailResults.filter((result) => result.sent).length,

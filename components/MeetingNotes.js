@@ -34,7 +34,17 @@ const csvCell = (value) => {
   return `"${text.replace(/"/g, '""')}"`;
 };
 
-export default function MeetingNotes({ projectId, keyValue, members, canDelete, canManageContent, me, onAccessChange, refreshKey }) {
+const Icon = ({ d, size = 16 }) => <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={d} /></svg>;
+const CHEVRON = "M6 9l6 6 6-6";
+const EDIT = "M12 20h9M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z";
+const CONTEXT = "M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2zM8 9h8M8 13h5";
+const toggled = (set, id) => { const next = new Set(set); if (next.has(id)) next.delete(id); else next.add(id); return next; };
+
+/**
+ * `openTarget` ({ note, month, task }) opens one meeting note on one task, as linked from a task
+ * assignment email; `onTargetOpened` is called once it is shown.
+ */
+export default function MeetingNotes({ projectId, keyValue, members, canDelete, canManageContent, me, onAccessChange, refreshKey, openTarget, onTargetOpened }) {
   const [month, setMonth] = useState(currentMonth);
   const [reportPeriod, setReportPeriod] = useState("month");
   const [reportWeek, setReportWeek] = useState(() => new Date().toISOString().slice(0, 10));
@@ -44,6 +54,7 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
   const [notesTotal, setNotesTotal] = useState(0);
   const [notesHasMore, setNotesHasMore] = useState(false);
   const [notesLoading, setNotesLoading] = useState(false);
+  const [notesMonth, setNotesMonth] = useState("");
   const [selected, setSelected] = useState(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -60,10 +71,20 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
   const [tab, setTab] = useState("overview");
   const [search, setSearch] = useState("");
   const [reportOpen, setReportOpen] = useState(false);
+  // Which member cards and action-item groups are expanded, and which task panel (edit / context) is open.
+  const [openMembers, setOpenMembers] = useState(() => new Set());
+  const [openGroups, setOpenGroups] = useState(() => new Set());
+  const [taskPanels, setTaskPanels] = useState({});
+  const [highlightTask, setHighlightTask] = useState("");
   // The note as last loaded from the server; a live refresh only replaces the open note when the
   // user has not started editing it.
   const baselineRef = useRef("");
-  const openNote = (note) => { baselineRef.current = note ? JSON.stringify(note) : ""; setSelected(note); };
+  const openNote = (note) => {
+    baselineRef.current = note ? JSON.stringify(note) : "";
+    setSelected(note);
+    setOpenMembers(new Set()); setOpenGroups(new Set()); setTaskPanels({}); setHighlightTask("");
+  };
+  const toggleTaskPanel = (taskId, panel) => setTaskPanels((panels) => ({ ...panels, [taskId]: panels[taskId] === panel ? "" : panel }));
 
   const request = useCallback(async (body, offset = 0) => {
     try {
@@ -87,6 +108,7 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
       if (!active) return;
       if (!result.ok) { setError(result.error || "Could not load notes"); return; }
       setNotes(result.notes || []);
+      setNotesMonth(month);
       setNotesOffset(result.pagination?.offset || 0);
       setNotesTotal(result.pagination?.total ?? result.notes.length);
       setNotesHasMore(!!result.pagination?.hasMore);
@@ -105,7 +127,7 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
       });
     }).finally(() => { if (active) setNotesLoading(false); });
     return () => { active = false; };
-  }, [request, canManageContent, onAccessChange, notesOffset, refreshKey]);
+  }, [request, canManageContent, onAccessChange, notesOffset, refreshKey]); // eslint-disable-line react-hooks/exhaustive-deps
   const refreshAccessState = async () => {
     const result = await request();
     if (!result.ok) { setError(result.error || "Could not refresh meeting access"); return; }
@@ -155,6 +177,25 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
     }
     return () => { active = false; urls.forEach((url) => URL.revokeObjectURL(url)); };
   }, [selected?.id, selected?.audioFile?.id, selected?.audioFiles?.length, projectId, keyValue]);
+
+  useEffect(() => {
+    if (openTarget?.month && /^\d{4}-\d{2}$/.test(openTarget.month) && openTarget.month !== month) { setMonth(openTarget.month); setNotesOffset(0); }
+  }, [openTarget?.month]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    // Wait until the notes of the task's month are loaded.
+    if (!openTarget?.note || notesLoading || notesMonth !== (openTarget.month || month)) return;
+    const note = notes.find((item) => item.id === openTarget.note);
+    if (!note) { setError("That task is no longer in Meeting Notes, or it belongs to another project."); onTargetOpened?.(); return; }
+    openNote(note);
+    setTab("tasks");
+    const task = (note.tasks || []).find((item) => item.id === openTarget.task);
+    if (task) {
+      setOpenGroups(new Set([task.assigneeId || "unassigned"]));
+      setHighlightTask(task.id);
+      setTimeout(() => document.getElementById("mn-task-" + task.id)?.scrollIntoView({ behavior: "smooth", block: "center" }), 150);
+    }
+    onTargetOpened?.();
+  }, [openTarget, notes, notesLoading, notesMonth, month]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const save = async () => {
     if (!selected || !editAccess) return;
@@ -428,10 +469,23 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
             <textarea disabled={!canManageContent} rows="7" maxLength="20000" value={selected.summary} onChange={(event) => setSelected({ ...selected, summary: event.target.value })} placeholder="Decisions, progress, blockers and next steps…" />
           </section>
           {!!selected.participantSummaries?.length && <section className="mn-block">
-            <h3>Member updates <small>{selected.participantSummaries.length} member{selected.participantSummaries.length === 1 ? "" : "s"}</small></h3>
+            <h3>Member updates <small>{selected.participantSummaries.length} member{selected.participantSummaries.length === 1 ? "" : "s"}</small>
+              <button type="button" className="mn-expand-all" onClick={() => setOpenMembers(openMembers.size === selected.participantSummaries.length ? new Set() : new Set(selected.participantSummaries.map((card) => card.memberId)))}>{openMembers.size === selected.participantSummaries.length ? "Collapse all" : "Expand all"}</button>
+            </h3>
             <div className="mn-members">
-              {selected.participantSummaries.map((card) => <details className="mn-member" key={card.memberId} open={selected.participantSummaries.length <= 2}>
-                <summary><i style={{ "--av": avatarColor(card.memberId) }}>{initials(card.name)}</i><b>{card.name}</b><span>{(card.points || []).filter(Boolean).length} updates · {(card.tasks || []).filter(Boolean).length} next tasks</span><em className={"pill " + (card.priority || "Medium")}>{card.priority || "Medium"}</em></summary>
+              {selected.participantSummaries.map((card) => {
+                const open = openMembers.has(card.memberId);
+                const updates = (card.points || []).filter((line) => String(line).trim()).length, next = (card.tasks || []).filter((line) => String(line).trim()).length;
+                const assigned = selectedTasks.filter((task) => task.assigneeId === card.memberId);
+                return <article className={"mn-member" + (open ? " open" : "")} key={card.memberId} style={{ "--av": avatarColor(card.memberId) }}>
+                <button type="button" className="mn-member-head" aria-expanded={open} onClick={() => setOpenMembers((set) => toggled(set, card.memberId))}>
+                  <i>{initials(card.name)}</i>
+                  <span className="mn-member-name"><b>{card.name}</b><small>{memberOf(card.memberId)?.role || "Team member"}</small></span>
+                  <span className="mn-member-counts"><em>{updates} update{updates === 1 ? "" : "s"}</em><em>{next} next task{next === 1 ? "" : "s"}</em>{!!assigned.length && <em className="ok">{assigned.filter((task) => task.status === "Completed").length}/{assigned.length} done</em>}</span>
+                  <em className={"pill " + (card.priority || "Medium")}>{card.priority || "Medium"}</em>
+                  <span className="mn-chevron"><Icon d={CHEVRON} /></span>
+                </button>
+                {open && <div className="mn-member-body">
                 <div className="mn-member-fields">
                   <label>Updates (done / in progress / blockers)<textarea disabled={!canEditMember(card.memberId)} rows="3" value={(card.points || []).join("\n")} onChange={(event) => setSelected({ ...selected, participantSummaries: selected.participantSummaries.map((item) => item.memberId === card.memberId ? { ...item, points: event.target.value.split("\n") } : item) })} /></label>
                   <label>Next tasks<textarea disabled={!canEditMember(card.memberId)} rows="3" value={(card.tasks || []).join("\n")} onChange={(event) => setSelected({ ...selected, participantSummaries: selected.participantSummaries.map((item) => item.memberId === card.memberId ? { ...item, tasks: event.target.value.split("\n") } : item) })} /></label>
@@ -442,19 +496,39 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
                     : <small>{(card.tasks || []).some((line) => String(line).trim()) ? `Next tasks are assigned to ${card.name}.` : `Add next tasks above to assign them to ${card.name}.`}</small>}
                   <button type="button" className="ic" onClick={() => { setTaskAssignee(card.memberId); taskFormRef.current?.querySelector("input")?.focus(); taskFormRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }); }}>Assign another task</button>
                 </div>}
-              </details>)}
+                </div>}
+              </article>;
+              })}
             </div>
           </section>}
         </div>}
 
         {tab === "tasks" && <div className="mn-pane">
           {!taskGroups.length && <div className="mn-empty-list"><b>No action items yet</b><span>{canManageContent ? "Add the first one above." : "Tasks assigned in this meeting will appear here."}</span></div>}
-          {taskGroups.map((group) => <section className="mn-task-group" key={group.id}>
-            <h4><i style={{ "--av": avatarColor(group.id) }}>{group.id === "unassigned" ? "?" : initials(group.name)}</i>{group.name}<small>{group.tasks.filter((task) => task.status === "Completed").length}/{group.tasks.length} done</small></h4>
-            <div className="mn-tasks">{group.tasks.map((task) => <article className={"mn-task st-" + String(task.status || "Open").replace(" ", "") + (isOverdue(task) ? " overdue" : "")} key={task.id}>
+          {taskGroups.length > 1 && <div className="mn-group-tools"><button type="button" className="mn-expand-all" onClick={() => setOpenGroups(openGroups.size === taskGroups.length ? new Set() : new Set(taskGroups.map((group) => group.id)))}>{openGroups.size === taskGroups.length ? "Collapse all" : "Expand all"}</button></div>}
+          {taskGroups.map((group) => {
+            const open = openGroups.has(group.id) || taskGroups.length === 1;
+            const done = group.tasks.filter((task) => task.status === "Completed").length, overdue = group.tasks.filter(isOverdue).length;
+            return <section className={"mn-task-group" + (open ? " open" : "")} key={group.id} style={{ "--av": avatarColor(group.id) }}>
+            <button type="button" className="mn-member-head" aria-expanded={open} disabled={taskGroups.length === 1} onClick={() => setOpenGroups((set) => toggled(set, group.id))}>
+              <i>{group.id === "unassigned" ? "?" : initials(group.name)}</i>
+              <span className="mn-member-name"><b>{group.name}</b><small>{memberOf(group.id)?.role || (group.id === "unassigned" ? "Not assigned yet" : "Team member")}</small></span>
+              <span className="mn-member-counts"><em>{group.tasks.length} task{group.tasks.length === 1 ? "" : "s"}</em><em className="ok">{done} done</em>{overdue > 0 && <em className="bad">{overdue} overdue</em>}</span>
+              <span className="mn-group-progress" aria-label={`${done} of ${group.tasks.length} done`}><i style={{ width: `${Math.round((done / group.tasks.length) * 100)}%` }} /></span>
+              {taskGroups.length > 1 && <span className="mn-chevron"><Icon d={CHEVRON} /></span>}
+            </button>
+            {open && <div className="mn-tasks">{group.tasks.map((task) => {
+              const panel = taskPanels[task.id] || "";
+              const editable = canEditTask(task);
+              const updateTask = (changes) => setSelected({ ...selected, tasks: selected.tasks.map((item) => item.id === task.id ? { ...item, ...changes } : item) });
+              return <article id={"mn-task-" + task.id} className={"mn-task st-" + String(task.status || "Open").replace(" ", "") + (isOverdue(task) ? " overdue" : "") + (highlightTask === task.id ? " highlight" : "")} key={task.id}>
               <div className="mn-task-top">
-                {canEditTask(task) ? <input className="mn-task-title" aria-label="Task title" maxLength="300" value={task.title} onChange={(event) => setSelected({ ...selected, tasks: selected.tasks.map((item) => item.id === task.id ? { ...item, title: event.target.value } : item) })} /> : <p className="mn-task-title">{task.title}</p>}
+                {editable ? <input className="mn-task-title" aria-label="Task title" maxLength="300" value={task.title} onChange={(event) => updateTask({ title: event.target.value })} /> : <p className="mn-task-title">{task.title}</p>}
                 <span className={"pill " + (task.priority || "Medium")}>{task.priority || "Medium"}</span>
+                <span className="mn-task-tools">
+                  {editable && <button type="button" className={"mn-icon-btn" + (panel === "edit" ? " on" : "")} title="Edit details" aria-label="Edit details" aria-expanded={panel === "edit"} onClick={() => toggleTaskPanel(task.id, "edit")}><Icon d={EDIT} /></button>}
+                  {(editable || task.description) && <button type="button" className={"mn-icon-btn" + (panel === "context" ? " on" : "") + (task.description ? " has" : "")} title="Context from the meeting" aria-label="Context from the meeting" aria-expanded={panel === "context"} onClick={() => toggleTaskPanel(task.id, "context")}><Icon d={CONTEXT} /></button>}
+                </span>
               </div>
               <div className="mn-task-meta">
                 {canEditTask(task) || task.assigneeId === me?.id
@@ -465,19 +539,29 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
                 <span className={"mn-due" + (isOverdue(task) ? " bad" : "")}>⏰ {isOverdue(task) ? "Overdue · " : ""}{dueLabel(task.dueDate)}</span>
                 {memberOf(task.assigneeId) && <span className="mn-assignee"><i style={{ "--av": avatarColor(task.assigneeId) }}>{initials(memberOf(task.assigneeId).name)}</i>{memberOf(task.assigneeId).name}</span>}
               </div>
-              {canEditTask(task) && <details className="mn-task-edit"><summary>Edit details</summary><div>
-                <label>Priority<select value={task.priority || "Medium"} onChange={(event) => setSelected({ ...selected, tasks: selected.tasks.map((item) => item.id === task.id ? { ...item, priority: event.target.value } : item) })}><option>High</option><option>Medium</option><option>Low</option></select></label>
-                {canManageContent && <label>Assignee<select value={task.assigneeId || ""} onChange={(event) => setSelected({ ...selected, tasks: selected.tasks.map((item) => item.id === task.id ? { ...item, assigneeId: event.target.value } : item) })}><option value="">Unassigned</option>{members.filter((member) => member.role !== "Client" && member.status === "active").map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>}
-                <label>Deadline<input type="datetime-local" value={localDateTime(task.dueDate)} onChange={(event) => setSelected({ ...selected, tasks: selected.tasks.map((item) => item.id === task.id ? { ...item, dueDate: event.target.value ? new Date(event.target.value).toISOString() : "" } : item) })} /></label>
-                {canManageContent && <button type="button" className="ic dl" onClick={() => setSelected({ ...selected, tasks: selected.tasks.filter((item) => item.id !== task.id) })}>Remove task</button>}
-              </div></details>}
-              {task.description && <details className="mn-task-desc"><summary>Context from the meeting</summary><p>{task.description}</p></details>}
+              {panel === "edit" && editable && <div className="mn-task-panel">
+                <b><Icon d={EDIT} size={14} />Edit details</b>
+                <div className="mn-task-edit">
+                  <label>Priority<select value={task.priority || "Medium"} onChange={(event) => updateTask({ priority: event.target.value })}><option>High</option><option>Medium</option><option>Low</option></select></label>
+                  {canManageContent && <label>Assignee<select value={task.assigneeId || ""} onChange={(event) => updateTask({ assigneeId: event.target.value })}><option value="">Unassigned</option>{members.filter((member) => member.role !== "Client" && member.status === "active").map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>}
+                  <label>Deadline<input type="datetime-local" value={localDateTime(task.dueDate)} onChange={(event) => updateTask({ dueDate: event.target.value ? new Date(event.target.value).toISOString() : "" })} /></label>
+                  {canManageContent && <button type="button" className="ic dl" onClick={() => setSelected({ ...selected, tasks: selected.tasks.filter((item) => item.id !== task.id) })}>Remove task</button>}
+                </div>
+              </div>}
+              {panel === "context" && <div className="mn-task-panel">
+                <b><Icon d={CONTEXT} size={14} />Context from the meeting</b>
+                {editable
+                  ? <textarea rows="4" maxLength="2000" value={task.description || ""} onChange={(event) => updateTask({ description: event.target.value })} placeholder="What was said about this task in the meeting: background, links, acceptance criteria…" aria-label="Context from the meeting" />
+                  : <p>{task.description}</p>}
+              </div>}
               {(canManageContent || (editAccess && task.assigneeId === me?.id)) && <div className="mn-comments">
                 {(task.comments || []).map((comment) => <p key={comment.id}><b>{comment.by}</b><small>{dateLabel(comment.createdAt.slice(0, 10))}</small><br />{comment.text}</p>)}
                 <div><input maxLength="2000" placeholder="Write a comment…" value={commentDrafts[task.id] || ""} onChange={(event) => setCommentDrafts({ ...commentDrafts, [task.id]: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addComment(task); } }} /><button type="button" className="btn alt" disabled={busy || !(commentDrafts[task.id] || "").trim()} onClick={() => addComment(task)}>Comment</button></div>
               </div>}
-            </article>)}</div>
-          </section>)}
+            </article>;
+            })}</div>}
+          </section>;
+          })}
         </div>}
 
         {tab === "transcript" && <div className="mn-pane">

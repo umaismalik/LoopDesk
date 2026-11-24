@@ -76,6 +76,9 @@ const writeWorkspaceCache = (sessionKey, data) => {
     localStorage.setItem(WORKSPACE_CACHE, JSON.stringify({ sessionKey, data: { ...rest, audit: [] } }));
   } catch {}
 };
+// A task link from an email, kept until the person has signed in and the task is shown.
+const OPEN_TASK = "rw-open-task";
+const readOpenTask = () => { try { return JSON.parse(sessionStorage.getItem(OPEN_TASK) || "null"); } catch { return null; } };
 // The sidebar counts (meetings this month, attachments, activity, tickets by type) as last seen, so a
 // fresh visit shows them at once instead of 0 until each screen has been opened.
 const NAV_COUNTS = "rw-nav-counts";
@@ -415,6 +418,7 @@ export default function Page() {
   // browser that were never finished or saved (closed tab, crash), which can be recovered.
   const [transcriptionInfo, setTranscriptionInfo] = useState(null);
   const [savedRecordings, setSavedRecordings] = useState([]);
+  const [meetingTaskTarget, setMeetingTaskTarget] = useState(null);
   const [recordingClips, setRecordingClips] = useState([]);
   const [recordingTranscript, setRecordingTranscript] = useState("");
   const [recordingSaved, setRecordingSaved] = useState(false);
@@ -529,6 +533,12 @@ export default function Page() {
   useEffect(() => {
     const sp = new URLSearchParams(location.search), t = sp.get("invite");
     if (sp.get("reset")) { setScreen("reset"); return; }
+    // A task link from an assignment email: open that task in Meeting Notes once signed in.
+    if (sp.get("meeting-task")) {
+      const target = { task: sp.get("meeting-task"), note: sp.get("note") || "", month: sp.get("month") || "", project: sp.get("project") || "" };
+      try { sessionStorage.setItem(OPEN_TASK, JSON.stringify(target)); } catch {}
+      history.replaceState(null, "", "/");
+    }
     // A direct sign-up link to send to new companies: https://your-site/?start
     if (sp.has("start") && !localStorage.getItem("rw-key")) { setScreen("signup"); return; }
     if (sp.get("signup")) {
@@ -561,8 +571,23 @@ export default function Page() {
       };
       openInvite();
     }
-    else { const k = localStorage.getItem("rw-key") || ""; setKey(k); load(k); }
+    else { const k = localStorage.getItem("rw-key") || ""; setKey(k); load(k, readOpenTask()?.project || undefined); }
   }, [load]);
+  // Opens the task from an email link in its project's Meeting Notes (after sign-in if needed).
+  useEffect(() => {
+    if (screen !== "app" || !key || !projectId) return;
+    const target = readOpenTask();
+    if (!target) return;
+    if (target.project && target.project !== projectId && !target.switched) {
+      try { sessionStorage.setItem(OPEN_TASK, JSON.stringify({ ...target, switched: true })); } catch {}
+      load(key, target.project);
+      return;
+    }
+    try { sessionStorage.removeItem(OPEN_TASK); } catch {}
+    if (target.project && target.project !== projectId) { setMsg("That task belongs to a project you are not a member of."); return; }
+    setMeetingTaskTarget(target);
+    setView("meeting-notes");
+  }, [screen, key, projectId, load]);
   // ---- Live updates -------------------------------------------------------------------------
   // Every 5 seconds (while the tab is visible) ask the server for the project's change version. When
   // someone changes anything, quietly reload what is on screen; nobody has to press refresh.
@@ -1108,7 +1133,7 @@ export default function Page() {
     } else if (!result.cards.length) {
       setMeetingNotice("Transcript added to shared meeting notes. To fill a member's card automatically, address them by name (for example \"Ali, tell me about your tasks\") or click their card while they speak.");
     } else {
-      setMeetingNotice(`English notes ready. Filled ${result.cards.length === 1 ? "the card" : "cards"} for ${result.cards.map((card) => card.name).join(", ")}. Review them, then save: each filled card is emailed to its member.`);
+      setMeetingNotice(`English notes ready. Filled ${result.cards.length === 1 ? "the card" : "cards"} for ${result.cards.map((card) => card.name).join(", ")}. Review them, then save: each member is emailed only the tasks assigned to them, with a link to open each task.`);
     }
   };
   const finishMeetingRecording = async (notice = "") => {
@@ -1873,7 +1898,7 @@ export default function Page() {
               </aside>
             </div>
           </div>}
-        </section>) : view === "meeting-notes" ? <MeetingNotes projectId={projectId} keyValue={key} members={members} canDelete={admin} canManageContent={!!me && ["Admin", "Collaborator"].includes(me.role)} me={me} onAccessChange={handleMeetingAccessChange} refreshKey={liveVersion} /> : view === "portal" ? (<section className="panel"><div className="wrap"><table className="tm"><thead><tr><th>ID</th><th>Ticket</th><th>Type</th><th>Raised</th><th>Status</th><th>Completed</th><th className="ra-h">Actions</th></tr></thead><tbody>
+        </section>) : view === "meeting-notes" ? <MeetingNotes projectId={projectId} keyValue={key} members={members} canDelete={admin} canManageContent={!!me && ["Admin", "Collaborator"].includes(me.role)} me={me} onAccessChange={handleMeetingAccessChange} refreshKey={liveVersion} openTarget={meetingTaskTarget} onTargetOpened={() => setMeetingTaskTarget(null)} /> : view === "portal" ? (<section className="panel"><div className="wrap"><table className="tm"><thead><tr><th>ID</th><th>Ticket</th><th>Type</th><th>Raised</th><th>Status</th><th>Completed</th><th className="ra-h">Actions</th></tr></thead><tbody>
           {[...tickets].sort((a, b) => (b.date || "").localeCompare(a.date || "")).map((t) => (<tr key={t.id}>
             <td><b className={"id " + t.type}>{t.clientRef || t.id}</b></td><td className="tt">{t.title}</td><td>{t.type === "issue" ? "Issue" : "Feature"}</td><td className="nw">{fmt(t.date)}</td>
             <td><span className={"pill st " + t.status.replace(" ", "")}>{t.status}</span></td><td className="nw">{fmt(t.closed)}</td>
