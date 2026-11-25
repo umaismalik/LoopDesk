@@ -8,7 +8,7 @@ import { carriedOverTasks, monthlyReport, rowsOfNotes } from "../../../lib/meeti
 import { liveRequest, bumpProjectVersion } from "../../../lib/live-api";
 import { meetingAiRequest } from "../../../lib/meeting-ai";
 import { signupRequest } from "../../../lib/signup-api";
-import { CHILD_KINDS, loadOrgMeta, organizationPath, saveOrgMeta, tenantSuspended } from "../../../lib/tenant-store";
+import { CHILD_KINDS, loadOrgMeta, organizationPath, organizationUsage, removeOrgMeta, saveOrgMeta, tenantSuspended } from "../../../lib/tenant-store";
 import { isPlatformAdmin, platformRequest } from "../../../lib/platform-api";
 import { attachmentError, attachmentKind, descriptionError } from "../../../lib/limits";
 import { publicErrorMessage } from "../../../lib/http-error";
@@ -1722,6 +1722,53 @@ async function h(req, p, m) {
         throw error;
       }
       return J({ ok: true, organization: { id: organization.id, name, parentId, kind, parentName: parent.name, status: "active", canCreateProject: true, canAddChild: false } });
+    }
+    if (r === "project-move") {
+      // Moves the open project to the main company or to another of its departments / sub-companies.
+      // Only an admin of the main company can do this, and only within that company.
+      const body = await req.json();
+      const targetId = String(body.organizationId || "");
+      const currentId = project.organizationId || defaultOrganization.id;
+      if (targetId === currentId) return J({ error: "The project is already there" }, 400);
+      const meta = await loadOrgMeta([currentId, targetId]);
+      const rootOf = (id) => meta.get(id)?.parentId || id;
+      const root = d.organizations.find((item) => item.id === rootOf(currentId));
+      const target = d.organizations.find((item) => item.id === targetId);
+      if (!root || !target || rootOf(targetId) !== root.id) return J({ error: "Choose the company or one of its departments" }, 400);
+      if (!(root.adminIds || []).includes(account.id)) return J({ error: `Only an admin of ${root.name} can move projects` }, 403);
+      if (d.projects.some((item) => item.id !== project.id && item.organizationId === targetId && item.name.toLowerCase() === project.name.toLowerCase())) return J({ error: `${target.name} already has a project named "${project.name}"` }, 400);
+      const from = d.organizations.find((item) => item.id === currentId);
+      // Keep Google Calendar / Meet working: the connection belongs to the organization.
+      const calendar = googleCalendarForOrganization(d, currentId);
+      if (calendar?.refreshToken && !googleCalendarForOrganization(d, targetId) && !(await organizationUsage(targetId)).calendar) {
+        d.googleCalendars = { ...(d.googleCalendars || {}), [targetId]: { ...calendar, organizationId: targetId } };
+      }
+      project.organizationId = targetId;
+      target.adminIds = [...new Set([...(target.adminIds || []), account.id])];
+      log(d, me.name, "Moved project", `${from?.name || "?"} → ${target.name}`);
+      await save(d);
+      // Tell the admin when the department it came from is now empty, so it can be removed.
+      let emptied = null;
+      if (from && meta.get(currentId)?.parentId && !(await organizationUsage(currentId)).projects.length) emptied = { id: from.id, name: from.name, kind: meta.get(currentId).kind };
+      return J({ ok: true, project: { id: project.id, name: project.name, organizationId: targetId }, emptied });
+    }
+    if (r === "organization-remove") {
+      // Removes an empty department or sub-company. Main companies are never removed here.
+      const body = await req.json();
+      const id = String(body.organizationId || "");
+      const meta = await loadOrgMeta([id]);
+      const unit = d.organizations.find((item) => item.id === id);
+      const parentId = meta.get(id)?.parentId;
+      if (!unit || !parentId) return J({ error: "Only a department or sub-company can be removed" }, 400);
+      const parent = d.organizations.find((item) => item.id === parentId);
+      if (!(parent?.adminIds || []).includes(account.id)) return J({ error: `Only an admin of ${parent?.name || "the company"} can remove it` }, 403);
+      if ((await organizationUsage(id)).projects.length || d.projects.some((item) => item.organizationId === id)) return J({ error: `${unit.name} still has projects. Move them first.` }, 400);
+      d.organizations = d.organizations.filter((item) => item.id !== id);
+      if (d.googleCalendars?.[id]) { const { [id]: _removed, ...rest } = d.googleCalendars; d.googleCalendars = rest; }
+      log(d, me.name, "Removed " + (meta.get(id).kind === "subsidiary" ? "sub-company" : "department"), unit.name);
+      await save(d);
+      await removeOrgMeta(id);
+      return J({ ok: true });
     }
     if (r === "project") {
       if (me.role !== "Admin") return J({ error: "Admin only" }, 403);

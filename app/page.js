@@ -327,6 +327,8 @@ export default function Page() {
   const [organizationModal, setOrganizationModal] = useState(false);
   const [organizationName, setOrganizationName] = useState("");
   const [organizationKind, setOrganizationKind] = useState("department");
+  // Moving the open project to the main company or another of its departments / sub-companies.
+  const [moveTarget, setMoveTarget] = useState(null);
   // Self sign-up: a new company creates its own workspace (confirmed by email).
   const [signup, setSignup] = useState({ companyName: "", name: "", email: "", password: "", projectName: "", accept: false });
   const [signupBusy, setSignupBusy] = useState(false);
@@ -820,6 +822,9 @@ export default function Page() {
     ...organizations.filter((item) => !item.parentId).flatMap((tenant) => [tenant, ...organizations.filter((child) => child.parentId === tenant.id)]),
     ...organizations.filter((item) => item.parentId && !organizations.some((tenant) => tenant.id === item.parentId)),
   ];
+  // A main-company admin can move the open project between the company and its units.
+  const moveDestinations = activeTenant ? [activeTenant, ...organizations.filter((item) => item.parentId === activeTenant.id)] : [];
+  const canMoveProject = !!activeTenant?.canAddChild && moveDestinations.length > 1;
   const canDel = () => manager;
   // Dashboard lists cover the whole project; a ticket outside the loaded page opens via its log search.
   // Opens a ticket from anywhere (dashboard, chat links like "ISS-01", "iss-1" or "FTR 3"): goes to the
@@ -1388,6 +1393,20 @@ export default function Page() {
     setProjectModal(true);
     load(key, projectId);
   };
+  const moveProject = async (e) => {
+    e.preventDefault();
+    const result = await api("project-move", { organizationId: moveTarget }, key, projectId);
+    if (!result.ok) return alert(result.error || "Could not move the project");
+    setMoveTarget(null);
+    const emptied = result.emptied;
+    const kindName = emptied?.kind === "subsidiary" ? "sub-company" : "department";
+    if (emptied && confirm(`"${emptied.name}" has no projects now. Remove the ${kindName} "${emptied.name}"?`)) {
+      const removed = await api("organization-remove", { organizationId: emptied.id }, key, projectId);
+      if (!removed.ok) alert(removed.error || `Could not remove the ${kindName}`);
+      else setOrganizations((items) => items.filter((item) => item.id !== emptied.id));
+    }
+    load(key, projectId);
+  };
   const requestMeetingEditAccess = async () => {
     setMeetingError(""); setMeetingNotice("");
     const result = await api("meeting-notes", { action: "request-edit-access" }, key, projectId);
@@ -1625,11 +1644,13 @@ export default function Page() {
           <label htmlFor="project-select">PROJECT</label>
           <select id="project-select" value={projectId} onChange={(e) => {
             if (e.target.value === "__add_project__") { setProjectName(""); setProjectOrganizationId(activeOrganization?.id || organizations.find((item) => item.canCreateProject)?.id || ""); setProjectModal(true); return; }
+            if (e.target.value === "__move_project__") { setMoveTarget(moveDestinations.find((item) => item.id !== activeOrganization?.id)?.id || ""); return; }
             const id = e.target.value;
             setProjectId(id); setMeetingSelected(null); setMeetingDraft(""); setParticipantSummaries([]); setView(client ? "portal" : "all"); setModal(null); setDetail(null); load(key, id);
           }}>
             {projects.filter((item) => item.organizationId === activeOrganization?.id).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
             {organizations.some((item) => item.id === activeOrganization?.id && item.canCreateProject) && <option value="__add_project__">＋ Add project…</option>}
+            {canMoveProject && <option value="__move_project__">⇄ Move this project…</option>}
           </select>
         </div>
         {nav.map(([k, l]) => (<button key={k} className={"nav " + (view === k ? "on" : "")} onClick={() => {
@@ -2064,6 +2085,14 @@ export default function Page() {
         </div>
         <label>{organizationKind === "subsidiary" ? "Sub-company name" : "Department name"}<input autoFocus required maxLength={80} value={organizationName} onChange={(event) => setOrganizationName(event.target.value)} placeholder={organizationKind === "subsidiary" ? "e.g. Solexes Dubai" : "e.g. Mobile Development"} /></label>
         <div className="acts end"><button type="button" className="btn alt" onClick={() => setOrganizationModal(false)}>Cancel</button><button className="btn">Create {organizationKind === "subsidiary" ? "sub-company" : "department"}</button></div>
+      </form></div>)}
+      {moveTarget !== null && (<div className="ov" onClick={() => setMoveTarget(null)}><form className="modal project-modal" onClick={(e) => e.stopPropagation()} onSubmit={moveProject}>
+        <h2>Move {activeProject?.name}</h2>
+        <p className="note">Now in <b>{activeOrganization ? orgLabel(activeOrganization) : "—"}</b>. Its tickets, files, meetings, notes and team move with it; only where it is listed changes.</p>
+        <label>Move to<select required value={moveTarget} onChange={(event) => setMoveTarget(event.target.value)}>
+          {moveDestinations.filter((item) => item.id !== activeOrganization?.id).map((organization) => <option key={organization.id} value={organization.id}>{organization.parentId ? `${orgLabel(organization)} · ${KIND_LABEL[organization.kind] || "Unit"}` : `${organization.name} (directly under the company)`}</option>)}
+        </select></label>
+        <div className="acts end"><button type="button" className="btn alt" onClick={() => setMoveTarget(null)}>Cancel</button><button className="btn" disabled={!moveTarget}>Move project</button></div>
       </form></div>)}
 
       {dt && (<div className="ov" onClick={() => { setDetail(null); setCustomerReply(""); }}><div className="modal" onClick={(e) => e.stopPropagation()}>
