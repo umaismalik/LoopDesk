@@ -7,7 +7,6 @@ import { cloudTranscriptionStatus } from "../lib/cloud-transcription";
 import { LiveTranscription, mergeCards } from "../lib/live-transcription";
 import { deleteSession, listSessions } from "../lib/recording-store";
 import Dashboard from "./dashboard";
-import MonthlyTaskReport from "../components/MonthlyTaskReport";
 import { ATTACHMENT_ACCEPT, ATTACHMENT_HINT, attachmentError, DESCRIPTION_CHAR_LIMIT, DESCRIPTION_WORD_LIMIT, descriptionError, wordCount } from "../lib/limits";
 
 // Each screen's code downloads only when that screen is first opened, so sign-in and the dashboard
@@ -1996,7 +1995,7 @@ export default function Page() {
           </tbody></table></div>
           <p className="note">Roles and team membership apply only to {activeProject?.name} in {activeOrganization?.name}. Admin and Collaborator: full access to tickets (create, edit, assign, change status, delete). Developer: sees only the tickets assigned to them or raised by them (with their attachments and meeting-note tasks), can create tickets and edit or change the status of their own tickets; cannot reassign or delete. Assignees are emailed the full task when they are assigned. For meeting cards, saved meeting notes, and task details, only Admins and Collaborators can edit; other team members can change status on tasks assigned to them or request one-hour admin-approved edit access. Client: sees only tickets they raised in this project; can create, update, reopen and delete them.</p></section>
         </>) : (<>
-          {view === "all" ? <>{canUseMeetings && <MonthlyTaskReport key={"mtr-" + projectId} projectId={projectId} keyValue={key} refreshKey={liveVersion} />}<Dashboard key={projectId} apiGet={(path) => api(path, null, key, projectId)} members={members} projectName={activeProject?.name || ""} onOpenTicket={openTicket} refreshKey={liveVersion} /></> : (
+          {view === "all" ? <Dashboard key={projectId} apiGet={(path) => api(path, null, key, projectId)} members={members} projectName={activeProject?.name || ""} onOpenTicket={openTicket} refreshKey={liveVersion} /> : (
           <section className="panel">
             <div className="tools">
               <input placeholder="Search by ID, title, details..." value={q} onChange={(e) => setQ(e.target.value)} />
