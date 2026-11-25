@@ -823,8 +823,9 @@ export default function Page() {
     ...organizations.filter((item) => item.parentId && !organizations.some((tenant) => tenant.id === item.parentId)),
   ];
   // A main-company admin can move the open project between the company and its units.
-  const moveDestinations = activeTenant ? [activeTenant, ...organizations.filter((item) => item.parentId === activeTenant.id)] : [];
-  const canMoveProject = !!activeTenant?.canAddChild && moveDestinations.length > 1;
+  // DocuTect always stays directly under the company.
+  const moveDestinations = !activeTenant ? [] : /^docutect$/i.test(String(activeProject?.name || "").trim()) ? [activeTenant] : [activeTenant, ...organizations.filter((item) => item.parentId === activeTenant.id)];
+  const canMoveProject = !!activeTenant?.canAddChild && moveDestinations.some((item) => item.id !== activeOrganization?.id);
   const canDel = () => manager;
   // Dashboard lists cover the whole project; a ticket outside the loaded page opens via its log search.
   // Opens a ticket from anywhere (dashboard, chat links like "ISS-01", "iss-1" or "FTR 3"): goes to the

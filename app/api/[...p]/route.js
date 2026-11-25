@@ -54,6 +54,8 @@ const openGoogleToken = (sealed) => {
   return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
 };
 const googleCalendarForOrganization = (d, organizationId) => d.googleCalendars?.[organizationId];
+// The project connected to DocuTect (by its configured id, or by name when that is not set).
+const isDocutectProject = (item) => !!item && (item.id === docutectProjectId() || /^docutect$/i.test(String(item.name || "").trim()));
 async function googleAccessToken(d, organizationId) {
   const calendar = googleCalendarForOrganization(d, organizationId);
   if (!googleOAuthConfigured() || !calendar?.refreshToken) {
@@ -790,12 +792,24 @@ async function h(req, p, m) {
     if (m === "GET" && r === "db") {
       if (!d.members.length) return J({ setup: true });
       if (!me) return J({ error: account ? "You are not a member of this project" : "denied" }, account ? 403 : 401);
+      // Main companies (tenants) and their child organizations (departments / sub-companies).
+      const orgMeta = await loadOrgMeta(d.organizations.map((item) => item.id));
+      // The DocuTect project always sits directly under its main company, never in a department.
+      const misplaced = d.projects.filter((item) => isDocutectProject(item) && orgMeta.get(item.organizationId)?.parentId);
+      if (misplaced.length) {
+        misplaced.forEach((item) => {
+          const fromId = item.organizationId, toId = orgMeta.get(fromId).parentId;
+          const calendar = item.id === project.id && googleCalendarForOrganization(d, fromId);
+          if (calendar?.refreshToken && !googleCalendarForOrganization(d, toId)) d.googleCalendars = { ...(d.googleCalendars || {}), [toId]: { ...calendar, organizationId: toId } };
+          item.organizationId = toId;
+          if (item.id === project.id) log(d, "LoopDesk", "Moved project", `${d.organizations.find((o) => o.id === fromId)?.name || "Department"} → directly under ${d.organizations.find((o) => o.id === toId)?.name || "the company"}`);
+        });
+        try { await save(d); } catch (error) { console.warn("Could not move DocuTect under its company:", error?.message || error); }
+      }
       const projects = d.projects.filter((x) => x.members.some((entry) => entry.memberId === account.id && entry.status !== "disabled")).map(({ id, name, organizationId }) => ({ id, name, organizationId: organizationId || defaultOrganization.id }));
       const organizationRows = d.organizations
         .filter((organization) => (organization.adminIds || []).includes(account.id) || projects.some((item) => d.projects.find((projectItem) => projectItem.id === item.id)?.organizationId === organization.id))
         .map(({ id, name, adminIds }) => ({ id, name, canCreateProject: (adminIds || []).includes(account.id) }));
-      // Main companies (tenants) and their child organizations (departments / sub-companies).
-      const orgMeta = await loadOrgMeta(d.organizations.map((item) => item.id));
       const organizations = organizationRows.map((item) => {
         const meta = orgMeta.get(item.id);
         const parentId = meta?.parentId || "";
@@ -1735,6 +1749,7 @@ async function h(req, p, m) {
       const root = d.organizations.find((item) => item.id === rootOf(currentId));
       const target = d.organizations.find((item) => item.id === targetId);
       if (!root || !target || rootOf(targetId) !== root.id) return J({ error: "Choose the company or one of its departments" }, 400);
+      if (isDocutectProject(project) && targetId !== root.id) return J({ error: "DocuTect stays directly under the company, not in a department or sub-company" }, 400);
       if (!(root.adminIds || []).includes(account.id)) return J({ error: `Only an admin of ${root.name} can move projects` }, 403);
       if (d.projects.some((item) => item.id !== project.id && item.organizationId === targetId && item.name.toLowerCase() === project.name.toLowerCase())) return J({ error: `${target.name} already has a project named "${project.name}"` }, 400);
       const from = d.organizations.find((item) => item.id === currentId);
