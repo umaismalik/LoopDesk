@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import MonthlyTaskReport from "./MonthlyTaskReport";
 
 const currentMonth = () => {
   const date = new Date();
@@ -76,6 +77,12 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
   const [openGroups, setOpenGroups] = useState(() => new Set());
   const [taskPanels, setTaskPanels] = useState({});
   const [highlightTask, setHighlightTask] = useState("");
+  // Tasks from earlier meetings still not completed when the open note's meeting was held.
+  const [carried, setCarried] = useState([]);
+  const [carriedVersion, setCarriedVersion] = useState(0);
+  const [localTarget, setLocalTarget] = useState(null);
+  const [monthlyOpen, setMonthlyOpen] = useState(false);
+  const target = openTarget || localTarget;
   // The note as last loaded from the server; a live refresh only replaces the open note when the
   // user has not started editing it.
   const baselineRef = useRef("");
@@ -179,23 +186,51 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
   }, [selected?.id, selected?.audioFile?.id, selected?.audioFiles?.length, projectId, keyValue]);
 
   useEffect(() => {
-    if (openTarget?.month && /^\d{4}-\d{2}$/.test(openTarget.month) && openTarget.month !== month) { setMonth(openTarget.month); setNotesOffset(0); }
-  }, [openTarget?.month]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (target?.month && /^\d{4}-\d{2}$/.test(target.month) && target.month !== month) { setMonth(target.month); setNotesOffset(0); }
+  }, [target?.month]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     // Wait until the notes of the task's month are loaded.
-    if (!openTarget?.note || notesLoading || notesMonth !== (openTarget.month || month)) return;
-    const note = notes.find((item) => item.id === openTarget.note);
-    if (!note) { setError("That task is no longer in Meeting Notes, or it belongs to another project."); onTargetOpened?.(); return; }
+    if (!target?.note || notesLoading || notesMonth !== (target.month || month)) return;
+    const done = () => { if (openTarget) onTargetOpened?.(); else setLocalTarget(null); };
+    const note = notes.find((item) => item.id === target.note);
+    if (!note) { setError("That task is no longer in Meeting Notes, or it belongs to another project."); done(); return; }
     openNote(note);
     setTab("tasks");
-    const task = (note.tasks || []).find((item) => item.id === openTarget.task);
+    const task = (note.tasks || []).find((item) => item.id === target.task);
     if (task) {
       setOpenGroups(new Set([task.assigneeId || "unassigned"]));
       setHighlightTask(task.id);
       setTimeout(() => document.getElementById("mn-task-" + task.id)?.scrollIntoView({ behavior: "smooth", block: "center" }), 150);
     }
-    onTargetOpened?.();
-  }, [openTarget, notes, notesLoading, notesMonth, month]); // eslint-disable-line react-hooks/exhaustive-deps
+    done();
+  }, [target, notes, notesLoading, notesMonth, month]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    let active = true;
+    setCarried([]);
+    if (!selected?.id) return undefined;
+    fetch(`/api/meeting-notes?carried=${encodeURIComponent(selected.id)}&date=${encodeURIComponent(selected.date)}&at=${encodeURIComponent(selected.createdAt || "")}&project=${encodeURIComponent(projectId)}`, { headers: { "x-key": keyValue } })
+      .then((response) => response.ok ? response.json() : { tasks: [] })
+      .then((result) => { if (active) setCarried(result.tasks || []); })
+      .catch(() => {});
+    return () => { active = false; };
+  }, [selected?.id, selected?.date, selected?.createdAt, projectId, keyValue, refreshKey, carriedVersion]);
+  const carriedPending = carried.filter((task) => task.status !== "Completed");
+  const carriedByMember = (() => {
+    const groups = new Map();
+    carriedPending.forEach((task) => groups.set(task.assigneeId, [...(groups.get(task.assigneeId) || []), task]));
+    return [...groups.entries()].map(([memberId, tasks]) => ({ memberId, tasks }));
+  })();
+  const updateCarriedStatus = async (task, status) => {
+    setBusy(true); setError("");
+    const result = await request({ action: "task-status", noteId: task.origin.noteId, taskId: task.id, status });
+    setBusy(false);
+    if (!result.ok) { setError(result.error || "Could not update task status"); return; }
+    setNotes((items) => items.map((item) => item.id === result.note.id ? result.note : item));
+    setCarriedVersion((version) => version + 1);
+    setNotice(status === "Completed" ? `"${task.title}" is completed.` : `"${task.title}" is now ${status}.`);
+  };
+  const openOriginal = (task) => setLocalTarget({ note: task.origin.noteId, month: task.origin.date.slice(0, 7), task: task.id });
 
   const save = async () => {
     if (!selected) return;
@@ -436,7 +471,9 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" /></svg>
         Export report
       </button>
+      <button type="button" className={"btn alt" + (monthlyOpen ? " on" : "")} aria-expanded={monthlyOpen} onClick={() => setMonthlyOpen((value) => !value)}>Monthly report</button>
     </div>
+    {monthlyOpen && <MonthlyTaskReport projectId={projectId} keyValue={keyValue} month={month} refreshKey={`${refreshKey}-${carriedVersion}-${notes.length}`} title={`Task report · ${monthTitle(month)}`} />}
     {reportOpen && <div className="meeting-report-toolbar mn-report">
       <div><b>Team meeting report</b><span>Download assigned work by team member for a week or a month (opens in Excel).</span></div>
       <label>Period<select value={reportPeriod} onChange={(event) => setReportPeriod(event.target.value)}><option value="month">Month ({monthTitle(month)})</option><option value="week">Week</option></select></label>
@@ -492,7 +529,7 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
             {canDelete && <button type="button" className="ic dl" disabled={busy} onClick={deleteNote}>Delete note</button>}
           </div>
           <nav className="mn-tabs" role="tablist">
-            {[["overview", "Overview"], ["tasks", `Action items${selectedTasks.length ? ` · ${selectedTasks.length}` : ""}`], ["transcript", `Transcript${recordingUrls.length ? " & audio" : ""}`]].map(([id, label]) =>
+            {[["overview", "Overview"], ["tasks", `Action items${selectedTasks.length ? ` · ${selectedTasks.length}` : ""}${carriedPending.length ? ` + ${carriedPending.length} carried` : ""}`], ["transcript", `Transcript${recordingUrls.length ? " & audio" : ""}`]].map(([id, label]) =>
               <button type="button" role="tab" key={id} aria-selected={tab === id} className={tab === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>)}
           </nav>
         </header>
@@ -513,6 +550,12 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
           <button className="btn" disabled={busy}>{busy ? "Saving…" : "Add task"}</button>
         </form>}
 
+        {!!carriedPending.length && (tab === "overview" || tab === "tasks") && <div className="mn-carry-alert" role="status">
+          <b>⚠ Not completed from previous meetings — ask for an update</b>
+          <span>{carriedByMember.map(({ memberId, tasks }) => `${memberOf(memberId)?.name || "Former member"} (${tasks.length})`).join(" · ")}</span>
+          {tab === "overview" && <button type="button" className="ic" onClick={() => setTab("tasks")}>See the tasks</button>}
+        </div>}
+
         {tab === "overview" && <div className="mn-pane">
           <section className="mn-block">
             <h3>Key points</h3>
@@ -527,11 +570,12 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
                 const open = openMembers.has(card.memberId);
                 const updates = (card.points || []).filter((line) => String(line).trim()).length, next = (card.tasks || []).filter((line) => String(line).trim()).length;
                 const assigned = selectedTasks.filter((task) => task.assigneeId === card.memberId);
+                const pendingBefore = carriedPending.filter((task) => task.assigneeId === card.memberId).length;
                 return <article className={"mn-member" + (open ? " open" : "")} key={card.memberId} style={{ "--av": avatarColor(card.memberId) }}>
                 <button type="button" className="mn-member-head" aria-expanded={open} onClick={() => setOpenMembers((set) => toggled(set, card.memberId))}>
                   <i>{initials(card.name)}</i>
                   <span className="mn-member-name"><b>{card.name}</b><small>{memberOf(card.memberId)?.role || "Team member"}</small></span>
-                  <span className="mn-member-counts"><em>{updates} update{updates === 1 ? "" : "s"}</em><em>{next} next task{next === 1 ? "" : "s"}</em>{!!assigned.length && <em className="ok">{assigned.filter((task) => task.status === "Completed").length}/{assigned.length} done</em>}</span>
+                  <span className="mn-member-counts"><em>{updates} update{updates === 1 ? "" : "s"}</em><em>{next} next task{next === 1 ? "" : "s"}</em>{!!assigned.length && <em className="ok">{assigned.filter((task) => task.status === "Completed").length}/{assigned.length} done</em>}{!!pendingBefore && <em className="bad">{pendingBefore} pending from before</em>}</span>
                   <em className={"pill " + (card.priority || "Medium")}>{card.priority || "Medium"}</em>
                   <span className="mn-chevron"><Icon d={CHEVRON} /></span>
                 </button>
@@ -554,6 +598,28 @@ export default function MeetingNotes({ projectId, keyValue, members, canDelete, 
         </div>}
 
         {tab === "tasks" && <div className="mn-pane">
+          {!!carried.length && <section className="mn-carried">
+            <h3>Previously assigned <small>{carriedPending.length} not completed{carried.length > carriedPending.length ? ` · ${carried.length - carriedPending.length} completed since` : ""}</small></h3>
+            <p className="mn-carried-hint">Tasks from earlier meetings that were not completed by this meeting. They appear in every meeting until they are completed.</p>
+            {carried.map((task) => <article id={"mn-task-" + task.id} className={"mn-task carried st-" + String(task.status || "Open").replace(" ", "") + (isOverdue(task) ? " overdue" : "")} key={task.origin.noteId + task.id}>
+              <div className="mn-task-top">
+                <p className="mn-task-title">{task.title}</p>
+                <span className="mn-carried-tag">Previously assigned</span>
+                <span className={"pill " + (task.priority || "Medium")}>{task.priority || "Medium"}</span>
+              </div>
+              <div className="mn-task-meta">
+                {task.assigneeId === me?.id
+                  ? <select className={"mn-status st " + String(task.status || "Open").replace(" ", "")} aria-label="Task status" disabled={busy} value={task.status} onChange={(event) => updateCarriedStatus(task, event.target.value)}><option>Open</option><option>In Progress</option><option>Completed</option></select>
+                  : <span className={"pill st " + String(task.status || "Open").replace(" ", "")}>{task.status}</span>}
+                <span className={"mn-due" + (isOverdue(task) ? " bad" : "")}>⏰ {isOverdue(task) ? "Overdue · " : ""}{dueLabel(task.dueDate)}</span>
+                {memberOf(task.assigneeId) && <span className="mn-assignee"><i style={{ "--av": avatarColor(task.assigneeId) }}>{initials(memberOf(task.assigneeId).name)}</i>{memberOf(task.assigneeId).name}</span>}
+              </div>
+              <div className="mn-carried-from">
+                <span>Assigned in <b>{task.origin.title}</b> · {dateLabel(task.origin.date)}{task.status !== "Completed" ? ` · pending ${task.pendingDays} day${task.pendingDays === 1 ? "" : "s"}` : ""}</span>
+                <button type="button" className="ic" onClick={() => openOriginal(task)}>Open in its meeting</button>
+              </div>
+            </article>)}
+          </section>}
           {!taskGroups.length && <div className="mn-empty-list"><b>No action items yet</b><span>{canManageContent ? "Add the first one above." : "Tasks assigned in this meeting will appear here."}</span></div>}
           {taskGroups.length > 1 && <div className="mn-group-tools"><button type="button" className="mn-expand-all" onClick={() => setOpenGroups(openGroups.size === taskGroups.length ? new Set() : new Set(taskGroups.map((group) => group.id)))}>{openGroups.size === taskGroups.length ? "Collapse all" : "Expand all"}</button></div>}
           {taskGroups.map((group) => {

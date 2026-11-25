@@ -2,8 +2,9 @@ import path from "path";
 import crypto from "crypto";
 import { SEED } from "../../../lib/seed";
 import { sendEmail } from "../../../lib/email";
-import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, loadProjectTicketIds, loadClientTickets, deleteTicketFiles, loadTicketSummaries, loadTicketAccess, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
+import { getWorkspaceMemberCount, loadDb, loadLoginDb, loadPublicFlowDb, loadProjectTicketIds, loadClientTickets, deleteTicketFiles, loadTicketSummaries, loadTicketAccess, loadMeetingTaskRows, saveDb, createLoginSession, putFile, getFile, delFile, remote } from "../../../lib/store";
 import { check } from "../../../lib/reminders";
+import { carriedOverTasks, monthlyReport, rowsOfNotes } from "../../../lib/meeting-report";
 import { liveRequest, bumpProjectVersion } from "../../../lib/live-api";
 import { meetingAiRequest } from "../../../lib/meeting-ai";
 import { signupRequest } from "../../../lib/signup-api";
@@ -894,6 +895,23 @@ async function h(req, p, m) {
         expiresAt: editGrant?.expiresAt || null,
         requests: d.meetingEditRequests.filter((item) => item.projectId === project.id && (me.role === "Admin" || item.memberId === account.id)),
       };
+      const carriedFor = u.searchParams.get("carried") || "", reportMonth = u.searchParams.get("report") || "";
+      if (carriedFor || reportMonth) {
+        const validDay = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value);
+        if (carriedFor && !validDay(u.searchParams.get("date") || "")) return J({ error: "Choose a meeting note" }, 400);
+        if (reportMonth && !/^\d{4}-(0[1-9]|1[0-2])$/.test(reportMonth)) return J({ error: "Choose a month" }, 400);
+        const upTo = carriedFor ? u.searchParams.get("date") : `${reportMonth}-31`;
+        const rows = (await loadMeetingTaskRows(project.id, upTo)) ||
+          rowsOfNotes(d.meetingNotes.filter((note) => note.projectId === project.id && note.date <= upTo));
+        // A Developer sees only their own tasks, as in the notes themselves.
+        const visibleRows = limitedToOwnTickets(me) ? rows.filter((row) => row.task.assigneeId === account.id) : rows;
+        if (carriedFor) {
+          const tasks = carriedOverTasks(visibleRows, { id: carriedFor, date: u.searchParams.get("date"), createdAt: u.searchParams.get("at") || "" });
+          return J({ ...access, tasks });
+        }
+        const team = project.members.map((entry) => d.members.find((member) => member.id === entry.memberId)).filter(Boolean);
+        return J({ ...access, report: monthlyReport(visibleRows, reportMonth, team) });
+      }
       const month = u.searchParams.get("month") || "";
       const from = u.searchParams.get("from") || "", to = u.searchParams.get("to") || "";
       if (from || to) {
@@ -1481,6 +1499,7 @@ async function h(req, p, m) {
             id, title, description, assigneeId, dueDate, status, comments,
             priority: ["High", "Medium", "Low"].includes(task.priority) ? task.priority : "Medium",
             remindersSent: previous?.dueDate === dueDate ? previous.remindersSent || [] : [],
+            completedAt: status === "Completed" ? (previous?.status === "Completed" && previous.completedAt) || new Date().toISOString() : "",
             // Who added the task and when come from the stored task, never from the request.
             createdBy: previous ? previous.createdBy || "" : account.id,
             createdByName: previous ? previous.createdByName || "" : me.name,
@@ -1534,6 +1553,8 @@ async function h(req, p, m) {
         const task = (note.tasks || []).find((item) => item.id === String(b.taskId || ""));
         if (!task) return J({ error: "Task not found" }, 404);
         if (task.assigneeId !== account.id) return J({ error: "You can only update the status of tasks assigned to you" }, 403);
+        if (b.status === "Completed" && task.status !== "Completed") task.completedAt = new Date().toISOString();
+        if (b.status !== "Completed") task.completedAt = "";
         task.status = b.status;
         note.updatedAt = new Date().toISOString();
         await save(d);
@@ -1559,7 +1580,8 @@ async function h(req, p, m) {
           if (!task) return J({ error: "Task not found" }, 404);
           if (!ownTaskEditable(task, account.id)) return J({ error: "You can edit a task you added only within 24 hours of adding it; after that you can update its status" }, 403);
           if (task.dueDate !== dueDate) task.remindersSent = [];
-          Object.assign(task, { title, description, priority, status, dueDate });
+          const completedAt = status === "Completed" ? (task.status === "Completed" && task.completedAt) || new Date().toISOString() : "";
+          Object.assign(task, { title, description, priority, status, dueDate, completedAt });
         }
         note.updatedAt = new Date().toISOString();
         await save(d);
